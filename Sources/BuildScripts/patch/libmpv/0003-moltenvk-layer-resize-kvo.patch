@@ -1,0 +1,97 @@
+--- a/video/out/vulkan/context_moltenvk.m
++++ b/video/out/vulkan/context_moltenvk.m
+@@ -15,6 +15,7 @@
+  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#import <Foundation/Foundation.h>
+ #include <CoreGraphics/CoreGraphics.h>
+ #include <QuartzCore/CAMetalLayer.h>
+ #include <MoltenVK/mvk_vulkan.h>
+@@ -22,15 +23,58 @@
+ #include "common.h"
+ #include "context.h"
+ #include "utils.h"
++#include "video/out/vo.h"
+ 
++/* mpv-iOS rotation/resize workaround:
++ * On iOS, mpv has no native trigger for surface size changes (no equivalent
++ * to Android's surface callbacks, X11 ConfigureNotify, etc). The video output
++ * stays at the initial render rect even when the CAMetalLayer's drawableSize
++ * grows (device rotation, multitasking split, ...).
++ *
++ * Fix (analog to mpv-android's plumbing): KVO on the layer's bounds and
++ * drawableSize. On change, call vo_control(VOCTRL_EXTERNAL_RESIZE) — this is
++ * dispatch-routed by mpv to vo->driver->control(VOCTRL_EXTERNAL_RESIZE),
++ * handled by vo_gpu_next as reconfig(vo, NULL), which calls our
++ * moltenvk_reconfig (re-reads CAMetalLayer.drawableSize and resizes the
++ * Vulkan swapchain) AND runs resize(vo) (recomputes the video display rect
++ * for the new dimensions). Without that resize(vo), the video stays at its
++ * old rect inside the new larger swapchain. */
++@interface MPVMoltenVKLayerObserver : NSObject {
++    @public struct ra_ctx *_ctx;
++}
++@end
++
++@implementation MPVMoltenVKLayerObserver
++- (void)observeValueForKeyPath:(NSString *)keyPath
++                      ofObject:(id)object
++                        change:(NSDictionary<NSKeyValueChangeKey, id> *)change
++                       context:(void *)context
++{
++    if (!_ctx || !_ctx->vo) return;
++    /* vo_control is thread-safe: mp_dispatch_run hops onto the VO's own
++     * dispatch queue. Safe to call from the main thread (KVO callback). */
++    vo_control(_ctx->vo, VOCTRL_EXTERNAL_RESIZE, NULL);
++}
++@end
++
+ struct priv {
+     struct mpvk_ctx vk;
+     CAMetalLayer *layer;
++    void *observer;
+ };
+ 
+ static void moltenvk_uninit(struct ra_ctx *ctx)
+ {
+     struct priv *p = ctx->priv;
++    if (p->observer && p->layer) {
++        MPVMoltenVKLayerObserver *obs = (__bridge_transfer MPVMoltenVKLayerObserver *)p->observer;
++        @try {
++            [p->layer removeObserver:obs forKeyPath:@"bounds"];
++            [p->layer removeObserver:obs forKeyPath:@"drawableSize"];
++        } @catch (NSException *e) {}
++        p->observer = NULL;
++        (void)obs;
++    }
+     ra_vk_ctx_uninit(ctx);
+     mpvk_uninit(&p->vk);
+ }
+@@ -67,6 +111,14 @@
+     if (!ra_vk_ctx_init(ctx, vk, params, VK_PRESENT_MODE_FIFO_KHR))
+         goto fail;
+ 
++    MPVMoltenVKLayerObserver *obs = [[MPVMoltenVKLayerObserver alloc] init];
++    obs->_ctx = ctx;
++    p->observer = (__bridge_retained void *)obs;
++    [p->layer addObserver:obs forKeyPath:@"bounds"
++                  options:NSKeyValueObservingOptionNew context:NULL];
++    [p->layer addObserver:obs forKeyPath:@"drawableSize"
++                  options:NSKeyValueObservingOptionNew context:NULL];
++
+     return true;
+ fail:
+     moltenvk_uninit(ctx);
+@@ -77,6 +129,12 @@
+ {
+     struct priv *p = ctx->priv;
+     CGSize s = p->layer.drawableSize;
++    /* Must update vo->dwidth/dheight here, otherwise vo_gpu_next's resize()
++     * recomputes src/dst rects from stale (initial) dimensions. Mirrors what
++     * other platform window code (x11_common, w32_common, vo_wlshm, ...)
++     * does before triggering a resize. */
++    ctx->vo->dwidth = (int)s.width;
++    ctx->vo->dheight = (int)s.height;
+     ra_vk_ctx_resize(ctx, s.width, s.height);
+     return true;
+ }

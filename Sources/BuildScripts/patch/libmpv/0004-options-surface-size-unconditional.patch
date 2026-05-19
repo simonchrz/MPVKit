@@ -1,0 +1,17 @@
+--- a/options/options.c
++++ b/options/options.c
+@@ -242,9 +242,11 @@
+         {"donotround", DWMWCP_DONOTROUND},
+         {"round", DWMWCP_ROUND},
+         {"roundsmall", DWMWCP_ROUNDSMALL})},
+ #endif
+-#if HAVE_EGL_ANDROID
++    /* mpv-iOS: surface-size always available so the iOS Swift wrapper can
++     * trigger VOCTRL_EXTERNAL_RESIZE on layer-bounds changes (CALayer KVO
++     * is unreliable). Hits player/command.c which calls
++     * vo_control(VOCTRL_EXTERNAL_RESIZE) → vo_gpu_next reconfig + resize. */
+     {"android-surface-size", OPT_SIZE_BOX(android_surface_size)},
+-#endif
+ #if HAVE_D3D11
+     {"d3d11-composition-size", OPT_SIZE_BOX(d3d11_composition_size)},
+ #endif

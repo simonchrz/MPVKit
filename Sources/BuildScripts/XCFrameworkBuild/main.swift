@@ -22,7 +22,7 @@ do {
 
     // libbluray
     try BuildBluray().buildALL()
-    
+
     // ffmpeg
     try BuildUavs3d().buildALL()
     try BuildDovi().buildALL()
