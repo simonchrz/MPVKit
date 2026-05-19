@@ -253,31 +253,38 @@ let package = Package(
 
         .binaryTarget(
             name: "Libavcodec",
-            path: "dist/release/Libavcodec.xcframework.zip"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-n8.1-ios-landscape.1/Libavcodec.xcframework.zip",
+            checksum: "c401ac7851a8277c124cbabe723076a7664534cbd87645a7457cda0260b1b44b"
         ),
         .binaryTarget(
             name: "Libavdevice",
-            path: "dist/release/Libavdevice.xcframework.zip"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-n8.1-ios-landscape.1/Libavdevice.xcframework.zip",
+            checksum: "cd60043be86bcc9be532748fc29438bc73d97bb58fcd51718d71bc78e022f213"
         ),
         .binaryTarget(
             name: "Libavformat",
-            path: "dist/release/Libavformat.xcframework.zip"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-n8.1-ios-landscape.1/Libavformat.xcframework.zip",
+            checksum: "712ce880d68277ca677ca762c2b59f5b325abc9c9f66a46ebc7ff6c282e16770"
         ),
         .binaryTarget(
             name: "Libavfilter",
-            path: "dist/release/Libavfilter.xcframework.zip"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-n8.1-ios-landscape.1/Libavfilter.xcframework.zip",
+            checksum: "5fefefc708f586e942d46fbcd0b902c15adfd95aa38cc37d18feecee888d859f"
         ),
         .binaryTarget(
             name: "Libavutil",
-            path: "dist/release/Libavutil.xcframework.zip"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-n8.1-ios-landscape.1/Libavutil.xcframework.zip",
+            checksum: "2f33c900dd5ae75ed1e3feaef170e64cad4a128a50f017b83d4177f04d577cdc"
         ),
         .binaryTarget(
             name: "Libswresample",
-            path: "dist/release/Libswresample.xcframework.zip"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-n8.1-ios-landscape.1/Libswresample.xcframework.zip",
+            checksum: "c6d3fdf0da1a97dd651edca339f60d06f953977666d689866efe2d4dd043196f"
         ),
         .binaryTarget(
             name: "Libswscale",
-            path: "dist/release/Libswscale.xcframework.zip"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-n8.1-ios-landscape.1/Libswscale.xcframework.zip",
+            checksum: "ded412ed3e96fc9fb0bc9b8b9995dca741772f705915cf00b3a2054dfef42fc2"
         ),
 
         .binaryTarget(
@@ -294,7 +301,8 @@ let package = Package(
 
         .binaryTarget(
             name: "Libmpv",
-            path: "dist/release/Libmpv.xcframework.zip"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-n8.1-ios-landscape.1/Libmpv.xcframework.zip",
+            checksum: "eec8311a7bb0eeeb1466e82e4f506ee56e9611f8f6da61ac94867be155452874"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
