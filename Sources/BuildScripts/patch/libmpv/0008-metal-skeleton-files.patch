@@ -1536,7 +1536,7 @@
 +}
 --- a/video/out/metal/ra_metal_renderpass.m
 +++ b/video/out/metal/ra_metal_renderpass.m
-@@ -0,0 +1,980 @@
+@@ -0,0 +1,992 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Apple Metal backend for mpv's render abstraction (ra). Parallel to
@@ -1889,8 +1889,20 @@
 +    }
 +    for (size_t i = 0; i < count; i++) {
 +        if (list[i].name && want_name && strcmp(list[i].name, want_name) == 0) {
-+            return (int)spvc_compiler_get_decoration(sc_compiler, list[i].id,
-+                                                     SpvDecorationBinding);
++            /* SPIRV-Cross assigns its OWN automatic MSL binding indices
++             * ([[texture(0)]], [[buffer(0)]] etc.) — these are NOT the same
++             * as SpvDecorationBinding (the layout(binding=N) from the
++             * original Vulkan-flavoured GLSL). Using the Vulkan binding
++             * makes setFragmentTexture:atIndex: target the wrong slot and
++             * the shader samples a random texture (e.g. dither LUT instead
++             * of the YUV planes → solid colored checkerboard output).
++             * msl_get_automatic_resource_binding returns the MSL index. */
++            unsigned msl_idx =
++                spvc_compiler_msl_get_automatic_resource_binding(sc_compiler,
++                                                                 list[i].id);
++            if (msl_idx == (unsigned)-1)
++                return -1;
++            return (int)msl_idx;
 +        }
 +    }
 +    return -1;
