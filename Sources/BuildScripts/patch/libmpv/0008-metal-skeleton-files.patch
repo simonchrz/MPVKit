@@ -1536,7 +1536,7 @@
 +}
 --- a/video/out/metal/ra_metal_renderpass.m
 +++ b/video/out/metal/ra_metal_renderpass.m
-@@ -0,0 +1,979 @@
+@@ -0,0 +1,980 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Apple Metal backend for mpv's render abstraction (ra). Parallel to
@@ -2104,11 +2104,14 @@
 +    pass->params.cached_program = (struct bstr){0};
 +
 +    // === 8. Cleanup ===
++    // NOTE: don't talloc_free(spirv) — it's owned by ra_ctx (set up by
++    // spirv_compiler_init in ra_init_metal). Freeing it nulls ctx->spirv's
++    // backing memory; the talloc allocator reuses that slot for the next
++    // allocation → next renderpass_create reads fns=NULL → silent fail.
 +    metal_shader_stage_uninit(&vert);
 +    metal_shader_stage_uninit(&frag);
 +    metal_shader_stage_uninit(&comp);
 +    talloc_free(ta_ctx);
-+    talloc_free(spirv);
 +    return pass;
 +
 +fail:
@@ -2118,8 +2121,6 @@
 +    if (pass)
 +        talloc_free(pass);
 +    talloc_free(ta_ctx);
-+    if (spirv)
-+        talloc_free(spirv);
 +    return NULL;
 +}
 +
