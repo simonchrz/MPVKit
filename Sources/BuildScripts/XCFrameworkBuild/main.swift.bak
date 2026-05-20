@@ -390,8 +390,6 @@ private class BuildMPV: BaseBuild {
             "-Duchardet=enabled",
             "-Dvulkan=enabled",
             "-Dmoltenvk=enabled",  // from patch option
-            "-Dmetal=auto",  // Phase-2 Metal RA backend (untested)
-
 
             "-Djavascript=disabled",
             "-Dzimg=disabled",
