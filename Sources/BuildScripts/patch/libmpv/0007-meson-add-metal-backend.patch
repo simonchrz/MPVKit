@@ -2,10 +2,28 @@ diff --git a/meson.build b/meson.build
 index fb10be5..030eebd 100644
 --- a/meson.build
 +++ b/meson.build
-@@ -1330,6 +1330,37 @@ if features['vulkan'] and features['x11']
+@@ -996,7 +996,7 @@ if features['sdl2-video']
+ endif
+
+ shaderc = dependency('shaderc', required:
+-    get_option('shaderc').require(features['win32-desktop']))
++    get_option('shaderc').require(features['win32-desktop'] or (darwin and get_option('metal').allowed())))
+ features += {'shaderc': shaderc.found()}
+ if features['shaderc']
+     dependencies += shaderc
+@@ -1016,7 +1016,7 @@ if features['posix']
+ endif
+
+ spirv_cross = dependency('spirv-cross-c-shared', required:
+-    get_option('spirv-cross').require(features['win32-desktop']))
++    get_option('spirv-cross').require(features['win32-desktop'] or (darwin and get_option('metal').allowed())))
+ features += {'spirv-cross': spirv_cross.found()}
+ if features['spirv-cross']
+     dependencies += spirv_cross
+@@ -1330,6 +1330,38 @@ if features['vulkan'] and features['x11']
       sources += files('video/out/vulkan/context_xlib.c')
  endif
- 
+
 +if host_machine.system() == 'darwin'
 +    moltenvk = get_option('moltenvk').require(
 +        features['vulkan'],
@@ -17,10 +35,11 @@ index fb10be5..030eebd 100644
 +    endif
 +endif
 +
-+# Apple Metal render backend
++# Apple Metal render backend.
++# Needs shaderc (GLSL -> SPIR-V) and spirv-cross (SPIR-V -> MSL), mirroring d3d11.
 +metal_opt = get_option('metal').require(
-+    darwin,
-+    error_message: 'Metal backend is only available on Apple platforms (macOS/iOS).',
++    darwin and features['shaderc'] and features['spirv-cross'],
++    error_message: 'Metal backend needs darwin platform plus shaderc and spirv-cross.',
 +)
 +metal_dep = dependency('appleframeworks', modules: ['Metal', 'Foundation'],
 +                       required: metal_opt)
@@ -57,6 +76,6 @@ index 52782f7..1ff18d2 100644
  option('videotoolbox-gl', type: 'feature', value: 'auto', description: 'Videotoolbox with OpenGL')
  option('videotoolbox-pl', type: 'feature', value: 'auto', description: 'Videotoolbox with libplacebo')
 +option('moltenvk', type: 'feature', value: 'auto', description: 'Moltenvk context')
- 
+
  # macOS features
  option('macos-10-15-4-features', type: 'feature', value: 'auto', description: 'macOS 10.15.4 SDK Features')

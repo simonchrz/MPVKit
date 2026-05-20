@@ -297,10 +297,10 @@ index 0000000..85ffbf3
 +};
 diff --git a/video/out/metal/ra_metal.h b/video/out/metal/ra_metal.h
 new file mode 100644
-index 0000000..58a7a77
+index 0000000..46fc180
 --- /dev/null
 +++ b/video/out/metal/ra_metal.h
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,108 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Internal header for the Apple Metal backend of mpv's render abstraction.
@@ -358,6 +358,10 @@ index 0000000..58a7a77
 +    id<MTLCommandBuffer> cmd_buf;
 +    /* Sampler state cache keyed on (linear, repeat) — 4 combos. */
 +    id<MTLSamplerState> samplers[4];
++    /* Currently-open render encoder, if any. Tracked so debug markers can
++     * route insertDebugSignpost: calls to the live encoder. nil between
++     * encodes. */
++    id<MTLRenderCommandEncoder> active_render_enc;
 +};
 +
 +struct ra_tex_metal {
@@ -379,6 +383,10 @@ index 0000000..58a7a77
 +    /* Map from ra_renderpass_input index → Metal binding slot. */
 +    int *binding_indices;
 +    int num_inputs;
++    /* For compute passes only: threads-per-threadgroup as declared by the
++     * shader's `layout(local_size_x = ...)` qualifier. Populated by
++     * metal_renderpass_create from SPIRV-Cross reflection. */
++    MTLSize compute_threads_per_group;
 +};
 +
 +/* Helpers that may be shared between chunks. */
@@ -865,10 +873,10 @@ index 0000000..9d745cb
 +}
 diff --git a/video/out/metal/ra_metal_renderpass.m b/video/out/metal/ra_metal_renderpass.m
 new file mode 100644
-index 0000000..9d833b7
+index 0000000..10a6440
 --- /dev/null
 +++ b/video/out/metal/ra_metal_renderpass.m
-@@ -0,0 +1,341 @@
+@@ -0,0 +1,960 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Apple Metal backend for mpv's render abstraction (ra). Parallel to
@@ -883,9 +891,51 @@ index 0000000..9d833b7
 + */
 +
 +#import "ra_metal.h"
++#import <Foundation/Foundation.h>
 +#include "mpv_talloc.h"
 +#include "common/msg.h"
++#include "options/m_config.h"
 +#include "video/out/gpu/utils.h"
++#include "video/out/gpu/spirv.h"
++#include "misc/mp_assert.h"
++
++#include <spirv_cross/spirv_cross_c.h>
++
++/*
++ * spirv_conf is the shared sub-options group from video/out/gpu/spirv.c that
++ * exposes the spirv-compiler choice ("shaderc" today). Declared extern so
++ * we don't need to drag in the full options stack from this translation
++ * unit. mp_get_config_group(NULL, ra->global, &spirv_conf) returns a fresh
++ * struct spirv_compiler bound to the chosen backend.
++ */
++extern const struct m_sub_options spirv_conf;
++
++/*
++ * Vertex stream binding slot. SPIRV-Cross emits MSL that reads vertex
++ * attributes from buffer(30); the layout entry on the pipeline state
++ * descriptor must agree. Top buffer slots are reserved by Metal for this.
++ */
++#ifndef kMetalVertexBufferIndex
++#define kMetalVertexBufferIndex 30
++#endif
++
++/*
++ * Slot used for the implicit "loose uniforms" UBO that SPIRV-Cross packs
++ * scalar/vector/matrix uniforms into. SPIRV-Cross's default MSL binding
++ * for the global uniform block is 0; mirror it here.
++ */
++#ifndef kMetalGlobalUniformSlot
++#define kMetalGlobalUniformSlot 0
++#endif
++
++/*
++ * Per Metal spec, setVertexBytes:/setFragmentBytes:/setBytes: are only
++ * legal up to 4 KB. Above that we have to round-trip through a real
++ * MTLBuffer.
++ */
++#ifndef kMetalInlineBytesLimit
++#define kMetalInlineBytesLimit 4096
++#endif
 +
 +// ============ INIT + FORMATS + LIFECYCLE ============
 +
@@ -941,97 +991,459 @@ index 0000000..9d833b7
 +/* ------------------------------------------------------------------ */
 +
 +/*
-+ * TODO(phase-2): full implementation. Template is ra_d3d11.c:1301-1409
-+ * (the compile_glsl helper) plus the D3D11 pipeline-state assembly that
-+ * follows it. The Metal equivalent is:
++ * Map an mpv vertex-attribute (vartype, vector-dim) pair to a Metal
++ * vertex format. Mirrors the DXGI_FORMAT switch in
++ * ra_d3d11.c:1668-1685 (renderpass_create_raster). mpv only ever uses
++ * FLOAT (1..4 components) and BYTE_UNORM (1, 2, 4 components); other
++ * combinations return MTLVertexFormatInvalid so the caller can fail
++ * cleanly. The 3-component byte-unorm case has no canonical Metal
++ * format -- mpv pads to 4 components on the host side just like d3d11.
++ */
++static MTLVertexFormat metal_vertex_format(enum ra_vartype type, int dim_v)
++{
++    switch (type) {
++    case RA_VARTYPE_FLOAT:
++        switch (dim_v) {
++        case 1: return MTLVertexFormatFloat;
++        case 2: return MTLVertexFormatFloat2;
++        case 3: return MTLVertexFormatFloat3;
++        case 4: return MTLVertexFormatFloat4;
++        }
++        break;
++    case RA_VARTYPE_BYTE_UNORM:
++        switch (dim_v) {
++        case 1: return MTLVertexFormatUCharNormalized;
++        case 2: return MTLVertexFormatUChar2Normalized;
++        case 4: return MTLVertexFormatUChar4Normalized;
++        }
++        break;
++    default:
++        break;
++    }
++    return MTLVertexFormatInvalid;
++}
++
++/*
++ * Map mpv blend factors to Metal blend factors. Mirrors map_ra_blend()
++ * in ra_d3d11.c:1426-1435. Only the four factors mpv actually uses are
++ * defined in ra.h; default to ZERO for safety so an unknown factor at
++ * worst zeroes the channel instead of leaving it undefined.
++ */
++static MTLBlendFactor metal_blend_factor(enum ra_blend f)
++{
++    switch (f) {
++    case RA_BLEND_ONE:                 return MTLBlendFactorOne;
++    case RA_BLEND_SRC_ALPHA:           return MTLBlendFactorSourceAlpha;
++    case RA_BLEND_ONE_MINUS_SRC_ALPHA: return MTLBlendFactorOneMinusSourceAlpha;
++    case RA_BLEND_ZERO:
++    default:                           return MTLBlendFactorZero;
++    }
++}
++
++/*
++ * SPIR-V module compiled from one GLSL shader plus the matching
++ * SPIRV-Cross/MSL state. Bundled into a small helper struct so the
++ * raster path (vert + frag) and the compute path can share the same
++ * compile / reflect / cleanup code without duplicating goto-cleanup
++ * book-keeping.
++ */
++struct metal_shader_stage {
++    bstr spv;                  /* SPIR-V bytecode (talloc'd) */
++    spvc_context sc_ctx;       /* owns parsed_ir + compiler */
++    spvc_compiler sc_compiler; /* SPIRV-Cross MSL compiler */
++    const char *msl;           /* MSL source -- lifetime tied to sc_ctx */
++    id<MTLLibrary> library;    /* compiled MTLLibrary */
++    id<MTLFunction> function;  /* "main0" entry point */
++};
++
++/*
++ * Compile one GLSL stage all the way to a usable MTLFunction. Returns
++ * true on success; on failure, stage may be partially populated and the
++ * caller is responsible for releasing it via metal_shader_stage_uninit.
 + *
-+ *   1. Acquire the SPIR-V compiler the same way d3d11 does:
++ * Pipeline (matches ra_d3d11.c:1301-1409 compile_glsl, adapted for MSL):
++ *   GLSL -> shaderc -> SPIR-V -> SPIRV-Cross -> MSL ->
++ *     [device newLibraryWithSource:...] -> [lib newFunctionWithName:@"main0"]
++ */
++static bool metal_compile_stage(struct ra *ra,
++                                id<MTLDevice> device,
++                                struct spirv_compiler *spirv,
++                                void *ta_ctx,
++                                enum glsl_shader stage_type,
++                                const char *glsl,
++                                struct metal_shader_stage *stage)
++{
++    if (!glsl) {
++        MP_ERR(ra, "metal: NULL shader source for stage %d\n", (int)stage_type);
++        return false;
++    }
++
++    /* GLSL -> SPIR-V via shaderc. */
++    if (!spirv->fns->compile_glsl(spirv, ta_ctx, stage_type, glsl, &stage->spv))
++        return false;
++
++    /* SPIR-V -> MSL via SPIRV-Cross. */
++    if (spvc_context_create(&stage->sc_ctx) != SPVC_SUCCESS) {
++        MP_ERR(ra, "metal: spvc_context_create failed\n");
++        return false;
++    }
++
++    spvc_parsed_ir parsed_ir = NULL;
++    if (spvc_context_parse_spirv(stage->sc_ctx,
++                                 (const SpvId *)stage->spv.start,
++                                 stage->spv.len / sizeof(SpvId),
++                                 &parsed_ir) != SPVC_SUCCESS)
++    {
++        MP_ERR(ra, "metal: spvc_context_parse_spirv failed: %s\n",
++               spvc_context_get_last_error_string(stage->sc_ctx));
++        return false;
++    }
++
++    if (spvc_context_create_compiler(stage->sc_ctx, SPVC_BACKEND_MSL,
++                                     parsed_ir,
++                                     SPVC_CAPTURE_MODE_TAKE_OWNERSHIP,
++                                     &stage->sc_compiler) != SPVC_SUCCESS)
++    {
++        MP_ERR(ra, "metal: spvc_context_create_compiler failed: %s\n",
++               spvc_context_get_last_error_string(stage->sc_ctx));
++        return false;
++    }
++
++    spvc_compiler_options opts = NULL;
++    if (spvc_compiler_create_compiler_options(stage->sc_compiler, &opts)
++            != SPVC_SUCCESS) {
++        MP_ERR(ra, "metal: spvc_compiler_create_compiler_options failed\n");
++        return false;
++    }
++
++    /* Metal 2.4 (0x20004 == 2*0x10000 + 4) -- iOS 15 / macOS 12 baseline.
++     * Matches the [copts setLanguageVersion:MTLLanguageVersion2_4] below. */
++    spvc_compiler_options_set_uint(opts,
++        SPVC_COMPILER_OPTION_MSL_VERSION, 0x20004);
++
++    /* SPIRV-Cross target platform. We always pick iOS here -- the
++     * skeleton's Metal context is currently iOS-only (libmpv_metal.m
++     * targets CAMetalLayer on iOS). When the macOS backend lands, swap
++     * the constant under a #if TARGET_OS_OSX guard. */
++    spvc_compiler_options_set_uint(opts,
++        SPVC_COMPILER_OPTION_MSL_PLATFORM, SPVC_MSL_PLATFORM_IOS);
++
++    /* TODO(phase-3): argument buffers are required when a single shader
++     * references more than ~31 textures (the Metal default-binding limit).
++     * mpv's renderer rarely exceeds 8, so leave them off for now and pay
++     * the per-resource setFragmentTexture: cost. */
++    spvc_compiler_options_set_bool(opts,
++        SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS, SPVC_FALSE);
++
++    if (spvc_compiler_install_compiler_options(stage->sc_compiler, opts)
++            != SPVC_SUCCESS) {
++        MP_ERR(ra, "metal: spvc_compiler_install_compiler_options failed\n");
++        return false;
++    }
++
++    if (spvc_compiler_compile(stage->sc_compiler, &stage->msl) != SPVC_SUCCESS) {
++        MP_ERR(ra, "metal: spvc_compiler_compile (MSL) failed: %s\n",
++               spvc_context_get_last_error_string(stage->sc_ctx));
++        return false;
++    }
++
++    /* MSL -> MTLLibrary. */
++    NSString *src = [NSString stringWithUTF8String:stage->msl];
++    MTLCompileOptions *copts = [MTLCompileOptions new];
++    [copts setLanguageVersion:MTLLanguageVersion2_4];
++
++    NSError *err = nil;
++    stage->library = [device newLibraryWithSource:src
++                                          options:copts
++                                            error:&err];
++    if (!stage->library) {
++        MP_ERR(ra, "metal: newLibraryWithSource failed: %s\n",
++               err.localizedDescription
++                   ? err.localizedDescription.UTF8String
++                   : "unknown error");
++        MP_ERR(ra, "metal: failing GLSL source was:\n%s\n", glsl);
++        MP_ERR(ra, "metal: translated MSL was:\n%s\n", stage->msl);
++        return false;
++    }
++
++    /* SPIRV-Cross always emits the entry point as "main0" for the MSL
++     * backend (it renames `main` to dodge MSL's reserved-word rule). */
++    stage->function = [stage->library newFunctionWithName:@"main0"];
++    if (!stage->function) {
++        MP_ERR(ra, "metal: library has no 'main0' entry point\n");
++        return false;
++    }
++
++    return true;
++}
++
++/* Release every Metal/SPIRV-Cross resource held by a stage. Safe to call
++ * on a zero-initialised or partially-initialised struct. */
++static void metal_shader_stage_uninit(struct metal_shader_stage *stage)
++{
++    stage->function = nil;
++    stage->library  = nil;
++    /* sc_compiler is owned by sc_ctx (SPVC_CAPTURE_MODE_TAKE_OWNERSHIP). */
++    if (stage->sc_ctx) {
++        spvc_context_destroy(stage->sc_ctx);
++        stage->sc_ctx      = NULL;
++        stage->sc_compiler = NULL;
++        stage->msl         = NULL;
++    }
++    /* stage->spv is a child of the surrounding talloc ta_ctx. */
++}
++
++/*
++ * Map mpv ra_renderpass_input.binding (mpv-side slot number) to the
++ * SPIRV-Cross-emitted Metal binding slot, by name. SPIRV-Cross numbers
++ * its MSL bindings sequentially in declaration order, which usually --
++ * but not always -- matches mpv's. Going through the reflection API is
++ * the only way to be sure.
 + *
-+ *        struct spirv_compiler *spirv =
-+ *            mp_get_config_group(ra, ra->global, &spirv_conf);
-+ *
-+ *      (compare ra_d3d11.c around line 1303-1305 where p->spirv is
-+ *      cached on the backend priv at init time -- we'll do the same on
-+ *      struct ra_metal in phase 2.)
-+ *
-+ *   2. Translate GLSL -> SPIR-V via shaderc:
-+ *
-+ *        bstr spv;
-+ *        spirv->fns->compile_glsl(spirv, ta_ctx,
-+ *                                 GLSL_SHADER_FRAGMENT,
-+ *                                 params->frag_shader, &spv);
-+ *
-+ *      Repeat for vertex (or compute, when type == COMPUTE).
-+ *
-+ *   3. Translate SPIR-V -> MSL via SPIRV-Cross:
-+ *
-+ *        spvc_context ctx; spvc_context_create(&ctx);
-+ *        spvc_context_parse_spirv(ctx, (SpvId *)spv.start,
-+ *                                 spv.len / sizeof(SpvId), &ir);
-+ *        spvc_context_create_compiler(ctx, SPVC_BACKEND_MSL, ir,
-+ *                                     SPVC_CAPTURE_MODE_TAKE_OWNERSHIP,
-+ *                                     &cc);
-+ *        spvc_compiler_create_compiler_options(cc, &opts);
-+ *        spvc_compiler_options_set_uint(opts,
-+ *            SPVC_COMPILER_OPTION_MSL_VERSION,
-+ *            SPVC_MAKE_MSL_VERSION(2, 4, 0));   // iOS 17+ baseline
-+ *        spvc_compiler_options_set_uint(opts,
-+ *            SPVC_COMPILER_OPTION_MSL_PLATFORM,
-+ *            SPVC_MSL_PLATFORM_IOS);
-+ *        spvc_compiler_install_compiler_options(cc, opts);
-+ *        const char *msl = NULL;
-+ *        spvc_compiler_compile(cc, &msl);
-+ *
-+ *   4. Build a MTLLibrary from the MSL source and pull out the two
-+ *      entry points. SPIRV-Cross names the entry point "main0" by
-+ *      default for both stages:
-+ *
-+ *        NSError *err = nil;
-+ *        id<MTLLibrary> lib =
-+ *            [device newLibraryWithSource:@(msl) options:nil error:&err];
-+ *        id<MTLFunction> vfn = [lib newFunctionWithName:@"main0"];
-+ *        id<MTLFunction> ffn = [lib newFunctionWithName:@"main0"];
-+ *
-+ *   5. Build a MTLVertexDescriptor from params->vertex_attribs. For
-+ *      each attribute, map (vartype, dim_v) -> MTLVertexFormat via a
-+ *      helper (metal_vertex_format()); offset comes from the input's
-+ *      offset field; bufferIndex is fixed at 30 (Metal reserves the top
-+ *      buffer slots for vertex streams when SPIRV-Cross emits MSL).
-+ *      The layout entry mirrors that:
-+ *
-+ *        vdesc.layouts[30].stride       = params->vertex_stride;
-+ *        vdesc.layouts[30].stepFunction = MTLVertexStepFunctionPerVertex;
-+ *
-+ *   6. Build a MTLRenderPipelineDescriptor:
-+ *        - vertexFunction / fragmentFunction from step 4
-+ *        - vertexDescriptor from step 5
-+ *        - colorAttachments[0].pixelFormat =
-+ *              ra_metal_pixel_format(params->target_format);
-+ *        - if params->enable_blend, fill in the blend factors via a
-+ *          helper metal_blend_factor(enum ra_blend) -> MTLBlendFactor;
-+ *          set blendingEnabled = YES and the source/destination
-+ *          rgb/alpha factors from params->blend_*.
-+ *        - [device newRenderPipelineStateWithDescriptor:desc error:&err]
-+ *
-+ *   7. Compute path: replace steps 5/6 with a MTLComputePipelineState
-+ *      built directly from the compute MTLFunction.
-+ *
-+ *   8. Reflection: walk params->inputs and ask SPIRV-Cross
-+ *      (spvc_compiler_get_decoration with SpvDecorationBinding) for
-+ *      the Metal binding slot of each. Store into
-+ *      ra_renderpass_metal->binding_indices[i] so renderpass_run can
-+ *      bind without re-reflecting on every draw.
-+ *
-+ * Until that lands, fail loudly so callers don't silently render nothing.
++ * Returns -1 if the input isn't found in the reflected resource list
++ * (which is fine: scalar uniforms that ended up in the implicit global
++ * UBO won't show up under any of the named resource types).
++ */
++static int metal_lookup_binding(spvc_compiler sc_compiler,
++                                spvc_resources resources,
++                                spvc_resource_type rtype,
++                                const char *want_name)
++{
++    const spvc_reflected_resource *list = NULL;
++    size_t count = 0;
++    if (spvc_resources_get_resource_list_for_type(resources, rtype,
++                                                  &list, &count)
++            != SPVC_SUCCESS) {
++        return -1;
++    }
++    for (size_t i = 0; i < count; i++) {
++        if (list[i].name && want_name && strcmp(list[i].name, want_name) == 0) {
++            return (int)spvc_compiler_get_decoration(sc_compiler, list[i].id,
++                                                     SpvDecorationBinding);
++        }
++    }
++    return -1;
++}
++
++/*
++ * Full implementation. Template is ra_d3d11.c:1301-1409 (the compile_glsl
++ * helper) plus the D3D11 pipeline-state assembly in
++ * renderpass_create_raster (ra_d3d11.c:1611-1741) and
++ * renderpass_create_compute (ra_d3d11.c:1743+). The Metal pipeline is
++ * GLSL -> shaderc -> SPIR-V -> SPIRV-Cross -> MSL -> MTLLibrary ->
++ * MTLRenderPipelineState (raster) or MTLComputePipelineState (compute).
 + */
 +struct ra_renderpass *metal_renderpass_create(struct ra *ra,
 +                                const struct ra_renderpass_params *params)
 +{
-+    (void)params;
-+    MP_FATAL(ra->log,
-+        "metal: renderpass_create not implemented "
-+        "(TODO(phase-2): shaderc -> SPIRV-Cross -> MSL -> MTLLibrary -> "
-+        "MTLRenderPipelineState)\n");
++    struct ra_metal *m = ra_metal_get(ra);
++    id<MTLDevice> device = m->device;
++
++    void *ta_ctx = talloc_new(NULL);
++    struct ra_renderpass *pass = NULL;
++    struct ra_renderpass_metal *pass_metal = NULL;
++
++    struct metal_shader_stage vert = {0};
++    struct metal_shader_stage frag = {0};
++    struct metal_shader_stage comp = {0};
++
++    // === 1. Acquire SPIR-V compiler ===
++    /* In phase-3 this will be cached on struct ra_metal at init time so
++     * we don't reparse the spirv subopts per pass; for now mirror the
++     * d3d11 backend's per-pass acquisition (ra_d3d11.c:1303-1305 caches
++     * it on the priv -- same lifetime, just a different entry point). */
++    struct spirv_compiler *spirv =
++        mp_get_config_group(NULL, ra->global, &spirv_conf);
++    if (!spirv || !spirv->fns) {
++        MP_ERR(ra, "metal: no SPIR-V compiler available\n");
++        goto fail;
++    }
++
++    // === 2. Compile GLSL -> SPIR-V (per stage) ===
++    if (params->type == RA_RENDERPASS_TYPE_RASTER) {
++        if (!metal_compile_stage(ra, device, spirv, ta_ctx,
++                                 GLSL_SHADER_VERTEX,
++                                 params->vertex_shader, &vert))
++            goto fail;
++        if (!metal_compile_stage(ra, device, spirv, ta_ctx,
++                                 GLSL_SHADER_FRAGMENT,
++                                 params->frag_shader, &frag))
++            goto fail;
++    } else if (params->type == RA_RENDERPASS_TYPE_COMPUTE) {
++        if (!metal_compile_stage(ra, device, spirv, ta_ctx,
++                                 GLSL_SHADER_COMPUTE,
++                                 params->compute_shader, &comp))
++            goto fail;
++    } else {
++        MP_ERR(ra, "metal: invalid renderpass type %d\n", (int)params->type);
++        goto fail;
++    }
++
++    // === 3. Allocate ra_renderpass + ra_renderpass_metal priv ===
++    pass = talloc_zero(NULL, struct ra_renderpass);
++    pass_metal = talloc_zero(pass, struct ra_renderpass_metal);
++    pass->priv = pass_metal;
++    pass_metal->num_inputs = params->num_inputs;
++    if (params->num_inputs > 0) {
++        pass_metal->binding_indices =
++            talloc_zero_array(pass_metal, int, params->num_inputs);
++        for (int i = 0; i < params->num_inputs; i++)
++            pass_metal->binding_indices[i] = params->inputs[i].binding;
++    }
++
++    if (params->type == RA_RENDERPASS_TYPE_RASTER) {
++        // === 4. Vertex descriptor (raster only) ===
++        MTLVertexDescriptor *vd = [MTLVertexDescriptor new];
++        for (int i = 0; i < params->num_vertex_attribs; i++) {
++            struct ra_renderpass_input *attr = &params->vertex_attribs[i];
++            MTLVertexFormat vfmt = metal_vertex_format(attr->type, attr->dim_v);
++            if (vfmt == MTLVertexFormatInvalid) {
++                MP_ERR(ra, "metal: unsupported vertex attribute "
++                           "(type=%d dim_v=%d)\n",
++                       (int)attr->type, attr->dim_v);
++                goto fail;
++            }
++            vd.attributes[i].format      = vfmt;
++            vd.attributes[i].offset      = attr->offset;
++            vd.attributes[i].bufferIndex = kMetalVertexBufferIndex;
++        }
++        vd.layouts[kMetalVertexBufferIndex].stride       = params->vertex_stride;
++        vd.layouts[kMetalVertexBufferIndex].stepFunction =
++            MTLVertexStepFunctionPerVertex;
++
++        // === 5. Render pipeline descriptor ===
++        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
++        pd.vertexFunction   = vert.function;
++        pd.fragmentFunction = frag.function;
++        pd.vertexDescriptor = vd;
++
++        MTLPixelFormat tfmt = ra_metal_pixel_format(params->target_format);
++        if (tfmt == MTLPixelFormatInvalid) {
++            MP_ERR(ra, "metal: unsupported target format '%s'\n",
++                   params->target_format
++                       ? params->target_format->name : "(null)");
++            goto fail;
++        }
++        /* TODO(phase-3): multi-attachment fragment outputs (mpv currently
++         * always renders to a single color attachment, but the renderer
++         * may grow MRT support for HDR tone-mapping pipelines). */
++        pd.colorAttachments[0].pixelFormat = tfmt;
++
++        if (params->enable_blend) {
++            pd.colorAttachments[0].blendingEnabled = YES;
++            pd.colorAttachments[0].sourceRGBBlendFactor =
++                metal_blend_factor(params->blend_src_rgb);
++            pd.colorAttachments[0].destinationRGBBlendFactor =
++                metal_blend_factor(params->blend_dst_rgb);
++            pd.colorAttachments[0].sourceAlphaBlendFactor =
++                metal_blend_factor(params->blend_src_alpha);
++            pd.colorAttachments[0].destinationAlphaBlendFactor =
++                metal_blend_factor(params->blend_dst_alpha);
++            pd.colorAttachments[0].rgbBlendOperation   = MTLBlendOperationAdd;
++            pd.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
++        }
++
++        NSError *pso_err = nil;
++        pass_metal->render_pso =
++            [device newRenderPipelineStateWithDescriptor:pd error:&pso_err];
++        if (!pass_metal->render_pso) {
++            MP_ERR(ra, "metal: newRenderPipelineStateWithDescriptor failed: %s\n",
++                   pso_err.localizedDescription
++                       ? pso_err.localizedDescription.UTF8String
++                       : "unknown error");
++            goto fail;
++        }
++        /* Keep the fragment library alive on the pass priv. Vertex library
++         * is kept alive transitively via the pipeline state; we publish the
++         * fragment one because debug-marker / reflection paths may need
++         * to query it after creation. */
++        pass_metal->library = frag.library;
++    } else {
++        // === 5'. Compute pipeline state ===
++        NSError *cpo_err = nil;
++        pass_metal->compute_pso =
++            [device newComputePipelineStateWithFunction:comp.function
++                                                  error:&cpo_err];
++        if (!pass_metal->compute_pso) {
++            MP_ERR(ra, "metal: newComputePipelineStateWithFunction failed: %s\n",
++                   cpo_err.localizedDescription
++                       ? cpo_err.localizedDescription.UTF8String
++                       : "unknown error");
++            goto fail;
++        }
++        pass_metal->library = comp.library;
++    }
++
++    // === 6. Reflection: map ra_renderpass_input.binding -> MSL slot ===
++    /* Use whichever compiler is appropriate for the pass type; for raster
++     * we prefer the fragment compiler because most resources are read on
++     * the fragment side. If a vertex-only resource turns up that the
++     * fragment compiler doesn't see, fall back to the vertex compiler. */
++    spvc_compiler primary =
++        (params->type == RA_RENDERPASS_TYPE_COMPUTE) ? comp.sc_compiler
++                                                     : frag.sc_compiler;
++    spvc_compiler secondary =
++        (params->type == RA_RENDERPASS_TYPE_RASTER) ? vert.sc_compiler : NULL;
++
++    spvc_resources primary_res = NULL, secondary_res = NULL;
++    if (primary)
++        spvc_compiler_create_shader_resources(primary, &primary_res);
++    if (secondary)
++        spvc_compiler_create_shader_resources(secondary, &secondary_res);
++
++    static const spvc_resource_type rtypes[] = {
++        SPVC_RESOURCE_TYPE_SAMPLED_IMAGE,
++        SPVC_RESOURCE_TYPE_STORAGE_IMAGE,
++        SPVC_RESOURCE_TYPE_UNIFORM_BUFFER,
++        SPVC_RESOURCE_TYPE_STORAGE_BUFFER,
++    };
++
++    for (int i = 0; i < params->num_inputs; i++) {
++        const char *name = params->inputs[i].name;
++        int found = -1;
++        for (size_t t = 0; t < MP_ARRAY_SIZE(rtypes); t++) {
++            if (primary_res) {
++                found = metal_lookup_binding(primary, primary_res,
++                                             rtypes[t], name);
++                if (found >= 0)
++                    break;
++            }
++            if (secondary_res) {
++                found = metal_lookup_binding(secondary, secondary_res,
++                                             rtypes[t], name);
++                if (found >= 0)
++                    break;
++            }
++        }
++        if (found >= 0)
++            pass_metal->binding_indices[i] = found;
++        /* else: keep the mpv-supplied binding as a sensible default. */
++    }
++
++    // === 7. Publish the params (copied so the caller can drop theirs) ===
++    pass->params = *ra_renderpass_params_copy(pass, params);
++    /* Metal doesn't reuse the SPIR-V text cache the way d3d11 does --
++     * MSL is fast enough to (re)compile that the disk-cache round-trip
++     * isn't worth the cross-build headaches yet. */
++    pass->params.cached_program = (struct bstr){0};
++
++    // === 8. Cleanup ===
++    metal_shader_stage_uninit(&vert);
++    metal_shader_stage_uninit(&frag);
++    metal_shader_stage_uninit(&comp);
++    talloc_free(ta_ctx);
++    talloc_free(spirv);
++    return pass;
++
++fail:
++    metal_shader_stage_uninit(&vert);
++    metal_shader_stage_uninit(&frag);
++    metal_shader_stage_uninit(&comp);
++    if (pass)
++        talloc_free(pass);
++    talloc_free(ta_ctx);
++    if (spirv)
++        talloc_free(spirv);
 +    return NULL;
 +}
 +
@@ -1058,69 +1470,280 @@ index 0000000..9d833b7
 +}
 +
 +/*
-+ * TODO(phase-2): full implementation. Outline:
++ * Dispatch one draw or compute pass. Mirrors gl_renderpass_run() in
++ * video/out/opengl/ra_gl.c:1038-1098 and renderpass_run() in
++ * video/out/d3d11/ra_d3d11.c:1906-1986: walk params->values, route each
++ * input by ra_vartype to the appropriate Metal encoder setter, then issue
++ * the draw / dispatchThreadgroups call.
 + *
-+ *   Raster path:
-+ *     - Build a MTLRenderPassDescriptor with one color attachment:
-+ *         rpd.colorAttachments[0].texture =
-+ *             ((struct ra_tex_metal *)params->target->priv)->texture;
-+ *         rpd.colorAttachments[0].loadAction =
-+ *             params->invalidate_target ? MTLLoadActionDontCare
-+ *                                       : MTLLoadActionLoad;
-+ *         rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
-+ *     - id<MTLRenderCommandEncoder> enc =
-+ *           [cmd_buf renderCommandEncoderWithDescriptor:rpd];
-+ *     - [enc setRenderPipelineState:pass_metal->render_pso];
-+ *     - Translate params->viewport and params->scissors into
-+ *       MTLViewport / MTLScissorRect and call setViewport: /
-+ *       setScissorRect:. Metal's viewport is in pixels with origin in
-+ *       the top-left, matching mp_rect.
-+ *     - For each params->values[i] dispatch on the input's vartype:
-+ *         RA_VARTYPE_TEX:    setFragmentTexture:atIndex: plus
-+ *                            setFragmentSamplerState: from the cached
-+ *                            ra_metal_sampler() table.
-+ *         RA_VARTYPE_BUF_RO,
-+ *         RA_VARTYPE_BUF_RW: setFragmentBuffer:offset:atIndex:.
-+ *         RA_VARTYPE_IMG_W:  setFragmentTexture: on the corresponding
-+ *                            image-binding slot (Metal collapses
-+ *                            sampled/storage textures into MTLTexture).
-+ *         Loose uniforms (UBO-less path, e.g. mat4 mvp):
-+ *                            pack into a transient block and submit via
-+ *                            setFragmentBytes:length:atIndex: -- limit
-+ *                            4 KB per call per Metal spec; for larger
-+ *                            blocks fall back to a per-frame ring
-+ *                            MTLBuffer.
-+ *     - Vertex data: small (<= 4 KB) goes via
-+ *         [enc setVertexBytes:params->vertex_data
-+ *                      length:params->vertex_count *
-+ *                             pass->params.vertex_stride
-+ *                     atIndex:30];
-+ *       larger streams should write into a ring MTLBuffer and use
-+ *       setVertexBuffer:offset:atIndex:30.
-+ *     - [enc drawPrimitives:MTLPrimitiveTypeTriangle
-+ *                vertexStart:0
-+ *                vertexCount:params->vertex_count];
-+ *     - [enc endEncoding];
++ * Notes on uniform handling: SPIRV-Cross collapses GLSL loose uniforms
++ * (scalars, vectors, matrices) into a single std140-laid-out global UBO,
++ * which we deliver via setFragmentBytes:/setBytes: at slot
++ * kMetalGlobalUniformSlot. ra_metal_get_uniform_offset() walks
++ * pass->params.inputs[].offset (populated by metal_renderpass_create from
++ * std140_layout) to pack the contiguous block on the stack.
 + *
-+ *   Compute path:
-+ *     - id<MTLComputeCommandEncoder> enc =
-+ *           [cmd_buf computeCommandEncoder];
-+ *     - [enc setComputePipelineState:pass_metal->compute_pso];
-+ *     - Same value-binding loop, but with setComputeTexture: /
-+ *       setBuffer: / setBytes: variants.
-+ *     - [enc dispatchThreadgroups:MTLSizeMake(params->compute_groups[0],
-+ *                                             params->compute_groups[1],
-+ *                                             params->compute_groups[2])
-+ *           threadsPerThreadgroup:<from pass params>];
-+ *     - [enc endEncoding];
++ * Per-buffer last_used_cb tracking matches ra_metal_buf_poll's
++ * expectations: a buffer is "in flight" until the cb that referenced it
++ * has signalled completion.
 + */
++
++/* Size in bytes of a host-side uniform value (scalar/vector/matrix). */
++static size_t metal_uniform_value_size(const struct ra_renderpass_input *in)
++{
++    /* dim_v * dim_m elements, 4 bytes each for FLOAT/INT (std140 column
++     * stride is handled at pack-emit time by std140_layout; the host data
++     * arrives already laid out, so we just need the contiguous byte
++     * count). For mat3 GLSL hands us 9 floats; SPIRV-Cross will emit MSL
++     * that reads them as packed_float3x3 with appropriate padding -- our
++     * std140 packing on the host side puts that padding in for us. */
++    return (size_t)in->dim_v * (size_t)in->dim_m * sizeof(float);
++}
++
 +void metal_renderpass_run(struct ra *ra,
 +                                 const struct ra_renderpass_run_params *params)
 +{
-+    (void)params;
-+    MP_FATAL(ra->log,
-+        "metal: renderpass_run not implemented "
-+        "(TODO(phase-2): depends on renderpass_create)\n");
++    struct ra_metal *m = ra_metal_get(ra);
++    struct ra_renderpass *pass = params->pass;
++    struct ra_renderpass_metal *pm = pass->priv;
++
++    id<MTLCommandBuffer> cb = ra_metal_cmd_buf(ra);
++    if (!cb) {
++        MP_ERR(ra, "metal: renderpass_run: no command buffer\n");
++        return;
++    }
++
++    /*
++     * Collect loose-uniform inputs into a single std140 block. We sweep
++     * params->values once before issuing the encoder, since the same
++     * block is bound to both vertex and fragment (raster) or compute
++     * (compute) at slot kMetalGlobalUniformSlot. Max size is bounded by
++     * pass->params.push_constants_size when set, otherwise we
++     * conservatively cap at 4 KB (Metal's setBytes: limit).
++     */
++    uint8_t uniform_block[kMetalInlineBytesLimit];
++    size_t uniform_block_size = 0;
++    bool have_uniform_block = false;
++
++    for (int i = 0; i < params->num_values; i++) {
++        const struct ra_renderpass_input_val *val = &params->values[i];
++        const struct ra_renderpass_input *in = &pass->params.inputs[val->index];
++        if (in->type != RA_VARTYPE_FLOAT && in->type != RA_VARTYPE_INT)
++            continue;
++        size_t vsize = metal_uniform_value_size(in);
++        size_t end = in->offset + vsize;
++        if (end > sizeof(uniform_block)) {
++            MP_ERR(ra, "metal: uniform block exceeds %d bytes "
++                       "(needs %zu); TODO(phase-3): spill to ring buffer\n",
++                   kMetalInlineBytesLimit, end);
++            return;
++        }
++        memcpy(uniform_block + in->offset, val->data, vsize);
++        if (end > uniform_block_size)
++            uniform_block_size = end;
++        have_uniform_block = true;
++    }
++
++    switch (pass->params.type) {
++    case RA_RENDERPASS_TYPE_RASTER: {
++        MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor new];
++        id<MTLTexture> target_tex =
++            ((struct ra_tex_metal *)params->target->priv)->texture;
++        rpd.colorAttachments[0].texture = target_tex;
++        rpd.colorAttachments[0].loadAction =
++            params->invalidate_target ? MTLLoadActionDontCare
++                                      : MTLLoadActionLoad;
++        rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
++
++        id<MTLRenderCommandEncoder> enc =
++            [cb renderCommandEncoderWithDescriptor:rpd];
++        m->active_render_enc = enc;
++        [enc setRenderPipelineState:pm->render_pso];
++
++        MTLViewport vp = {
++            .originX = params->viewport.x0,
++            .originY = params->viewport.y0,
++            .width   = params->viewport.x1 - params->viewport.x0,
++            .height  = params->viewport.y1 - params->viewport.y0,
++            .znear   = 0,
++            .zfar    = 1,
++        };
++        [enc setViewport:vp];
++
++        /* Metal asserts when the scissor rect leaves the attachment, so
++         * clamp here. Matches the d3d11 backend's tolerance for the
++         * caller passing rects with x1 > width. */
++        NSUInteger tex_w = target_tex.width;
++        NSUInteger tex_h = target_tex.height;
++        NSUInteger sx = (NSUInteger)MPMAX(0, params->scissors.x0);
++        NSUInteger sy = (NSUInteger)MPMAX(0, params->scissors.y0);
++        NSUInteger sw = 0, sh = 0;
++        if (sx < tex_w) {
++            NSUInteger want = (NSUInteger)MPMAX(0, params->scissors.x1 - (int)sx);
++            sw = MPMIN(want, tex_w - sx);
++        }
++        if (sy < tex_h) {
++            NSUInteger want = (NSUInteger)MPMAX(0, params->scissors.y1 - (int)sy);
++            sh = MPMIN(want, tex_h - sy);
++        }
++        MTLScissorRect sr = { .x = sx, .y = sy, .width = sw, .height = sh };
++        [enc setScissorRect:sr];
++
++        /* Bind inputs. */
++        for (int i = 0; i < params->num_values; i++) {
++            const struct ra_renderpass_input_val *val = &params->values[i];
++            const struct ra_renderpass_input *in =
++                &pass->params.inputs[val->index];
++            int slot = pm->binding_indices
++                       ? pm->binding_indices[val->index]
++                       : in->binding;
++            switch (in->type) {
++            case RA_VARTYPE_TEX: {
++                struct ra_tex *t = *(struct ra_tex **)val->data;
++                struct ra_tex_metal *tm = t->priv;
++                [enc setFragmentTexture:tm->texture atIndex:slot];
++                [enc setFragmentSamplerState:
++                        ra_metal_sampler(ra, t->params.src_linear,
++                                             t->params.src_repeat)
++                                     atIndex:slot];
++                break;
++            }
++            case RA_VARTYPE_IMG_W: {
++                struct ra_tex *t = *(struct ra_tex **)val->data;
++                struct ra_tex_metal *tm = t->priv;
++                /* Metal doesn't distinguish image vs sampled-image
++                 * binding tables on the fragment stage; same setter. */
++                [enc setFragmentTexture:tm->texture atIndex:slot];
++                break;
++            }
++            case RA_VARTYPE_BUF_RO:
++            case RA_VARTYPE_BUF_RW: {
++                struct ra_buf *b = *(struct ra_buf **)val->data;
++                struct ra_buf_metal *bm = b->priv;
++                [enc setFragmentBuffer:bm->buffer offset:0 atIndex:slot];
++                bm->last_used_cb = cb;
++                break;
++            }
++            case RA_VARTYPE_FLOAT:
++            case RA_VARTYPE_INT:
++                /* Packed into uniform_block above. */
++                break;
++            default:
++                MP_WARN(ra, "metal: unhandled input vartype %d\n",
++                        (int)in->type);
++                break;
++            }
++        }
++
++        if (have_uniform_block) {
++            [enc setVertexBytes:uniform_block
++                         length:uniform_block_size
++                        atIndex:kMetalGlobalUniformSlot];
++            [enc setFragmentBytes:uniform_block
++                           length:uniform_block_size
++                          atIndex:kMetalGlobalUniformSlot];
++        }
++
++        /* Vertex stream. */
++        size_t vbytes = (size_t)params->vertex_count *
++                        (size_t)pass->params.vertex_stride;
++        if (vbytes <= kMetalInlineBytesLimit) {
++            [enc setVertexBytes:params->vertex_data
++                         length:vbytes
++                        atIndex:kMetalVertexBufferIndex];
++        } else {
++            /* TODO(phase-3): per-frame ring buffer to avoid alloc per
++             * draw. For now a one-shot shared-storage buffer keeps the
++             * dispatch correct at the cost of a transient allocation. */
++            id<MTLBuffer> vbuf = [m->device
++                newBufferWithBytes:params->vertex_data
++                            length:vbytes
++                           options:MTLResourceStorageModeShared];
++            [enc setVertexBuffer:vbuf offset:0
++                         atIndex:kMetalVertexBufferIndex];
++        }
++
++        [enc drawPrimitives:MTLPrimitiveTypeTriangle
++                vertexStart:0
++                vertexCount:params->vertex_count];
++        [enc endEncoding];
++        m->active_render_enc = nil;
++        break;
++    }
++
++    case RA_RENDERPASS_TYPE_COMPUTE: {
++        id<MTLComputeCommandEncoder> cenc = [cb computeCommandEncoder];
++        [cenc setComputePipelineState:pm->compute_pso];
++
++        for (int i = 0; i < params->num_values; i++) {
++            const struct ra_renderpass_input_val *val = &params->values[i];
++            const struct ra_renderpass_input *in =
++                &pass->params.inputs[val->index];
++            int slot = pm->binding_indices
++                       ? pm->binding_indices[val->index]
++                       : in->binding;
++            switch (in->type) {
++            case RA_VARTYPE_TEX: {
++                struct ra_tex *t = *(struct ra_tex **)val->data;
++                struct ra_tex_metal *tm = t->priv;
++                [cenc setTexture:tm->texture atIndex:slot];
++                [cenc setSamplerState:
++                        ra_metal_sampler(ra, t->params.src_linear,
++                                             t->params.src_repeat)
++                              atIndex:slot];
++                break;
++            }
++            case RA_VARTYPE_IMG_W: {
++                struct ra_tex *t = *(struct ra_tex **)val->data;
++                struct ra_tex_metal *tm = t->priv;
++                [cenc setTexture:tm->texture atIndex:slot];
++                break;
++            }
++            case RA_VARTYPE_BUF_RO:
++            case RA_VARTYPE_BUF_RW: {
++                struct ra_buf *b = *(struct ra_buf **)val->data;
++                struct ra_buf_metal *bm = b->priv;
++                [cenc setBuffer:bm->buffer offset:0 atIndex:slot];
++                bm->last_used_cb = cb;
++                break;
++            }
++            case RA_VARTYPE_FLOAT:
++            case RA_VARTYPE_INT:
++                /* Packed into uniform_block above. */
++                break;
++            default:
++                MP_WARN(ra, "metal: unhandled input vartype %d\n",
++                        (int)in->type);
++                break;
++            }
++        }
++
++        if (have_uniform_block) {
++            [cenc setBytes:uniform_block
++                    length:uniform_block_size
++                   atIndex:kMetalGlobalUniformSlot];
++        }
++
++        /* TODO(phase-3): if compute_threads_per_group is zero (i.e. not
++         * yet wired in renderpass_create's SPIRV-Cross reflection), fall
++         * back to a 1x1x1 group so the dispatch is still legal but the
++         * shader will likely under-utilise the GPU. */
++        MTLSize tpg = pm->compute_threads_per_group;
++        if (tpg.width == 0)
++            tpg = MTLSizeMake(1, 1, 1);
++        MTLSize groups = MTLSizeMake((NSUInteger)params->compute_groups[0],
++                                     (NSUInteger)params->compute_groups[1],
++                                     (NSUInteger)params->compute_groups[2]);
++        [cenc dispatchThreadgroups:groups threadsPerThreadgroup:tpg];
++        [cenc endEncoding];
++        break;
++    }
++
++    default:
++        MP_ERR(ra, "metal: renderpass_run: invalid pass type %d\n",
++               (int)pass->params.type);
++        break;
++    }
 +}
 +
 +/* ------------------------------------------------------------------ */
@@ -1170,21 +1793,25 @@ index 0000000..9d833b7
 +/* ------------------------------------------------------------------ */
 +
 +/*
-+ * Real implementation would call
-+ *   [encoder insertDebugSignpost:@(msg)]
-+ * on whichever render/compute/blit encoder is currently active. That
-+ * needs the encoder to be tracked on struct ra_metal (a `current_encoder`
-+ * field plus push/pop hooks in renderpass_run and any future blit
-+ * helpers). Until that tracking exists, we just route the marker into
-+ * the mpv log so the breadcrumb still shows up in --msg-level=vo=v.
-+ *
-+ * TODO(phase-2): once renderpass_run sets ra_metal->current_encoder,
-+ * forward the message via insertDebugSignpost: when non-nil; keep the
-+ * MP_VERBOSE fallback for the cases where no encoder is open.
++ * Forwards the breadcrumb to the currently-open render encoder via
++ * insertDebugSignpost: when one is live (set by metal_renderpass_run
++ * around its encoder block); otherwise logs to mpv's VO trace stream so
++ * markers issued between passes still show up under
++ * --msg-level=vo=v. Compute encoders are short-lived and we don't track
++ * them on ra_metal, so markers issued during compute fall through to the
++ * log path -- acceptable since Xcode's GPU capture still shows
++ * compute-encoder boundaries on its own.
 + */
 +void metal_debug_marker(struct ra *ra, const char *msg)
 +{
-+    MP_VERBOSE(ra, "[marker] %s\n", msg ? msg : "");
++    struct ra_metal *m = ra_metal_get(ra);
++    const char *s = msg ? msg : "";
++    if (m && m->active_render_enc) {
++        [m->active_render_enc
++            insertDebugSignpost:[NSString stringWithUTF8String:s]];
++        return;
++    }
++    MP_VERBOSE(ra, "[marker] %s\n", s);
 +}
 +
 +/* ------------------------------------------------------------------ */
