@@ -1516,7 +1516,7 @@
 +}
 --- a/video/out/metal/ra_metal_renderpass.m
 +++ b/video/out/metal/ra_metal_renderpass.m
-@@ -0,0 +1,963 @@
+@@ -0,0 +1,981 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Apple Metal backend for mpv's render abstraction (ra). Parallel to
@@ -1713,20 +1713,33 @@
 +                                const char *glsl,
 +                                struct metal_shader_stage *stage)
 +{
++    MP_WARN(ra, "TRACE compile_stage ENTER type=%d glsl=%p stage=%p spirv=%p\n",
++            (int)stage_type, glsl, stage, spirv);
 +    if (!glsl) {
 +        MP_ERR(ra, "metal: NULL shader source for stage %d\n", (int)stage_type);
 +        return false;
 +    }
++    if (!stage) {
++        MP_ERR(ra, "metal: NULL stage pointer\n");
++        return false;
++    }
++    if (!spirv || !spirv->fns) {
++        MP_ERR(ra, "metal: NULL spirv/fns\n");
++        return false;
++    }
++    MP_WARN(ra, "TRACE compile_stage about to call compile_glsl\n");
 +
 +    /* GLSL -> SPIR-V via shaderc. */
 +    if (!spirv->fns->compile_glsl(spirv, ta_ctx, stage_type, glsl, &stage->spv))
 +        return false;
++    MP_WARN(ra, "TRACE compile_stage compile_glsl OK spv.len=%zu\n", stage->spv.len);
 +
 +    /* SPIR-V -> MSL via SPIRV-Cross. */
 +    if (spvc_context_create(&stage->sc_ctx) != SPVC_SUCCESS) {
 +        MP_ERR(ra, "metal: spvc_context_create failed\n");
 +        return false;
 +    }
++    MP_WARN(ra, "TRACE compile_stage spvc_context OK\n");
 +
 +    spvc_parsed_ir parsed_ir = NULL;
 +    if (spvc_context_parse_spirv(stage->sc_ctx,
@@ -1738,6 +1751,7 @@
 +               spvc_context_get_last_error_string(stage->sc_ctx));
 +        return false;
 +    }
++    MP_WARN(ra, "TRACE compile_stage parse_spirv OK\n");
 +
 +    if (spvc_context_create_compiler(stage->sc_ctx, SPVC_BACKEND_MSL,
 +                                     parsed_ir,
@@ -1748,6 +1762,7 @@
 +               spvc_context_get_last_error_string(stage->sc_ctx));
 +        return false;
 +    }
++    MP_WARN(ra, "TRACE compile_stage create_compiler OK\n");
 +
 +    spvc_compiler_options opts = NULL;
 +    if (spvc_compiler_create_compiler_options(stage->sc_compiler, &opts)
@@ -1786,6 +1801,7 @@
 +               spvc_context_get_last_error_string(stage->sc_ctx));
 +        return false;
 +    }
++    MP_WARN(ra, "TRACE compile_stage MSL: %zu bytes\n", strlen(stage->msl));
 +
 +    /* MSL -> MTLLibrary. */
 +    NSString *src = [NSString stringWithUTF8String:stage->msl];
@@ -1876,6 +1892,9 @@
 +struct ra_renderpass *metal_renderpass_create(struct ra *ra,
 +                                const struct ra_renderpass_params *params)
 +{
++    MP_WARN(ra, "TRACE renderpass_create ENTER type=%d num_inputs=%d num_vattribs=%d vert=%p frag=%p comp=%p\n",
++            (int)params->type, params->num_inputs, params->num_vertex_attribs,
++            params->vertex_shader, params->frag_shader, params->compute_shader);
 +    struct ra_metal *m = ra_metal_get(ra);
 +    id<MTLDevice> device = m->device;
 +
@@ -1888,12 +1907,11 @@
 +    struct metal_shader_stage comp = {0};
 +
 +    // === 1. Acquire SPIR-V compiler ===
-+    /* In phase-3 this will be cached on struct ra_metal at init time so
-+     * we don't reparse the spirv subopts per pass; for now mirror the
-+     * d3d11 backend's per-pass acquisition (ra_d3d11.c:1303-1305 caches
-+     * it on the priv -- same lifetime, just a different entry point). */
++    MP_WARN(ra, "TRACE renderpass_create global=%p\n", m->global);
 +    struct spirv_compiler *spirv =
-+        mp_get_config_group(NULL, ra_metal_get(ra)->global, &spirv_conf);
++        mp_get_config_group(NULL, m->global, &spirv_conf);
++    MP_WARN(ra, "TRACE renderpass_create spirv=%p fns=%p priv=%p\n",
++            spirv, spirv ? spirv->fns : NULL, spirv ? spirv->priv : NULL);
 +    if (!spirv || !spirv->fns) {
 +        MP_ERR(ra, "metal: no SPIR-V compiler available\n");
 +        goto fail;
