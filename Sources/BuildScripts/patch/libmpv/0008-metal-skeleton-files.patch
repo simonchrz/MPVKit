@@ -1536,7 +1536,7 @@
 +}
 --- a/video/out/metal/ra_metal_renderpass.m
 +++ b/video/out/metal/ra_metal_renderpass.m
-@@ -0,0 +1,992 @@
+@@ -0,0 +1,995 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Apple Metal backend for mpv's render abstraction (ra). Parallel to
@@ -1811,6 +1811,49 @@
 +        return false;
 +    }
 +
++    /* Force MSL bindings to match the Vulkan-side SpvDecorationBinding so
++     * our renderpass_run setFragmentTexture:atIndex: numbers line up with
++     * what the emitted MSL shader actually reads from. Without this,
++     * SPIRV-Cross auto-renumbers (e.g. layout(binding=7) → [[texture(0)]])
++     * and we end up sampling the wrong texture (red checkerboard symptom
++     * from sampling the dither LUT instead of the Y plane). We sweep every
++     * reflected resource and pin its MSL slot == its Vulkan slot for both
++     * stages compiled here. */
++    spvc_resources res = NULL;
++    if (spvc_compiler_create_shader_resources(stage->sc_compiler, &res) == SPVC_SUCCESS) {
++        static const spvc_resource_type kTypes[] = {
++            SPVC_RESOURCE_TYPE_SAMPLED_IMAGE,
++            SPVC_RESOURCE_TYPE_STORAGE_IMAGE,
++            SPVC_RESOURCE_TYPE_UNIFORM_BUFFER,
++            SPVC_RESOURCE_TYPE_STORAGE_BUFFER,
++        };
++        for (size_t t = 0; t < MP_ARRAY_SIZE(kTypes); t++) {
++            const spvc_reflected_resource *list = NULL;
++            size_t count = 0;
++            if (spvc_resources_get_resource_list_for_type(res, kTypes[t],
++                                                          &list, &count)
++                    != SPVC_SUCCESS) continue;
++            for (size_t i = 0; i < count; i++) {
++                unsigned set = spvc_compiler_get_decoration(stage->sc_compiler,
++                                  list[i].id, SpvDecorationDescriptorSet);
++                unsigned bind = spvc_compiler_get_decoration(stage->sc_compiler,
++                                  list[i].id, SpvDecorationBinding);
++                spvc_msl_resource_binding rb = {0};
++                rb.stage = (stage_type == GLSL_SHADER_VERTEX)
++                         ? SpvExecutionModelVertex
++                         : (stage_type == GLSL_SHADER_FRAGMENT)
++                         ? SpvExecutionModelFragment
++                         : SpvExecutionModelGLCompute;
++                rb.desc_set      = set;
++                rb.binding       = bind;
++                rb.msl_buffer    = bind;
++                rb.msl_texture   = bind;
++                rb.msl_sampler   = bind;
++                spvc_compiler_msl_add_resource_binding(stage->sc_compiler, &rb);
++            }
++        }
++    }
++
 +    if (spvc_compiler_compile(stage->sc_compiler, &stage->msl) != SPVC_SUCCESS) {
 +        MP_ERR(ra, "metal: spvc_compiler_compile (MSL) failed: %s\n",
 +               spvc_context_get_last_error_string(stage->sc_ctx));
@@ -2062,51 +2105,11 @@
 +        pass_metal->library = comp.library;
 +    }
 +
-+    // === 6. Reflection: map ra_renderpass_input.binding -> MSL slot ===
-+    /* Use whichever compiler is appropriate for the pass type; for raster
-+     * we prefer the fragment compiler because most resources are read on
-+     * the fragment side. If a vertex-only resource turns up that the
-+     * fragment compiler doesn't see, fall back to the vertex compiler. */
-+    spvc_compiler primary =
-+        (params->type == RA_RENDERPASS_TYPE_COMPUTE) ? comp.sc_compiler
-+                                                     : frag.sc_compiler;
-+    spvc_compiler secondary =
-+        (params->type == RA_RENDERPASS_TYPE_RASTER) ? vert.sc_compiler : NULL;
-+
-+    spvc_resources primary_res = NULL, secondary_res = NULL;
-+    if (primary)
-+        spvc_compiler_create_shader_resources(primary, &primary_res);
-+    if (secondary)
-+        spvc_compiler_create_shader_resources(secondary, &secondary_res);
-+
-+    static const spvc_resource_type rtypes[] = {
-+        SPVC_RESOURCE_TYPE_SAMPLED_IMAGE,
-+        SPVC_RESOURCE_TYPE_STORAGE_IMAGE,
-+        SPVC_RESOURCE_TYPE_UNIFORM_BUFFER,
-+        SPVC_RESOURCE_TYPE_STORAGE_BUFFER,
-+    };
-+
-+    for (int i = 0; i < params->num_inputs; i++) {
-+        const char *name = params->inputs[i].name;
-+        int found = -1;
-+        for (size_t t = 0; t < MP_ARRAY_SIZE(rtypes); t++) {
-+            if (primary_res) {
-+                found = metal_lookup_binding(primary, primary_res,
-+                                             rtypes[t], name);
-+                if (found >= 0)
-+                    break;
-+            }
-+            if (secondary_res) {
-+                found = metal_lookup_binding(secondary, secondary_res,
-+                                             rtypes[t], name);
-+                if (found >= 0)
-+                    break;
-+            }
-+        }
-+        if (found >= 0)
-+            pass_metal->binding_indices[i] = found;
-+        /* else: keep the mpv-supplied binding as a sensible default. */
-+    }
++    // === 6. Binding indices == mpv input.binding ===
++    /* spvc_compiler_msl_add_resource_binding above pinned MSL slots to
++     * match the Vulkan-side bindings, so the runtime mapping is identity
++     * (no reflection-by-name lookup needed). */
++    (void)metal_lookup_binding;  /* legacy helper, kept for reference */
 +
 +    // === 7. Publish the params (copied so the caller can drop theirs) ===
 +    pass->params = *ra_renderpass_params_copy(pass, params);
