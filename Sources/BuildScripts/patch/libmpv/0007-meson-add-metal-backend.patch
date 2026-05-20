@@ -1,5 +1,5 @@
 diff --git a/meson.build b/meson.build
-index fb10be5..a724741 100644
+index 42ece8e..6188e2e 100644
 --- a/meson.build
 +++ b/meson.build
 @@ -996,7 +996,7 @@ if features['sdl2-video']
@@ -20,21 +20,10 @@ index fb10be5..a724741 100644
  features += {'spirv-cross': spirv_cross.found()}
  if features['spirv-cross']
      dependencies += spirv_cross
-@@ -1330,6 +1330,38 @@ if features['vulkan'] and features['x11']
-      sources += files('video/out/vulkan/context_xlib.c')
+@@ -1341,6 +1341,27 @@ if host_machine.system() == 'darwin'
+     endif
  endif
  
-+if host_machine.system() == 'darwin'
-+    moltenvk = get_option('moltenvk').require(
-+        features['vulkan'],
-+        error_message: 'vulkan or moltenvk header could not be found!',
-+    )
-+    features += {'moltenvk': moltenvk.allowed()}
-+    if features['vulkan'] and features['moltenvk']
-+        sources += files('video/out/vulkan/context_moltenvk.m')
-+    endif
-+endif
-+
 +# Apple Metal render backend.
 +# Needs shaderc (GLSL -> SPIR-V) and spirv-cross (SPIR-V -> MSL), mirroring d3d11.
 +metal_opt = get_option('metal').require(
@@ -59,23 +48,25 @@ index fb10be5..a724741 100644
  features += {'vk-khr-display': vulkan.type_name() == 'internal' or
                                 cc.has_function('vkCreateDisplayPlaneSurfaceKHR', prefix: '#include <vulkan/vulkan_core.h>',
                                                 dependencies: [vulkan])}
+@@ -1807,7 +1828,8 @@ if get_option('libmpv')
+                  description: 'mpv media player client library')
+ 
+     headers = ['include/mpv/client.h', 'include/mpv/render.h',
+-               'include/mpv/render_gl.h', 'include/mpv/stream_cb.h']
++               'include/mpv/render_gl.h', 'include/mpv/render_mtl.h',
++               'include/mpv/stream_cb.h']
+     install_headers(headers, subdir: 'mpv')
+ 
+     # Allow projects to build with libmpv by cloning into ./subprojects/mpv
 diff --git a/meson.options b/meson.options
-index 52782f7..1ff18d2 100644
+index 81bc931..4be9fdc 100644
 --- a/meson.options
 +++ b/meson.options
-@@ -89,6 +89,7 @@ option('vaapi-wayland', type: 'feature', value: 'auto', description: 'VAAPI (Way
- option('vaapi-win32', type: 'feature', value: 'auto', description: 'VAAPI (Windows support)')
- option('vaapi-x11', type: 'feature', value: 'auto', description: 'VAAPI (X11 support)')
- option('vulkan', type: 'feature', value: 'auto', description: 'Vulkan context support')
-+option('metal', type: 'feature', value: 'auto', description: 'Apple Metal render backend (macOS/iOS only)')
- option('wayland', type: 'feature', value: 'auto', description: 'Wayland')
- option('x11', type: 'feature', value: 'auto', description: 'X11')
- option('xv', type: 'feature', value: 'auto', description: 'Xv video output')
-@@ -103,6 +104,7 @@ option('gl-dxinterop-d3d9', type: 'feature', value: 'auto', description: 'OpenGL
- option('ios-gl', type: 'feature', value: 'auto', description: 'iOS OpenGL ES interop support')
+@@ -104,6 +104,7 @@ option('ios-gl', type: 'feature', value: 'auto', description: 'iOS OpenGL ES int
  option('videotoolbox-gl', type: 'feature', value: 'auto', description: 'Videotoolbox with OpenGL')
  option('videotoolbox-pl', type: 'feature', value: 'auto', description: 'Videotoolbox with libplacebo')
-+option('moltenvk', type: 'feature', value: 'auto', description: 'Moltenvk context')
+ option('moltenvk', type: 'feature', value: 'auto', description: 'Moltenvk context')
++option('metal', type: 'feature', value: 'auto', description: 'Apple Metal render backend (macOS/iOS only)')
  
  # macOS features
  option('macos-10-15-4-features', type: 'feature', value: 'auto', description: 'macOS 10.15.4 SDK Features')
