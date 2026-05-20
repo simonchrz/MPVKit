@@ -299,7 +299,7 @@
 +};
 --- a/video/out/metal/ra_metal.h
 +++ b/video/out/metal/ra_metal.h
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,121 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Internal header for the Apple Metal backend of mpv's render abstraction.
@@ -369,6 +369,11 @@
 +     * SPIR-V compiler) in renderpass_create. spirv_compiler_init must be
 +     * called once before any pass creation; we do it in ra_init_metal. */
 +    struct ra_ctx *ctx;
++    /* Tiny LRU of MTLBuffer staging buffers for tex_upload. Without this
++     * we allocate a fresh ~2 MB buffer per YUV plane per frame, which
++     * jetsam's our process at ~40s of playback. 8 entries covers the
++     * common case (3 planes + headroom) and we evict largest-LRU. */
++    NSMutableArray *staging_pool;
 +};
 +
 +struct ra_tex_metal {
@@ -494,7 +499,7 @@
 +};
 --- a/video/out/metal/ra_metal_init.m
 +++ b/video/out/metal/ra_metal_init.m
-@@ -0,0 +1,404 @@
+@@ -0,0 +1,405 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Metal RA backend -- init, lifecycle, and pixel formats.
@@ -689,6 +694,7 @@
 +    p->global  = ctx->global;
 +    p->ctx     = ctx;
 +    p->queue   = queue ?: [device newCommandQueue];
++    p->staging_pool = [NSMutableArray arrayWithCapacity:8];
 +
 +    /* SPIR-V compiler init. mpv's gl_sc generates GLSL; we compile that
 +     * to SPIR-V via shaderc, then translate to MSL via SPIRV-Cross. Without
@@ -901,7 +907,7 @@
 +}
 --- a/video/out/metal/ra_metal_textures.m
 +++ b/video/out/metal/ra_metal_textures.m
-@@ -0,0 +1,632 @@
+@@ -0,0 +1,660 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Metal RA backend — textures, buffers, clear, blit.
@@ -1000,13 +1006,31 @@
 +    size_t total = bytes_per_row * region.size.height *
 +                   (dimensions == 3 ? region.size.depth : 1);
 +
-+    id<MTLBuffer> staging =
-+        [p->device newBufferWithBytes:data
-+                               length:total
-+                              options:MTLResourceStorageModeShared];
-+    if (!staging) {
-+        MP_ERR(ra, "metal: failed to allocate %zu-byte staging buffer\n", total);
-+        return false;
++    /* Try to reuse an MTLBuffer from the pool that's at least `total` big.
++     * Without pooling, every YUV-plane upload (3x per frame on 1080p
++     * playback) allocates a fresh ~2 MB Shared MTLBuffer, which iOS
++     * jetsam's the process after ~40s. */
++    id<MTLBuffer> staging = nil;
++    NSUInteger pick_idx = NSNotFound;
++    for (NSUInteger i = 0; i < p->staging_pool.count; i++) {
++        id<MTLBuffer> b = p->staging_pool[i];
++        if (b.length >= total) {
++            staging = b;
++            pick_idx = i;
++            break;
++        }
++    }
++    if (staging) {
++        [p->staging_pool removeObjectAtIndex:pick_idx];
++        memcpy(staging.contents, data, total);
++    } else {
++        staging = [p->device newBufferWithBytes:data
++                                         length:total
++                                        options:MTLResourceStorageModeShared];
++        if (!staging) {
++            MP_ERR(ra, "metal: failed to allocate %zu-byte staging buffer\n", total);
++            return false;
++        }
 +    }
 +
 +    id<MTLCommandBuffer> cb = ra_metal_cmd_buf(ra);
@@ -1021,6 +1045,16 @@
 +       destinationLevel:0
 +      destinationOrigin:region.origin];
 +    [enc endEncoding];
++
++    /* Return to pool once the GPU is done reading. Capture into the block
++     * keeps `staging` alive. Cap the pool at 8 entries to bound memory. */
++    NSMutableArray *pool = p->staging_pool;
++    [cb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull buf) {
++        @synchronized (pool) {
++            if (pool.count < 8)
++                [pool addObject:staging];
++        }
++    }];
 +    return true;
 +}
 +
