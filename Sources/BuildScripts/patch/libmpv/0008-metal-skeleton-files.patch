@@ -299,7 +299,7 @@
 +};
 --- a/video/out/metal/ra_metal.h
 +++ b/video/out/metal/ra_metal.h
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,127 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Internal header for the Apple Metal backend of mpv's render abstraction.
@@ -372,8 +372,14 @@
 +    /* Tiny LRU of MTLBuffer staging buffers for tex_upload. Without this
 +     * we allocate a fresh ~2 MB buffer per YUV plane per frame, which
 +     * jetsam's our process at ~40s of playback. 8 entries covers the
-+     * common case (3 planes + headroom) and we evict largest-LRU. */
-+    NSMutableArray *staging_pool;
++     * common case (3 planes + headroom) and we evict largest-LRU.
++     *
++     * void* + CF-bridging because this struct is talloc-allocated (raw C
++     * memory) and ARC won't manage NSMutableArray * fields in C structs:
++     * the autoreleased array gets freed at function exit → NSException
++     * on first [pool count] in tex_upload. Explicit __bridge_retained
++     * keeps it alive; CFBridgingRelease in destroy frees. */
++    void *staging_pool;
 +};
 +
 +struct ra_tex_metal {
@@ -499,7 +505,7 @@
 +};
 --- a/video/out/metal/ra_metal_init.m
 +++ b/video/out/metal/ra_metal_init.m
-@@ -0,0 +1,405 @@
+@@ -0,0 +1,409 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Metal RA backend -- init, lifecycle, and pixel formats.
@@ -694,7 +700,7 @@
 +    p->global  = ctx->global;
 +    p->ctx     = ctx;
 +    p->queue   = queue ?: [device newCommandQueue];
-+    p->staging_pool = [NSMutableArray arrayWithCapacity:8];
++    p->staging_pool = (__bridge_retained void *)[[NSMutableArray alloc] initWithCapacity:8];
 +
 +    /* SPIR-V compiler init. mpv's gl_sc generates GLSL; we compile that
 +     * to SPIR-V via shaderc, then translate to MSL via SPIRV-Cross. Without
@@ -893,6 +899,10 @@
 +            p->samplers[i] = nil;
 +        p->queue  = nil;
 +        p->device = nil;
++        if (p->staging_pool) {
++            CFRelease(p->staging_pool);
++            p->staging_pool = NULL;
++        }
 +    }
 +    /* `p` is a talloc child of `ra`, so it dies with the parent. */
 +    talloc_free(ra);
@@ -907,7 +917,7 @@
 +}
 --- a/video/out/metal/ra_metal_textures.m
 +++ b/video/out/metal/ra_metal_textures.m
-@@ -0,0 +1,660 @@
+@@ -0,0 +1,664 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Metal RA backend — textures, buffers, clear, blit.
@@ -1010,18 +1020,22 @@
 +     * Without pooling, every YUV-plane upload (3x per frame on 1080p
 +     * playback) allocates a fresh ~2 MB Shared MTLBuffer, which iOS
 +     * jetsam's the process after ~40s. */
++    NSMutableArray *pool = (__bridge NSMutableArray *)p->staging_pool;
 +    id<MTLBuffer> staging = nil;
 +    NSUInteger pick_idx = NSNotFound;
-+    for (NSUInteger i = 0; i < p->staging_pool.count; i++) {
-+        id<MTLBuffer> b = p->staging_pool[i];
-+        if (b.length >= total) {
-+            staging = b;
-+            pick_idx = i;
-+            break;
++    @synchronized (pool) {
++        for (NSUInteger i = 0; i < pool.count; i++) {
++            id<MTLBuffer> b = pool[i];
++            if (b.length >= total) {
++                staging = b;
++                pick_idx = i;
++                break;
++            }
 +        }
++        if (staging)
++            [pool removeObjectAtIndex:pick_idx];
 +    }
 +    if (staging) {
-+        [p->staging_pool removeObjectAtIndex:pick_idx];
 +        memcpy(staging.contents, data, total);
 +    } else {
 +        staging = [p->device newBufferWithBytes:data
@@ -1046,9 +1060,9 @@
 +      destinationOrigin:region.origin];
 +    [enc endEncoding];
 +
-+    /* Return to pool once the GPU is done reading. Capture into the block
-+     * keeps `staging` alive. Cap the pool at 8 entries to bound memory. */
-+    NSMutableArray *pool = p->staging_pool;
++    /* Return to pool once the GPU is done reading. Capture `pool` and
++     * `staging` into the block (keeps them alive across the GPU work). Cap
++     * the pool at 8 entries to bound memory. */
 +    [cb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull buf) {
 +        @synchronized (pool) {
 +            if (pool.count < 8)
