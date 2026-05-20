@@ -299,7 +299,7 @@
 +};
 --- a/video/out/metal/ra_metal.h
 +++ b/video/out/metal/ra_metal.h
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,116 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Internal header for the Apple Metal backend of mpv's render abstraction.
@@ -365,6 +365,10 @@
 +     * spirv_conf via mp_get_config_group(). struct ra itself has no global
 +     * pointer; we mirror what ra_d3d11 does and cache it on priv. */
 +    struct mpv_global *global;
++    /* ra_ctx pointer for accessing ctx->spirv (the actual initialized
++     * SPIR-V compiler) in renderpass_create. spirv_compiler_init must be
++     * called once before any pass creation; we do it in ra_init_metal. */
++    struct ra_ctx *ctx;
 +};
 +
 +struct ra_tex_metal {
@@ -490,7 +494,7 @@
 +};
 --- a/video/out/metal/ra_metal_init.m
 +++ b/video/out/metal/ra_metal_init.m
-@@ -0,0 +1,388 @@
+@@ -0,0 +1,404 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Metal RA backend -- init, lifecycle, and pixel formats.
@@ -514,6 +518,7 @@
 +#import "ra_metal.h"
 +#include "mpv_talloc.h"
 +#include "common/msg.h"
++#include "video/out/gpu/spirv.h"
 +
 +/* Defined by the master assembled file ra_metal.m. Declared here so
 + * ra_init_metal() can wire `ra->fns = &ra_fns_metal` without pulling in
@@ -682,7 +687,22 @@
 +    ra->priv   = p;
 +    p->device  = device;
 +    p->global  = ctx->global;
++    p->ctx     = ctx;
 +    p->queue   = queue ?: [device newCommandQueue];
++
++    /* SPIR-V compiler init. mpv's gl_sc generates GLSL; we compile that
++     * to SPIR-V via shaderc, then translate to MSL via SPIRV-Cross. Without
++     * spirv_compiler_init(), ctx->spirv stays NULL and every
++     * renderpass_create fails silently — which manifests as blank/blue
++     * output with audio working. d3d11/context.c:520 follows the same
++     * pattern: spirv must be initialised once per ra_ctx before any pass.
++     * Note: we share the ra_ctx with libmpv_metal.m's wrap_fbo path; that
++     * path doesn't allocate ctx->spirv so we own it here. */
++    if (!spirv_compiler_init(ctx)) {
++        MP_FATAL(ra, "ra_init_metal: spirv_compiler_init failed\n");
++        talloc_free(ra);
++        return false;
++    }
 +    if (!p->queue) {
 +        MP_FATAL(ra, "ra_init_metal: failed to allocate MTLCommandQueue\n");
 +        talloc_free(ra);
@@ -1516,7 +1536,7 @@
 +}
 --- a/video/out/metal/ra_metal_renderpass.m
 +++ b/video/out/metal/ra_metal_renderpass.m
-@@ -0,0 +1,981 @@
+@@ -0,0 +1,979 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Apple Metal backend for mpv's render abstraction (ra). Parallel to
@@ -1541,14 +1561,9 @@
 +
 +#include <spirv_cross/spirv_cross_c.h>
 +
-+/*
-+ * spirv_conf is the shared sub-options group from video/out/gpu/spirv.c that
-+ * exposes the spirv-compiler choice ("shaderc" today). Declared extern so
-+ * we don't need to drag in the full options stack from this translation
-+ * unit. mp_get_config_group(NULL, ra->global, &spirv_conf) returns a fresh
-+ * struct spirv_compiler bound to the chosen backend.
-+ */
-+extern const struct m_sub_options spirv_conf;
++/* spirv_conf was used by an earlier (broken) acquisition path. We now use
++ * ctx->spirv (populated by spirv_compiler_init in ra_init_metal). The decl
++ * stays here only because removing it cascades through include changes. */
 +
 +/*
 + * Vertex stream binding slot. SPIRV-Cross emits MSL that reads vertex
@@ -1907,9 +1922,12 @@
 +    struct metal_shader_stage comp = {0};
 +
 +    // === 1. Acquire SPIR-V compiler ===
-+    MP_WARN(ra, "TRACE renderpass_create global=%p\n", m->global);
-+    struct spirv_compiler *spirv =
-+        mp_get_config_group(NULL, m->global, &spirv_conf);
++    /* Use the ra_ctx->spirv that was initialized by spirv_compiler_init()
++     * during ra_init_metal. The old `mp_get_config_group(&spirv_conf)`
++     * path returned a `struct spirv_opts` (the int-only options struct),
++     * NOT a compiler — casting it produced fns=NULL → silent renderpass
++     * failure → blank/blue output. */
++    struct spirv_compiler *spirv = m->ctx ? m->ctx->spirv : NULL;
 +    MP_WARN(ra, "TRACE renderpass_create spirv=%p fns=%p priv=%p\n",
 +            spirv, spirv ? spirv->fns : NULL, spirv ? spirv->priv : NULL);
 +    if (!spirv || !spirv->fns) {
