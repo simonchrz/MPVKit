@@ -45,6 +45,10 @@ do {
 
 enum Library: String, CaseIterable {
     case libmpv, FFmpeg, libshaderc, vulkan, lcms2, libdovi, openssl, libunibreak, libfreetype, libfribidi, libharfbuzz, libass, libsmbclient, libplacebo, libdav1d, gmp, nettle, gnutls, libuchardet, libbluray, libluajit, libuavs3d
+    /// Built from source by Sources/BuildScripts/build_spirv_cross.sh (no
+    /// companion mpvkit/libspirv-cross-build repo exists). Only present so
+    /// PlatformType.pkgConfigPath() includes the install dir.
+    case libspirv_cross = "libspirv-cross"
     var version: String {
         switch self {
         case .libmpv:
@@ -91,6 +95,8 @@ enum Library: String, CaseIterable {
             return "2.1.0-xcode"
         case .libuavs3d:
             return "1.2.1-xcode"
+        case .libspirv_cross:
+            return "main"  // built from source via build_spirv_cross.sh
         }
     }
 
@@ -140,6 +146,8 @@ enum Library: String, CaseIterable {
             return "https://github.com/mpvkit/libluajit-build/releases/download/\(self.version)/libluajit-all.zip"
         case .libuavs3d:
             return "https://github.com/mpvkit/libuavs3d-build/releases/download/\(self.version)/libuavs3d-all.zip"
+        case .libspirv_cross:
+            return ""  // built from source, no download URL
         }
     }
 
@@ -362,6 +370,8 @@ enum Library: String, CaseIterable {
                     checksum: "https://github.com/mpvkit/libuavs3d-build/releases/download/\(self.version)/Libuavs3d.xcframework.checksum.txt"
                 ),
             ]
+        case .libspirv_cross:
+            return []  // built from source, not surfaced as a SwiftPM target
         }
     }
 }

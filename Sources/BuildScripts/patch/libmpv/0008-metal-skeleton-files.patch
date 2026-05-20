@@ -133,10 +133,10 @@ index 0000000..047253b
 +#endif
 diff --git a/video/out/metal/libmpv_metal.m b/video/out/metal/libmpv_metal.m
 new file mode 100644
-index 0000000..85ffbf3
+index 0000000..e341fb8
 --- /dev/null
 +++ b/video/out/metal/libmpv_metal.m
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,160 @@
 +/*
 + * libmpv Metal backend bridge.
 + *
@@ -151,6 +151,8 @@ index 0000000..85ffbf3
 +
 +#import <Metal/Metal.h>
 +
++#include "common/msg.h"
++#include "mpv_talloc.h"
 +#include "options/m_config.h"
 +#include "mpv/render_mtl.h"
 +#include "video/out/gpu/context.h"
