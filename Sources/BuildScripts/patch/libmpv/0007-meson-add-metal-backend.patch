@@ -1,0 +1,63 @@
+From: mpv-metal-skeleton <noreply@example.invalid>
+Subject: [PATCH 7/?] meson: scaffold Apple Metal render backend
+
+Wire up a build-system entry point for the new Metal RA / libmpv
+backend. The actual implementation (video/out/metal/libmpv_metal.m
+and video/out/metal/ra_metal.m) is added in a follow-up patch; this
+commit only adds the option, feature gating, source list and the
+MPV_HAVE_METAL preprocessor define so the rest of the tree can start
+referencing it.
+
+Notes:
+  * Option is feature-typed and defaults to auto; on non-Apple
+    hosts the require() forces it disabled so it is a no-op there.
+  * Frameworks: Metal (the GPU API) and Foundation (NSString etc.
+    used by the Objective-C glue). QuartzCore / CoreVideo are not
+    pulled in here yet; they belong with the CAMetalLayer host glue
+    and the VideoToolbox hwdec interop respectively, both of which
+    live outside libmpv proper.
+  * MPV_HAVE_METAL is added via add_project_arguments rather than
+    relying on the auto-generated HAVE_METAL in config.h, so it is
+    visible to the public headers / Objective-C TUs that do not
+    include config.h.
+---
+ meson.build   | 15 +++++++++++++++
+ meson.options |  1 +
+ 2 files changed, 16 insertions(+)
+
+diff --git a/meson.options b/meson.options
+--- a/meson.options
++++ b/meson.options
+@@ -89,6 +89,7 @@
+ option('vaapi-win32', type: 'feature', value: 'auto', description: 'VAAPI (Windows support)')
+ option('vaapi-x11', type: 'feature', value: 'auto', description: 'VAAPI (X11 support)')
+ option('vulkan', type: 'feature', value: 'auto', description: 'Vulkan context support')
++option('metal', type: 'feature', value: 'auto', description: 'Apple Metal render backend (macOS/iOS only)')
+ option('wayland', type: 'feature', value: 'auto', description: 'Wayland')
+ option('x11', type: 'feature', value: 'auto', description: 'X11')
+ option('xv', type: 'feature', value: 'auto', description: 'Xv video output')
+diff --git a/meson.build b/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -1341,6 +1341,21 @@
+     endif
+ endif
+ 
++# Apple Metal render backend
++metal_opt = get_option('metal').require(
++    darwin,
++    error_message: 'Metal backend is only available on Apple platforms (macOS/iOS).',
++)
++metal_dep = dependency('appleframeworks', modules: ['Metal', 'Foundation'],
++                       required: metal_opt)
++features += {'metal': metal_dep.found()}
++if features['metal']
++    dependencies += metal_dep
++    sources += files('video/out/metal/libmpv_metal.m',
++                     'video/out/metal/ra_metal.m')
++    add_project_arguments('-DMPV_HAVE_METAL=1', language: ['c', 'cpp', 'objc'])
++endif
++
+ features += {'vk-khr-display': vulkan.type_name() == 'internal' or
+                                cc.has_function('vkCreateDisplayPlaneSurfaceKHR', prefix: '#include <vulkan/vulkan_core.h>',
+                                                dependencies: [vulkan])}

@@ -1,0 +1,37 @@
+From: mpv-metal-skeleton <noreply@example.invalid>
+Subject: [PATCH 6/?] render: add Metal render-param enum values
+
+Reserve two new mpv_render_param_type values for the upcoming Apple
+Metal backend (see include/mpv/render_mtl.h):
+
+  MPV_RENDER_PARAM_METAL_INIT_PARAMS = 21
+  MPV_RENDER_PARAM_METAL_DRAWABLE    = 22
+
+These slot in immediately after MPV_RENDER_PARAM_SW_POINTER (= 20),
+the last value in the upstream 0.41 enum, so the ABI of existing
+values is preserved.
+---
+ include/mpv/render.h | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/include/mpv/render.h b/include/mpv/render.h
+--- a/include/mpv/render.h
++++ b/include/mpv/render.h
+@@ -422,6 +422,17 @@ typedef enum mpv_render_param_type {
+      * See MPV_RENDER_PARAM_SW_STRIDE for alignment requirements.
+      */
+     MPV_RENDER_PARAM_SW_POINTER = 20,
++    /**
++     * Required parameters for initializing the Metal renderer. Valid for
++     * mpv_render_context_create().
++     * Type: mpv_metal_init_params* (see render_mtl.h)
++     */
++    MPV_RENDER_PARAM_METAL_INIT_PARAMS = 21,
++    /**
++     * Describes a Metal render target. Valid for mpv_render_context_render().
++     * Type: mpv_metal_drawable* (see render_mtl.h)
++     */
++    MPV_RENDER_PARAM_METAL_DRAWABLE = 22,
+ } mpv_render_param_type;
+
+ /**
