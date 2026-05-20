@@ -377,7 +377,7 @@ enum Library: String, CaseIterable {
 }
 
 
-private class BuildMPV: BaseBuild {
+private class BuildMPV: CombineBaseBuild {
     init() {
         super.init(library: .libmpv)
     }
@@ -388,6 +388,75 @@ private class BuildMPV: BaseBuild {
         } else {
             return [.gmp]
         }
+    }
+
+    /// SPIRV-Cross's C API symbols (spvc_*) are referenced by ra_metal_renderpass.m
+    /// at link time. They live in /dist/libspirv-cross/... (built standalone by
+    /// build_spirv_cross.sh) but mpv's meson build doesn't bundle them into
+    /// libmpv.a — meson treats them as a normal `dependency`, expecting the
+    /// final-binary linker to pick them up. MPVKit only ships Libmpv.xcframework
+    /// (no separate spirv-cross xcframework), so Kuckuck would see undefined
+    /// _spvc_* symbols. Bundle them into libmpv.a here via `libtool -static`
+    /// before the framework gets created.
+    /// Default CombineBaseBuild produces "Libmpv-combined.xcframework" — but
+    /// Package.swift expects "Libmpv.xcframework" (no suffix). Override both:
+    /// `combineFrameworkName` becomes the libtool output filename (overwrites
+    /// the original libmpv.a after the move-to-bak/ step), and `frameworks()`
+    /// keeps the default raw-value framework name so the xcframework drops at
+    /// the right path.
+    /// Keep CombineBaseBuild's default libtool output (`libmpv-combined.a`)
+    /// — naming the libtool output the same as one of the inputs trips a
+    /// "remove before write" race in base.combineStaticLibraries (the script
+    /// deletes the output path before libtool runs, which on the x86_64 slice
+    /// deletes libmpv.a and then libtool can't read it).
+    /// Instead, override `frameworks()` to keep the standard `libmpv` name
+    /// (so the resulting xcframework is `Libmpv.xcframework`, not
+    /// `Libmpv-combined.xcframework`), and after each per-arch combine, copy
+    /// `libmpv-combined.a` → `libmpv.a` so createFramework's `lib/libmpv.a`
+    /// lookup finds the merged archive.
+    override func frameworks() throws -> [String] {
+        [library.rawValue]
+    }
+
+    override func build(platform: PlatformType, arch: ArchType) throws {
+        try super.build(platform: platform, arch: arch)
+        let libDir = thinDir(platform: platform, arch: arch) + ["lib"]
+        let combined = libDir + ["libmpv-combined.a"]
+        let plain = libDir + ["libmpv.a"]
+        if FileManager.default.fileExists(atPath: combined.path) {
+            try? FileManager.default.removeItem(at: plain)
+            try? FileManager.default.copyItem(at: combined, to: plain)
+        }
+    }
+
+    override func combineFrameworks(platform: PlatformType, arch: ArchType) -> [String] {
+        // Names must match what base.combineStaticLibraries expects: filenames
+        // as they appear in lib/, with the .a suffix preserved. The framework
+        // logic prefixes "lib" only if the name doesn't already start with it.
+        var libs: [String] = ["libmpv.a"]
+        let spvcLibDir = URL.currentDirectory + ["libspirv-cross", platform.rawValue, "thin", arch.rawValue, "lib"]
+        if FileManager.default.fileExists(atPath: spvcLibDir.path) {
+            let crossLibs = (try? FileManager.default.contentsOfDirectory(atPath: spvcLibDir.path)) ?? []
+            for f in crossLibs where f.hasSuffix(".a") {
+                let dest = thinDir(platform: platform, arch: arch) + ["lib", f]
+                if !FileManager.default.fileExists(atPath: dest.path) {
+                    let src = spvcLibDir + [f]
+                    try? FileManager.default.copyItem(at: src, to: dest)
+                }
+                libs.append(f)
+            }
+        }
+        // mpv's meson install drops the pc file as `mpv.pc`, but
+        // base.combineStaticLibraries looks for `\(library.rawValue).pc` =
+        // `libmpv.pc`. Copy so the pkgconfig-rewrite step finds it.
+        let pkgConfigDir = thinDir(platform: platform, arch: arch) + ["lib", "pkgconfig"]
+        let mpvPc = pkgConfigDir + ["mpv.pc"]
+        let libmpvPc = pkgConfigDir + ["libmpv.pc"]
+        if FileManager.default.fileExists(atPath: mpvPc.path),
+           !FileManager.default.fileExists(atPath: libmpvPc.path) {
+            try? FileManager.default.copyItem(at: mpvPc, to: libmpvPc)
+        }
+        return libs
     }
 
 
