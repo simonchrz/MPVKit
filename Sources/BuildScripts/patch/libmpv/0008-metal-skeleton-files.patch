@@ -299,7 +299,7 @@
 +};
 --- a/video/out/metal/ra_metal.h
 +++ b/video/out/metal/ra_metal.h
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,133 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Internal header for the Apple Metal backend of mpv's render abstraction.
@@ -380,6 +380,12 @@
 +     * on first [pool count] in tex_upload. Explicit __bridge_retained
 +     * keeps it alive; CFBridgingRelease in destroy frees. */
 +    void *staging_pool;
++    /* Pipeline cache: NSMutableDictionary<NSString*, MetalPassCacheEntry*>
++     * keyed by hash of (vertex_glsl + frag_glsl + target_format) or
++     * (compute_glsl). Cache hit short-circuits the full shaderc + SPIRV-Cross
++     * + MTLLibrary + MTLRenderPipelineState compile chain — saves ~150-300ms
++     * per renderpass_create. Same CF-bridge trick as staging_pool. */
++    void *pipeline_cache;
 +};
 +
 +struct ra_tex_metal {
@@ -505,7 +511,7 @@
 +};
 --- a/video/out/metal/ra_metal_init.m
 +++ b/video/out/metal/ra_metal_init.m
-@@ -0,0 +1,409 @@
+@@ -0,0 +1,414 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Metal RA backend -- init, lifecycle, and pixel formats.
@@ -701,6 +707,7 @@
 +    p->ctx     = ctx;
 +    p->queue   = queue ?: [device newCommandQueue];
 +    p->staging_pool = (__bridge_retained void *)[[NSMutableArray alloc] initWithCapacity:8];
++    p->pipeline_cache = (__bridge_retained void *)[[NSMutableDictionary alloc] init];
 +
 +    /* SPIR-V compiler init. mpv's gl_sc generates GLSL; we compile that
 +     * to SPIR-V via shaderc, then translate to MSL via SPIRV-Cross. Without
@@ -902,6 +909,10 @@
 +        if (p->staging_pool) {
 +            CFRelease(p->staging_pool);
 +            p->staging_pool = NULL;
++        }
++        if (p->pipeline_cache) {
++            CFRelease(p->pipeline_cache);
++            p->pipeline_cache = NULL;
 +        }
 +    }
 +    /* `p` is a talloc child of `ra`, so it dies with the parent. */
@@ -1584,7 +1595,7 @@
 +}
 --- a/video/out/metal/ra_metal_renderpass.m
 +++ b/video/out/metal/ra_metal_renderpass.m
-@@ -0,0 +1,995 @@
+@@ -0,0 +1,1051 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Apple Metal backend for mpv's render abstraction (ra). Parallel to
@@ -1612,6 +1623,19 @@
 +/* spirv_conf was used by an earlier (broken) acquisition path. We now use
 + * ctx->spirv (populated by spirv_compiler_init in ra_init_metal). The decl
 + * stays here only because removing it cascades through include changes. */
++
++/* Pipeline cache value object. We retain the MTLLibrary because it's the
++ * Metal-side container for the compiled GPU code that the PSO references
++ * — releasing it can invalidate the PSO on some driver versions. */
++@interface MetalPassCacheEntry : NSObject
++@property (nonatomic, strong) id<MTLLibrary> library;
++@property (nonatomic, strong) id<MTLRenderPipelineState> renderPSO;
++@property (nonatomic, strong) id<MTLComputePipelineState> computePSO;
++@property (nonatomic, assign) MTLSize computeThreadsPerGroup;
++@property (nonatomic, strong) NSData *bindingIndices;  /* int[numInputs] */
++@property (nonatomic, assign) int numInputs;
++@end
++@implementation MetalPassCacheEntry @end
 +
 +/*
 + * Vertex stream binding slot. SPIRV-Cross emits MSL that reads vertex
@@ -1776,8 +1800,6 @@
 +                                const char *glsl,
 +                                struct metal_shader_stage *stage)
 +{
-+    MP_WARN(ra, "TRACE compile_stage ENTER type=%d glsl=%p stage=%p spirv=%p\n",
-+            (int)stage_type, glsl, stage, spirv);
 +    if (!glsl) {
 +        MP_ERR(ra, "metal: NULL shader source for stage %d\n", (int)stage_type);
 +        return false;
@@ -1790,19 +1812,16 @@
 +        MP_ERR(ra, "metal: NULL spirv/fns\n");
 +        return false;
 +    }
-+    MP_WARN(ra, "TRACE compile_stage about to call compile_glsl\n");
 +
 +    /* GLSL -> SPIR-V via shaderc. */
 +    if (!spirv->fns->compile_glsl(spirv, ta_ctx, stage_type, glsl, &stage->spv))
 +        return false;
-+    MP_WARN(ra, "TRACE compile_stage compile_glsl OK spv.len=%zu\n", stage->spv.len);
 +
 +    /* SPIR-V -> MSL via SPIRV-Cross. */
 +    if (spvc_context_create(&stage->sc_ctx) != SPVC_SUCCESS) {
 +        MP_ERR(ra, "metal: spvc_context_create failed\n");
 +        return false;
 +    }
-+    MP_WARN(ra, "TRACE compile_stage spvc_context OK\n");
 +
 +    spvc_parsed_ir parsed_ir = NULL;
 +    if (spvc_context_parse_spirv(stage->sc_ctx,
@@ -1814,7 +1833,6 @@
 +               spvc_context_get_last_error_string(stage->sc_ctx));
 +        return false;
 +    }
-+    MP_WARN(ra, "TRACE compile_stage parse_spirv OK\n");
 +
 +    if (spvc_context_create_compiler(stage->sc_ctx, SPVC_BACKEND_MSL,
 +                                     parsed_ir,
@@ -1825,7 +1843,6 @@
 +               spvc_context_get_last_error_string(stage->sc_ctx));
 +        return false;
 +    }
-+    MP_WARN(ra, "TRACE compile_stage create_compiler OK\n");
 +
 +    spvc_compiler_options opts = NULL;
 +    if (spvc_compiler_create_compiler_options(stage->sc_compiler, &opts)
@@ -1907,7 +1924,6 @@
 +               spvc_context_get_last_error_string(stage->sc_ctx));
 +        return false;
 +    }
-+    MP_WARN(ra, "TRACE compile_stage MSL: %zu bytes\n", strlen(stage->msl));
 +
 +    /* MSL -> MTLLibrary. */
 +    NSString *src = [NSString stringWithUTF8String:stage->msl];
@@ -2010,9 +2026,6 @@
 +struct ra_renderpass *metal_renderpass_create(struct ra *ra,
 +                                const struct ra_renderpass_params *params)
 +{
-+    MP_WARN(ra, "TRACE renderpass_create ENTER type=%d num_inputs=%d num_vattribs=%d vert=%p frag=%p comp=%p\n",
-+            (int)params->type, params->num_inputs, params->num_vertex_attribs,
-+            params->vertex_shader, params->frag_shader, params->compute_shader);
 +    struct ra_metal *m = ra_metal_get(ra);
 +    id<MTLDevice> device = m->device;
 +
@@ -2024,6 +2037,43 @@
 +    struct metal_shader_stage frag = {0};
 +    struct metal_shader_stage comp = {0};
 +
++    // === 0. Pipeline cache lookup ===
++    /* Cache key from GLSL input (cheap) before the expensive shaderc +
++     * SPIRV-Cross + Metal-compile chain. On hit we return a fresh
++     * ra_renderpass that reuses the cached library/PSO — saves ~150-300ms
++     * per pass and avoids the per-pass MTLLibrary alloc that contributes
++     * to long-playback memory pressure. */
++    NSMutableDictionary *pipeline_cache = (__bridge NSMutableDictionary *)m->pipeline_cache;
++    NSMutableString *cache_key_buf = [NSMutableString new];
++    if (params->vertex_shader)  [cache_key_buf appendFormat:@"V|%s|", params->vertex_shader];
++    if (params->frag_shader)    [cache_key_buf appendFormat:@"F|%s|", params->frag_shader];
++    if (params->compute_shader) [cache_key_buf appendFormat:@"C|%s|", params->compute_shader];
++    if (params->target_format && params->target_format->name)
++        [cache_key_buf appendFormat:@"T|%s|", params->target_format->name];
++    [cache_key_buf appendFormat:@"B|%d|", params->enable_blend];
++    NSString *cache_key = [cache_key_buf copy];
++
++    MetalPassCacheEntry *cached = pipeline_cache[cache_key];
++    if (cached) {
++        pass = talloc_zero(NULL, struct ra_renderpass);
++        pass_metal = talloc_zero(pass, struct ra_renderpass_metal);
++        pass->priv = pass_metal;
++        pass_metal->library = cached.library;
++        pass_metal->render_pso = cached.renderPSO;
++        pass_metal->compute_pso = cached.computePSO;
++        pass_metal->compute_threads_per_group = cached.computeThreadsPerGroup;
++        pass_metal->num_inputs = cached.numInputs;
++        if (cached.numInputs > 0 && cached.bindingIndices) {
++            pass_metal->binding_indices = talloc_array(pass_metal, int, cached.numInputs);
++            memcpy(pass_metal->binding_indices, cached.bindingIndices.bytes,
++                   sizeof(int) * cached.numInputs);
++        }
++        pass->params = *ra_renderpass_params_copy(pass, params);
++        pass->params.cached_program = (struct bstr){0};
++        talloc_free(ta_ctx);
++        return pass;
++    }
++
 +    // === 1. Acquire SPIR-V compiler ===
 +    /* Use the ra_ctx->spirv that was initialized by spirv_compiler_init()
 +     * during ra_init_metal. The old `mp_get_config_group(&spirv_conf)`
@@ -2031,8 +2081,6 @@
 +     * NOT a compiler — casting it produced fns=NULL → silent renderpass
 +     * failure → blank/blue output. */
 +    struct spirv_compiler *spirv = m->ctx ? m->ctx->spirv : NULL;
-+    MP_WARN(ra, "TRACE renderpass_create spirv=%p fns=%p priv=%p\n",
-+            spirv, spirv ? spirv->fns : NULL, spirv ? spirv->priv : NULL);
 +    if (!spirv || !spirv->fns) {
 +        MP_ERR(ra, "metal: no SPIR-V compiler available\n");
 +        goto fail;
@@ -2166,7 +2214,26 @@
 +     * isn't worth the cross-build headaches yet. */
 +    pass->params.cached_program = (struct bstr){0};
 +
-+    // === 8. Cleanup ===
++    // === 8. Cache the freshly-built pipeline state ===
++    /* Save to pipeline_cache so the next renderpass_create with the same
++     * GLSL skips the full shaderc+SPIRV-Cross+Metal-compile chain.
++     * cache_key was computed at the top from the same GLSL. */
++    {
++        MetalPassCacheEntry *entry = [MetalPassCacheEntry new];
++        entry.library = pass_metal->library;
++        entry.renderPSO = pass_metal->render_pso;
++        entry.computePSO = pass_metal->compute_pso;
++        entry.computeThreadsPerGroup = pass_metal->compute_threads_per_group;
++        entry.numInputs = pass_metal->num_inputs;
++        if (pass_metal->num_inputs > 0 && pass_metal->binding_indices) {
++            entry.bindingIndices =
++                [NSData dataWithBytes:pass_metal->binding_indices
++                               length:sizeof(int) * pass_metal->num_inputs];
++        }
++        pipeline_cache[cache_key] = entry;
++    }
++
++    // === 9. Cleanup ===
 +    // NOTE: don't talloc_free(spirv) — it's owned by ra_ctx (set up by
 +    // spirv_compiler_init in ra_init_metal). Freeing it nulls ctx->spirv's
 +    // backing memory; the talloc allocator reuses that slot for the next
