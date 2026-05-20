@@ -295,3 +295,1556 @@ index 0000000..85ffbf3
 +    .done_frame = done_frame,
 +    .destroy = destroy,
 +};
+diff --git a/video/out/metal/ra_metal.h b/video/out/metal/ra_metal.h
+new file mode 100644
+index 0000000..58a7a77
+--- /dev/null
++++ b/video/out/metal/ra_metal.h
+@@ -0,0 +1,100 @@
++/* Copyright (C) 2026 the mpv developers
++ *
++ * Internal header for the Apple Metal backend of mpv's render abstraction.
++ * Parallel to video/out/opengl/ra_gl.h.
++ */
++
++#ifndef MP_RA_METAL_H
++#define MP_RA_METAL_H
++
++#import <Metal/Metal.h>
++#include "video/out/gpu/ra.h"
++#include "video/out/gpu/context.h"
++
++/* Public API used by libmpv_metal.m -- all are implemented in ra_metal.m */
++
++/**
++ * Initialize a `ra` instance backed by Metal.
++ * `device` must be a valid `id<MTLDevice>` (non-NULL).
++ * `queue` may be NULL — caller-supplied command queue is preferred; if NULL,
++ * a new one is allocated from `device`.
++ * Fills `ra_ctx->ra` on success. Returns true on success.
++ */
++bool ra_init_metal(struct ra_ctx *ctx, id<MTLDevice> device,
++                   id<MTLCommandQueue> queue);
++
++/**
++ * Wrap a caller-provided `id<MTLTexture>` (typically a CAMetalDrawable's
++ * texture) as a transient `ra_tex` for the current frame. Returned tex is
++ * valid until the next call to ra_metal_commit_frame().
++ */
++struct ra_tex *ra_metal_wrap_drawable(struct ra_ctx *ctx,
++                                      id<MTLTexture> texture,
++                                      int w, int h,
++                                      id<MTLCommandBuffer> command_buffer);
++
++/**
++ * Commit the current frame's command buffer. If `display_synced` is true,
++ * mpv requested display synchronization (currently honoured as
++ * `addScheduledHandler:` for timing; presentation is the host app's job).
++ */
++void ra_metal_commit_frame(struct ra_ctx *ctx, bool display_synced);
++
++/**
++ * Tear down the Metal ra. Safe to call multiple times.
++ */
++void ra_metal_destroy(struct ra_ctx *ctx);
++
++/* Internal types -- exposed here so chunks of the implementation can share */
++
++struct ra_metal {
++    id<MTLDevice> device;
++    id<MTLCommandQueue> queue;
++    /* Per-frame command buffer. Allocated lazily on first encode call.
++     * Released by ra_metal_commit_frame(). */
++    id<MTLCommandBuffer> cmd_buf;
++    /* Sampler state cache keyed on (linear, repeat) — 4 combos. */
++    id<MTLSamplerState> samplers[4];
++};
++
++struct ra_tex_metal {
++    id<MTLTexture> texture;
++    /* Set when this tex wraps a drawable (no ownership of texture lifecycle). */
++    bool is_wrapped;
++};
++
++struct ra_buf_metal {
++    id<MTLBuffer> buffer;
++    /* Tracks the command buffer that last used the buf for buf_poll. */
++    id<MTLCommandBuffer> last_used_cb;
++};
++
++struct ra_renderpass_metal {
++    id<MTLRenderPipelineState> render_pso;
++    id<MTLComputePipelineState> compute_pso;
++    id<MTLLibrary> library;
++    /* Map from ra_renderpass_input index → Metal binding slot. */
++    int *binding_indices;
++    int num_inputs;
++};
++
++/* Helpers that may be shared between chunks. */
++
++/* Returns the `ra_metal` priv from a `ra*`. */
++static inline struct ra_metal *ra_metal_get(struct ra *ra)
++{
++    return (struct ra_metal *)ra->priv;
++}
++
++/* Returns or lazily allocates the per-frame command buffer.
++ * Implemented in ra_metal_init.m. */
++id<MTLCommandBuffer> ra_metal_cmd_buf(struct ra *ra);
++
++/* Returns or lazily creates a cached sampler state. Implemented in init.m. */
++id<MTLSamplerState> ra_metal_sampler(struct ra *ra, bool linear, bool repeat);
++
++/* Pixel format mapping. Returns MTLPixelFormatInvalid on no match.
++ * Implemented in init.m alongside the formats table. */
++MTLPixelFormat ra_metal_pixel_format(const struct ra_format *fmt);
++
++#endif
+diff --git a/video/out/metal/ra_metal.m b/video/out/metal/ra_metal.m
+new file mode 100644
+index 0000000..8dec242
+--- /dev/null
++++ b/video/out/metal/ra_metal.m
+@@ -0,0 +1,73 @@
++/* Copyright (C) 2026 the mpv developers
++ *
++ * Master file for mpv's Apple Metal RA backend. Defines the public
++ * `ra_fns_metal` vtable that aggregates the function-pointer slots
++ * filled by ra_metal_init.m, ra_metal_textures.m and ra_metal_renderpass.m.
++ *
++ * Phase 1 status (this commit):
++ *   - init/lifecycle/formats: real impl
++ *   - tex_* / buf_* / clear (full-rect) / blit (same-size): real impl
++ *   - renderpass_* / timer_* / scissored clear / scaled blit: stubs
++ *     marked `TODO(phase-2)` — grep for that token.
++ */
++
++#import "ra_metal.h"
++#include "video/out/gpu/utils.h"
++
++/* Prototypes for the non-static functions defined in the three chunks. */
++
++/* From ra_metal_textures.m */
++void           metal_tex_destroy(struct ra *ra, struct ra_tex *tex);
++struct ra_tex *metal_tex_create(struct ra *ra, const struct ra_tex_params *params);
++bool           metal_tex_upload(struct ra *ra, const struct ra_tex_upload_params *params);
++bool           metal_tex_download(struct ra *ra, struct ra_tex_download_params *params);
++void           metal_buf_destroy(struct ra *ra, struct ra_buf *buf);
++struct ra_buf *metal_buf_create(struct ra *ra, const struct ra_buf_params *params);
++void           metal_buf_update(struct ra *ra, struct ra_buf *buf, ptrdiff_t offset,
++                                const void *data, size_t size);
++bool           metal_buf_poll(struct ra *ra, struct ra_buf *buf);
++void           metal_clear(struct ra *ra, struct ra_tex *dst, float color[4],
++                           struct mp_rect *scissor);
++void           metal_blit(struct ra *ra, struct ra_tex *dst, struct ra_tex *src,
++                          struct mp_rect *dst_rc, struct mp_rect *src_rc);
++
++/* From ra_metal_renderpass.m */
++int                       metal_desc_namespace(struct ra *ra, enum ra_vartype type);
++struct ra_renderpass     *metal_renderpass_create(struct ra *ra, const struct ra_renderpass_params *params);
++void                      metal_renderpass_destroy(struct ra *ra, struct ra_renderpass *pass);
++void                      metal_renderpass_run(struct ra *ra, const struct ra_renderpass_run_params *params);
++ra_timer                 *metal_timer_create(struct ra *ra);
++void                      metal_timer_destroy(struct ra *ra, ra_timer *timer);
++void                      metal_timer_start(struct ra *ra, ra_timer *timer);
++uint64_t                  metal_timer_stop(struct ra *ra, ra_timer *timer);
++void                      metal_debug_marker(struct ra *ra, const char *msg);
++
++/* From ra_metal_init.m (file-local helper exported just for the .destroy slot) */
++extern void ra_metal_destroy_fns(struct ra *ra);
++
++/* mpv uses std140 packing for UBOs; shared with the GL backend. */
++extern struct ra_layout std140_layout(struct ra_renderpass_input *inp);
++
++const struct ra_fns ra_fns_metal = {
++    .destroy            = ra_metal_destroy_fns,
++    .tex_create         = metal_tex_create,
++    .tex_destroy        = metal_tex_destroy,
++    .tex_upload         = metal_tex_upload,
++    .tex_download       = metal_tex_download,
++    .buf_create         = metal_buf_create,
++    .buf_destroy        = metal_buf_destroy,
++    .buf_update         = metal_buf_update,
++    .buf_poll           = metal_buf_poll,
++    .clear              = metal_clear,
++    .blit               = metal_blit,
++    .uniform_layout     = std140_layout,
++    .desc_namespace     = metal_desc_namespace,
++    .renderpass_create  = metal_renderpass_create,
++    .renderpass_destroy = metal_renderpass_destroy,
++    .renderpass_run     = metal_renderpass_run,
++    .timer_create       = metal_timer_create,
++    .timer_destroy      = metal_timer_destroy,
++    .timer_start        = metal_timer_start,
++    .timer_stop         = metal_timer_stop,
++    .debug_marker       = metal_debug_marker,
++};
+diff --git a/video/out/metal/ra_metal_init.m b/video/out/metal/ra_metal_init.m
+new file mode 100644
+index 0000000..9d745cb
+--- /dev/null
++++ b/video/out/metal/ra_metal_init.m
+@@ -0,0 +1,377 @@
++/* Copyright (C) 2026 the mpv developers
++ *
++ * Metal RA backend -- init, lifecycle, and pixel formats.
++ *
++ * Parallel chunk to video/out/opengl/ra_gl.c lines 1-310 (init + format
++ * table) and the ra_fns_gl table near line 1186. This file owns:
++ *
++ *   - the static metal_formats[] table and ra_metal_pixel_format()
++ *   - ra_init_metal() / ra_metal_destroy() lifecycle entry points
++ *   - the per-frame command-buffer accessor ra_metal_cmd_buf()
++ *   - the 4-entry sampler-state cache ra_metal_sampler()
++ *   - ra_metal_wrap_drawable() / ra_metal_commit_frame() bridge helpers
++ *   - the ra_fns "destroy" slot (ra_metal_destroy_fns) consumed by the
++ *     master ra_fns_metal table in ra_metal.m.
++ *
++ * Helper functions (formats table, sampler descriptors) are file-local;
++ * everything declared in ra_metal.h is exported with external linkage.
++ */
++
++#import <Metal/Metal.h>
++#import "ra_metal.h"
++#include "mpv_talloc.h"
++#include "common/msg.h"
++
++/* Defined by the master assembled file ra_metal.m. Declared here so
++ * ra_init_metal() can wire `ra->fns = &ra_fns_metal` without pulling in
++ * the renderpass/tex chunks at compile time. */
++extern const struct ra_fns ra_fns_metal;
++
++/* The ra_fns destroy slot. Distinct from ra_metal_destroy(), which is
++ * the public lifecycle teardown that takes a `ra_ctx *`. Defined below. */
++static void ra_metal_destroy_fns(struct ra *ra);
++
++/* ------------------------------------------------------------------ */
++/* Pixel format table                                                 */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Mirrors gl_formats[] in video/out/opengl/formats.c. Each row is the
++ * mpv-side `ra_format` description plus the Apple-side `MTLPixelFormat`
++ * that backs it. Order matters: ra_find_unorm_format() and friends pick
++ * the first match, so the preferred upload paths come first per type
++ * width (this also matches ra_gl.c's ordering choices -- rg8 ahead of
++ * any luminance-alpha fallback, etc.).
++ *
++ * `priv` on the resulting ra_format points at the table entry so
++ * downstream (tex_create, renderpass_create) can recover the
++ * MTLPixelFormat in O(1) without re-walking the table.
++ */
++struct metal_format {
++    const char       *name;
++    MTLPixelFormat    mtl_format;
++    enum ra_ctype     ctype;
++    int               num_components;
++    int               component_size;   /* bits per component as stored */
++    int               component_depth;  /* bits actually in use (== size unless padded) */
++    int               pixel_size;       /* bytes */
++    bool              linear_filter;
++    bool              renderable;
++};
++
++static const struct metal_format metal_formats[] = {
++    /* 8-bit UNORM */
++    { "r8",       MTLPixelFormatR8Unorm,       RA_CTYPE_UNORM, 1,  8,  8,  1, true,  true  },
++    { "rg8",      MTLPixelFormatRG8Unorm,      RA_CTYPE_UNORM, 2,  8,  8,  2, true,  true  },
++    { "rgba8",    MTLPixelFormatRGBA8Unorm,    RA_CTYPE_UNORM, 4,  8,  8,  4, true,  true  },
++    { "bgra8",    MTLPixelFormatBGRA8Unorm,    RA_CTYPE_UNORM, 4,  8,  8,  4, true,  true  },
++
++    /* 16-bit UNORM. Note Apple-silicon GPUs require macOS 11+/iOS 14+
++     * for these; older Intel Macs lack rgba16-unorm filtering, but the
++     * filtering capability is a runtime check on MTLDevice and not
++     * worth gating at table-build time. */
++    { "r16",      MTLPixelFormatR16Unorm,      RA_CTYPE_UNORM, 1, 16, 16,  2, true,  true  },
++    { "rg16",     MTLPixelFormatRG16Unorm,     RA_CTYPE_UNORM, 2, 16, 16,  4, true,  true  },
++    { "rgba16",   MTLPixelFormatRGBA16Unorm,   RA_CTYPE_UNORM, 4, 16, 16,  8, true,  true  },
++
++    /* 16-bit float */
++    { "r16f",     MTLPixelFormatR16Float,      RA_CTYPE_FLOAT, 1, 16, 16,  2, true,  true  },
++    { "rg16f",    MTLPixelFormatRG16Float,     RA_CTYPE_FLOAT, 2, 16, 16,  4, true,  true  },
++    { "rgba16f",  MTLPixelFormatRGBA16Float,   RA_CTYPE_FLOAT, 4, 16, 16,  8, true,  true  },
++
++    /* 32-bit float. Per Apple docs, only rgba32float is renderable on
++     * every GPU family; r/rg32float are renderable on macOS, iOS-A11+. */
++    { "r32f",     MTLPixelFormatR32Float,      RA_CTYPE_FLOAT, 1, 32, 32,  4, true,  true  },
++    { "rg32f",    MTLPixelFormatRG32Float,     RA_CTYPE_FLOAT, 2, 32, 32,  8, true,  true  },
++    { "rgba32f",  MTLPixelFormatRGBA32Float,   RA_CTYPE_FLOAT, 4, 32, 32, 16, true,  true  },
++
++    /* Packed UNORM. Metal has no MTLPixelFormatRGB10A2Unorm with the
++     * memory layout mpv expects (R in LSB); BGR10A2Unorm matches the
++     * "rgb10_a2" interpretation in the shader-side swizzle path. */
++    { "rgb10_a2", MTLPixelFormatBGR10A2Unorm,  RA_CTYPE_UNORM, 4, 10, 10,  4, true,  true  },
++    { "rgb565",   MTLPixelFormatB5G6R5Unorm,   RA_CTYPE_UNORM, 3,  6,  5,  2, true,  true  },
++
++    /* 8-bit unsigned integer (non-filterable -- linear_filter=false). */
++    { "r8ui",     MTLPixelFormatR8Uint,        RA_CTYPE_UINT,  1,  8,  8,  1, false, true  },
++    { "rg8ui",    MTLPixelFormatRG8Uint,       RA_CTYPE_UINT,  2,  8,  8,  2, false, true  },
++    { "rgba8ui",  MTLPixelFormatRGBA8Uint,     RA_CTYPE_UINT,  4,  8,  8,  4, false, true  },
++};
++
++#define METAL_NUM_FORMATS (sizeof(metal_formats) / sizeof(metal_formats[0]))
++
++MTLPixelFormat ra_metal_pixel_format(const struct ra_format *fmt)
++{
++    if (!fmt || !fmt->priv)
++        return MTLPixelFormatInvalid;
++    const struct metal_format *mf = fmt->priv;
++    return mf->mtl_format;
++}
++
++/* ------------------------------------------------------------------ */
++/* Sampler cache                                                      */
++/* ------------------------------------------------------------------ */
++
++/*
++ * mpv only ever needs four sampler configurations (linear/nearest x
++ * clamp/repeat), so we cache them as a 2x2 grid keyed on (linear, repeat)
++ * to avoid allocating a fresh MTLSamplerState on every render pass.
++ * Index encoding: (linear << 1) | repeat -- stable so the renderpass
++ * chunk can reproduce it.
++ */
++static inline int sampler_index(bool linear, bool repeat)
++{
++    return (linear ? 2 : 0) | (repeat ? 1 : 0);
++}
++
++id<MTLSamplerState> ra_metal_sampler(struct ra *ra, bool linear, bool repeat)
++{
++    struct ra_metal *p = ra_metal_get(ra);
++    int idx = sampler_index(linear, repeat);
++    if (p->samplers[idx])
++        return p->samplers[idx];
++
++    MTLSamplerDescriptor *desc = [[MTLSamplerDescriptor alloc] init];
++    desc.minFilter    = linear ? MTLSamplerMinMagFilterLinear
++                               : MTLSamplerMinMagFilterNearest;
++    desc.magFilter    = linear ? MTLSamplerMinMagFilterLinear
++                               : MTLSamplerMinMagFilterNearest;
++    desc.mipFilter    = MTLSamplerMipFilterNotMipmapped;
++    desc.sAddressMode = repeat ? MTLSamplerAddressModeRepeat
++                               : MTLSamplerAddressModeClampToEdge;
++    desc.tAddressMode = desc.sAddressMode;
++    desc.rAddressMode = desc.sAddressMode;
++    desc.normalizedCoordinates = YES;
++
++    p->samplers[idx] = [p->device newSamplerStateWithDescriptor:desc];
++    return p->samplers[idx];
++}
++
++/* ------------------------------------------------------------------ */
++/* Per-frame command buffer                                           */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Lazy single-cmd-buf-per-frame strategy. The first encode call in a
++ * frame allocates; commit_frame nils it out. This matches how ra_d3d11
++ * keeps an ID3D11DeviceContext open across the frame. A future change
++ * may want multiple in-flight buffers for parallel compute encoders --
++ * the ra->caps RA_CAP_PARALLEL_COMPUTE bit is set, but the actual
++ * fanout happens in renderpass_run (TODO(phase-2)).
++ */
++id<MTLCommandBuffer> ra_metal_cmd_buf(struct ra *ra)
++{
++    struct ra_metal *p = ra_metal_get(ra);
++    if (!p->cmd_buf)
++        p->cmd_buf = [p->queue commandBuffer];
++    return p->cmd_buf;
++}
++
++/* ------------------------------------------------------------------ */
++/* ra_init_metal                                                      */
++/* ------------------------------------------------------------------ */
++
++bool ra_init_metal(struct ra_ctx *ctx, id<MTLDevice> device,
++                   id<MTLCommandQueue> queue)
++{
++    if (!ctx || !device) {
++        if (ctx)
++            MP_FATAL(ctx, "ra_init_metal: device must be non-NULL\n");
++        return false;
++    }
++
++    struct ra *ra = talloc_zero(NULL, struct ra);
++    ra->log    = ctx->log;
++    /* ctx->global may be NULL in headless unit tests; that's fine, the
++     * fields that consume it (spirv config lookup) are guarded. */
++    ra->fns    = &ra_fns_metal;
++
++    struct ra_metal *p = talloc_zero(ra, struct ra_metal);
++    ra->priv   = p;
++    p->device  = device;
++    p->queue   = queue ?: [device newCommandQueue];
++    if (!p->queue) {
++        MP_FATAL(ra, "ra_init_metal: failed to allocate MTLCommandQueue\n");
++        talloc_free(ra);
++        return false;
++    }
++
++    /* Capability bitset. Metal natively supports all of these on every
++     * GPU family mpv targets (Apple silicon + macOS Intel >= Skylake).
++     * Granular fallbacks (e.g. compute on older iOS A8) are not worth
++     * the maintenance burden -- the minimum deployment target is
++     * iOS 13/macOS 10.15 for our shaderc dependency anyway. */
++    ra->caps = RA_CAP_TEX_1D
++             | RA_CAP_TEX_3D
++             | RA_CAP_BLIT
++             | RA_CAP_COMPUTE
++             | RA_CAP_NUM_GROUPS
++             | RA_CAP_DIRECT_UPLOAD
++             | RA_CAP_BUF_RO
++             | RA_CAP_BUF_RW
++             | RA_CAP_FRAGCOORD
++             | RA_CAP_PARALLEL_COMPUTE
++             | RA_CAP_GLOBAL_UNIFORM
++             | RA_CAP_GATHER;
++
++    /* GLSL 4.50 + Vulkan dialect: matches what SPIRV-Cross expects on
++     * the input side. SPIRV-Cross will then emit MSL. ra->glsl_es stays
++     * false -- we never feed Metal an ES dialect. */
++    ra->glsl_version = 450;
++    ra->glsl_vulkan  = true;
++    ra->glsl_es      = false;
++
++    /* Hard-wired limits. The real Metal device exposes
++     * MTLDevice.maxBufferLength etc., but for the values mpv actually
++     * consults the per-feature-set minimums are a safe lower bound and
++     * avoid an init-time device query that would block in a unit test. */
++    ra->max_texture_wh             = 16384;
++    ra->max_pushc_size             = 4096;  /* Metal setBytes: 4 KB cap */
++    ra->max_compute_group_threads  = 1024;
++    ra->max_shmem                  = 32768; /* 32 KB threadgroup memory */
++
++    /* Build the ra_format table. Each entry is a talloc child of `ra` so
++     * the formats die with the ra (same lifetime model as ra_gl.c:149). */
++    for (size_t i = 0; i < METAL_NUM_FORMATS; i++) {
++        const struct metal_format *mf = &metal_formats[i];
++        struct ra_format *fmt = talloc_zero(ra, struct ra_format);
++        fmt->name           = mf->name;
++        fmt->priv           = (void *)mf;
++        fmt->ctype          = mf->ctype;
++        fmt->ordered        = true;
++        fmt->num_components = mf->num_components;
++        fmt->pixel_size     = mf->pixel_size;
++        fmt->linear_filter  = mf->linear_filter;
++        fmt->renderable     = mf->renderable;
++        fmt->storable       = true;
++        for (int c = 0; c < mf->num_components; c++) {
++            fmt->component_size[c]  = mf->component_size;
++            fmt->component_depth[c] = mf->component_depth;
++        }
++        MP_TARRAY_APPEND(ra, ra->formats, ra->num_formats, fmt);
++    }
++
++    ctx->ra = ra;
++    MP_VERBOSE(ra, "Metal RA initialised: device=\"%s\", %d formats\n",
++               [[device name] UTF8String] ?: "(unknown)", ra->num_formats);
++    return true;
++}
++
++/* ------------------------------------------------------------------ */
++/* ra_metal_wrap_drawable                                             */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Synthetic dummy format used by the wrapped drawable, mirroring
++ * fbo_dummy_format in ra_gl.c:420-429. The drawable's real
++ * MTLPixelFormat could be probed via [texture pixelFormat] and matched
++ * back into metal_formats[], but the renderer only ever consults
++ * dummy_format=true / renderable=true / pixel_size on this path, so a
++ * single shared entry is enough.
++ */
++static const struct metal_format drawable_dummy_metal_format = {
++    .name           = "unknown_drawable",
++    .mtl_format     = MTLPixelFormatBGRA8Unorm,
++    .ctype          = RA_CTYPE_UNORM,
++    .num_components = 4,
++    .component_size = 8,
++    .component_depth = 8,
++    .pixel_size     = 4,
++    .linear_filter  = true,
++    .renderable     = true,
++};
++
++static const struct ra_format drawable_dummy_ra_format = {
++    .name           = "unknown_drawable",
++    .priv           = (void *)&drawable_dummy_metal_format,
++    .ctype          = RA_CTYPE_UNORM,
++    .num_components = 4,
++    .pixel_size     = 4,
++    .renderable     = true,
++    .dummy_format   = true,
++};
++
++struct ra_tex *ra_metal_wrap_drawable(struct ra_ctx *ctx,
++                                      id<MTLTexture> texture,
++                                      int w, int h,
++                                      id<MTLCommandBuffer> command_buffer)
++{
++    if (!ctx || !ctx->ra || !texture)
++        return NULL;
++
++    struct ra_metal *p = ra_metal_get(ctx->ra);
++
++    /* If the caller hands us a fresh command buffer mid-frame, commit
++     * whatever we had pending before adopting the new one. Dropping it
++     * silently would orphan any encoded work. */
++    if (command_buffer) {
++        if (p->cmd_buf && p->cmd_buf != command_buffer)
++            [p->cmd_buf commit];
++        p->cmd_buf = command_buffer;
++    }
++
++    struct ra_tex *tex = talloc_zero(ctx->ra, struct ra_tex);
++    tex->params = (struct ra_tex_params){
++        .dimensions = 2,
++        .w = w, .h = h, .d = 1,
++        .format     = &drawable_dummy_ra_format,
++        .render_dst = true,
++        .blit_src   = true,
++        .blit_dst   = true,
++    };
++
++    struct ra_tex_metal *tm = talloc_zero(tex, struct ra_tex_metal);
++    tm->texture    = texture;
++    tm->is_wrapped = true;
++    tex->priv      = tm;
++    return tex;
++}
++
++/* ------------------------------------------------------------------ */
++/* Frame commit                                                       */
++/* ------------------------------------------------------------------ */
++
++void ra_metal_commit_frame(struct ra_ctx *ctx, bool display_synced)
++{
++    (void)display_synced;
++    if (!ctx || !ctx->ra)
++        return;
++    struct ra_metal *p = ra_metal_get(ctx->ra);
++    if (!p->cmd_buf)
++        return;
++    /* Presentation is intentionally not requested here -- the libmpv
++     * embedder owns the CAMetalDrawable lifecycle and calls
++     * presentDrawable on the host queue. We only commit. */
++    [p->cmd_buf commit];
++    p->cmd_buf = nil;
++}
++
++/* ------------------------------------------------------------------ */
++/* Teardown                                                           */
++/* ------------------------------------------------------------------ */
++
++static void ra_metal_destroy_fns(struct ra *ra)
++{
++    if (!ra)
++        return;
++    struct ra_metal *p = ra->priv;
++    if (p) {
++        if (p->cmd_buf) {
++            [p->cmd_buf commit];
++            p->cmd_buf = nil;
++        }
++        for (int i = 0; i < 4; i++)
++            p->samplers[i] = nil;
++        p->queue  = nil;
++        p->device = nil;
++    }
++    /* `p` is a talloc child of `ra`, so it dies with the parent. */
++    talloc_free(ra);
++}
++
++void ra_metal_destroy(struct ra_ctx *ctx)
++{
++    if (!ctx || !ctx->ra)
++        return;
++    ra_metal_destroy_fns(ctx->ra);
++    ctx->ra = NULL;
++}
+diff --git a/video/out/metal/ra_metal_renderpass.m b/video/out/metal/ra_metal_renderpass.m
+new file mode 100644
+index 0000000..9d833b7
+--- /dev/null
++++ b/video/out/metal/ra_metal_renderpass.m
+@@ -0,0 +1,341 @@
++/* Copyright (C) 2026 the mpv developers
++ *
++ * Apple Metal backend for mpv's render abstraction (ra). Parallel to
++ * video/out/opengl/ra_gl.c. This file is the assembled skeleton for
++ * Phase 1 — most lifecycle/format/buffer/texture functions are real
++ * implementations; renderpass + timer + scaled-blit + scissored-clear
++ * are stubs marked `TODO(phase-2)` pointing at follow-up work.
++ *
++ * The file is built up from three logical chunks (init, textures,
++ * renderpass) — kept inline for static-function locality, matching
++ * ra_gl.c's monolithic structure.
++ */
++
++#import "ra_metal.h"
++#include "mpv_talloc.h"
++#include "common/msg.h"
++#include "video/out/gpu/utils.h"
++
++// ============ INIT + FORMATS + LIFECYCLE ============
++
++// ============ TEXTURES + BUFFERS + CLEAR + BLIT ============
++
++// ============ RENDERPASS + TIMER + DEBUG_MARKER ============
++/*
++ * Metal RA backend: renderpass, timers, debug markers, uniform layout.
++ *
++ * Parallel chunk to video/out/opengl/ra_gl.c (lines ~720-1208) and
++ * video/out/d3d11/ra_d3d11.c (the GLSL->SPIR-V->target-language pipeline
++ * around lines 1301-1409). This file collects the ra_fns entries that
++ * deal with shader compilation and submission.
++ *
++ * Phase-1 status: scaffolding only. Shader translation is gated on the
++ * shaderc + SPIRV-Cross dependencies which are wired up in phase 2.
++ * Every deferred path is marked with the literal token "TODO(phase-2)"
++ * so it can be grepped uniformly across files. Don't drop or rename
++ * the token without updating the other chunks.
++ */
++
++
++
++/*
++ * mpv's std140 uniform layout helper lives in video/out/opengl/utils.c.
++ * Both the GL and (eventually) the Metal backend use it: SPIRV-Cross
++ * emits MSL with matching `packed_*` types and explicit padding when the
++ * SPIR-V module declares std140-laid-out uniform blocks. Re-using the
++ * shared helper guarantees mpv's CPU-side packing matches the GPU-side
++ * struct layout.
++ */
++extern struct ra_layout std140_layout(struct ra_renderpass_input *inp);
++
++/* ------------------------------------------------------------------ */
++/* desc_namespace                                                     */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Same trick as gl_desc_namespace (ra_gl.c:720): each ra_vartype gets
++ * its own binding-index namespace. In Metal terms, textures, samplers,
++ * read-only buffers and read-write buffers each live in independent
++ * binding-index spaces -- a texture at slot 0 does not conflict with a
++ * buffer at slot 0. The shader compiler hands out indices per type, so
++ * returning the vartype itself as the namespace key is correct.
++ */
++int metal_desc_namespace(struct ra *ra, enum ra_vartype type)
++{
++    return type;
++}
++
++/* ------------------------------------------------------------------ */
++/* renderpass_create / destroy / run                                  */
++/* ------------------------------------------------------------------ */
++
++/*
++ * TODO(phase-2): full implementation. Template is ra_d3d11.c:1301-1409
++ * (the compile_glsl helper) plus the D3D11 pipeline-state assembly that
++ * follows it. The Metal equivalent is:
++ *
++ *   1. Acquire the SPIR-V compiler the same way d3d11 does:
++ *
++ *        struct spirv_compiler *spirv =
++ *            mp_get_config_group(ra, ra->global, &spirv_conf);
++ *
++ *      (compare ra_d3d11.c around line 1303-1305 where p->spirv is
++ *      cached on the backend priv at init time -- we'll do the same on
++ *      struct ra_metal in phase 2.)
++ *
++ *   2. Translate GLSL -> SPIR-V via shaderc:
++ *
++ *        bstr spv;
++ *        spirv->fns->compile_glsl(spirv, ta_ctx,
++ *                                 GLSL_SHADER_FRAGMENT,
++ *                                 params->frag_shader, &spv);
++ *
++ *      Repeat for vertex (or compute, when type == COMPUTE).
++ *
++ *   3. Translate SPIR-V -> MSL via SPIRV-Cross:
++ *
++ *        spvc_context ctx; spvc_context_create(&ctx);
++ *        spvc_context_parse_spirv(ctx, (SpvId *)spv.start,
++ *                                 spv.len / sizeof(SpvId), &ir);
++ *        spvc_context_create_compiler(ctx, SPVC_BACKEND_MSL, ir,
++ *                                     SPVC_CAPTURE_MODE_TAKE_OWNERSHIP,
++ *                                     &cc);
++ *        spvc_compiler_create_compiler_options(cc, &opts);
++ *        spvc_compiler_options_set_uint(opts,
++ *            SPVC_COMPILER_OPTION_MSL_VERSION,
++ *            SPVC_MAKE_MSL_VERSION(2, 4, 0));   // iOS 17+ baseline
++ *        spvc_compiler_options_set_uint(opts,
++ *            SPVC_COMPILER_OPTION_MSL_PLATFORM,
++ *            SPVC_MSL_PLATFORM_IOS);
++ *        spvc_compiler_install_compiler_options(cc, opts);
++ *        const char *msl = NULL;
++ *        spvc_compiler_compile(cc, &msl);
++ *
++ *   4. Build a MTLLibrary from the MSL source and pull out the two
++ *      entry points. SPIRV-Cross names the entry point "main0" by
++ *      default for both stages:
++ *
++ *        NSError *err = nil;
++ *        id<MTLLibrary> lib =
++ *            [device newLibraryWithSource:@(msl) options:nil error:&err];
++ *        id<MTLFunction> vfn = [lib newFunctionWithName:@"main0"];
++ *        id<MTLFunction> ffn = [lib newFunctionWithName:@"main0"];
++ *
++ *   5. Build a MTLVertexDescriptor from params->vertex_attribs. For
++ *      each attribute, map (vartype, dim_v) -> MTLVertexFormat via a
++ *      helper (metal_vertex_format()); offset comes from the input's
++ *      offset field; bufferIndex is fixed at 30 (Metal reserves the top
++ *      buffer slots for vertex streams when SPIRV-Cross emits MSL).
++ *      The layout entry mirrors that:
++ *
++ *        vdesc.layouts[30].stride       = params->vertex_stride;
++ *        vdesc.layouts[30].stepFunction = MTLVertexStepFunctionPerVertex;
++ *
++ *   6. Build a MTLRenderPipelineDescriptor:
++ *        - vertexFunction / fragmentFunction from step 4
++ *        - vertexDescriptor from step 5
++ *        - colorAttachments[0].pixelFormat =
++ *              ra_metal_pixel_format(params->target_format);
++ *        - if params->enable_blend, fill in the blend factors via a
++ *          helper metal_blend_factor(enum ra_blend) -> MTLBlendFactor;
++ *          set blendingEnabled = YES and the source/destination
++ *          rgb/alpha factors from params->blend_*.
++ *        - [device newRenderPipelineStateWithDescriptor:desc error:&err]
++ *
++ *   7. Compute path: replace steps 5/6 with a MTLComputePipelineState
++ *      built directly from the compute MTLFunction.
++ *
++ *   8. Reflection: walk params->inputs and ask SPIRV-Cross
++ *      (spvc_compiler_get_decoration with SpvDecorationBinding) for
++ *      the Metal binding slot of each. Store into
++ *      ra_renderpass_metal->binding_indices[i] so renderpass_run can
++ *      bind without re-reflecting on every draw.
++ *
++ * Until that lands, fail loudly so callers don't silently render nothing.
++ */
++struct ra_renderpass *metal_renderpass_create(struct ra *ra,
++                                const struct ra_renderpass_params *params)
++{
++    (void)params;
++    MP_FATAL(ra->log,
++        "metal: renderpass_create not implemented "
++        "(TODO(phase-2): shaderc -> SPIRV-Cross -> MSL -> MTLLibrary -> "
++        "MTLRenderPipelineState)\n");
++    return NULL;
++}
++
++void metal_renderpass_destroy(struct ra *ra, struct ra_renderpass *pass)
++{
++    (void)ra;
++    if (!pass)
++        return;
++
++    struct ra_renderpass_metal *pass_metal = pass->priv;
++    if (pass_metal) {
++        /*
++         * ARC owns the Metal objects -- nilling the strong refs is what
++         * actually releases them. Be explicit so the lifetimes are
++         * visible at the call site (and so a future move to a non-ARC
++         * subset still does the right thing).
++         */
++        pass_metal->render_pso  = nil;
++        pass_metal->compute_pso = nil;
++        pass_metal->library     = nil;
++        /* binding_indices is talloc'd as a child of pass_metal. */
++    }
++    talloc_free(pass);
++}
++
++/*
++ * TODO(phase-2): full implementation. Outline:
++ *
++ *   Raster path:
++ *     - Build a MTLRenderPassDescriptor with one color attachment:
++ *         rpd.colorAttachments[0].texture =
++ *             ((struct ra_tex_metal *)params->target->priv)->texture;
++ *         rpd.colorAttachments[0].loadAction =
++ *             params->invalidate_target ? MTLLoadActionDontCare
++ *                                       : MTLLoadActionLoad;
++ *         rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
++ *     - id<MTLRenderCommandEncoder> enc =
++ *           [cmd_buf renderCommandEncoderWithDescriptor:rpd];
++ *     - [enc setRenderPipelineState:pass_metal->render_pso];
++ *     - Translate params->viewport and params->scissors into
++ *       MTLViewport / MTLScissorRect and call setViewport: /
++ *       setScissorRect:. Metal's viewport is in pixels with origin in
++ *       the top-left, matching mp_rect.
++ *     - For each params->values[i] dispatch on the input's vartype:
++ *         RA_VARTYPE_TEX:    setFragmentTexture:atIndex: plus
++ *                            setFragmentSamplerState: from the cached
++ *                            ra_metal_sampler() table.
++ *         RA_VARTYPE_BUF_RO,
++ *         RA_VARTYPE_BUF_RW: setFragmentBuffer:offset:atIndex:.
++ *         RA_VARTYPE_IMG_W:  setFragmentTexture: on the corresponding
++ *                            image-binding slot (Metal collapses
++ *                            sampled/storage textures into MTLTexture).
++ *         Loose uniforms (UBO-less path, e.g. mat4 mvp):
++ *                            pack into a transient block and submit via
++ *                            setFragmentBytes:length:atIndex: -- limit
++ *                            4 KB per call per Metal spec; for larger
++ *                            blocks fall back to a per-frame ring
++ *                            MTLBuffer.
++ *     - Vertex data: small (<= 4 KB) goes via
++ *         [enc setVertexBytes:params->vertex_data
++ *                      length:params->vertex_count *
++ *                             pass->params.vertex_stride
++ *                     atIndex:30];
++ *       larger streams should write into a ring MTLBuffer and use
++ *       setVertexBuffer:offset:atIndex:30.
++ *     - [enc drawPrimitives:MTLPrimitiveTypeTriangle
++ *                vertexStart:0
++ *                vertexCount:params->vertex_count];
++ *     - [enc endEncoding];
++ *
++ *   Compute path:
++ *     - id<MTLComputeCommandEncoder> enc =
++ *           [cmd_buf computeCommandEncoder];
++ *     - [enc setComputePipelineState:pass_metal->compute_pso];
++ *     - Same value-binding loop, but with setComputeTexture: /
++ *       setBuffer: / setBytes: variants.
++ *     - [enc dispatchThreadgroups:MTLSizeMake(params->compute_groups[0],
++ *                                             params->compute_groups[1],
++ *                                             params->compute_groups[2])
++ *           threadsPerThreadgroup:<from pass params>];
++ *     - [enc endEncoding];
++ */
++void metal_renderpass_run(struct ra *ra,
++                                 const struct ra_renderpass_run_params *params)
++{
++    (void)params;
++    MP_FATAL(ra->log,
++        "metal: renderpass_run not implemented "
++        "(TODO(phase-2): depends on renderpass_create)\n");
++}
++
++/* ------------------------------------------------------------------ */
++/* Timers                                                             */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Metal GPU timing requires MTLCounterSampleBuffer (iOS 14.2 / macOS
++ * 11+). The wiring is non-trivial: query device->counterSets for
++ * MTLCommonCounterSetTimestamp, allocate a sample buffer per timer,
++ * call sampleCountersInBuffer:atSampleIndex:withBarrier: at encoder
++ * boundaries, then resolve at frame end. Deferred -- the rest of the
++ * backend works fine without it (mpv uses timer data only for the
++ * --vo-gpu-stats overlay).
++ */
++ra_timer *metal_timer_create(struct ra *ra)
++{
++    (void)ra;
++    /* TODO(phase-2): MTLCounterSampleBuffer wiring. */
++    return NULL;
++}
++
++void metal_timer_destroy(struct ra *ra, ra_timer *timer)
++{
++    (void)ra;
++    (void)timer;
++    /* TODO(phase-2): release counter sample buffer. */
++}
++
++void metal_timer_start(struct ra *ra, ra_timer *timer)
++{
++    (void)ra;
++    (void)timer;
++    /* TODO(phase-2): sampleCountersInBuffer at encoder start. */
++}
++
++uint64_t metal_timer_stop(struct ra *ra, ra_timer *timer)
++{
++    (void)ra;
++    (void)timer;
++    /* TODO(phase-2): resolve counter sample buffer, return ns. */
++    return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* Debug marker                                                       */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Real implementation would call
++ *   [encoder insertDebugSignpost:@(msg)]
++ * on whichever render/compute/blit encoder is currently active. That
++ * needs the encoder to be tracked on struct ra_metal (a `current_encoder`
++ * field plus push/pop hooks in renderpass_run and any future blit
++ * helpers). Until that tracking exists, we just route the marker into
++ * the mpv log so the breadcrumb still shows up in --msg-level=vo=v.
++ *
++ * TODO(phase-2): once renderpass_run sets ra_metal->current_encoder,
++ * forward the message via insertDebugSignpost: when non-nil; keep the
++ * MP_VERBOSE fallback for the cases where no encoder is open.
++ */
++void metal_debug_marker(struct ra *ra, const char *msg)
++{
++    MP_VERBOSE(ra, "[marker] %s\n", msg ? msg : "");
++}
++
++/* ------------------------------------------------------------------ */
++/* ra_fns slice                                                       */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Only the entries owned by this chunk are listed. The init chunk
++ * assembles the full ra_fns_metal table by combining these with the
++ * tex/buf/clear/blit/destroy entries it owns. Naming convention matches
++ * ra_fns_gl in ra_gl.c:1186.
++ */
++const struct ra_fns ra_fns_metal_renderpass = {
++    .uniform_layout     = std140_layout,
++    .desc_namespace     = metal_desc_namespace,
++    .renderpass_create  = metal_renderpass_create,
++    .renderpass_destroy = metal_renderpass_destroy,
++    .renderpass_run     = metal_renderpass_run,
++    .timer_create       = metal_timer_create,
++    .timer_destroy      = metal_timer_destroy,
++    .timer_start        = metal_timer_start,
++    .timer_stop         = metal_timer_stop,
++    .debug_marker       = metal_debug_marker,
++};
++
+diff --git a/video/out/metal/ra_metal_textures.m b/video/out/metal/ra_metal_textures.m
+new file mode 100644
+index 0000000..cc7edbe
+--- /dev/null
++++ b/video/out/metal/ra_metal_textures.m
+@@ -0,0 +1,632 @@
++/* Copyright (C) 2026 the mpv developers
++ *
++ * Metal RA backend — textures, buffers, clear, blit.
++ *
++ * Parallel chunk to video/out/opengl/ra_gl.c (lines ~266-718), the
++ * texture/buffer/clear/blit slice of the GL backend. The Metal port is
++ * structurally the same: ra_tex / ra_buf wrappers around the native
++ * MTLTexture / MTLBuffer, with the GL FBO+PBO machinery replaced by
++ * MTLBlitCommandEncoder transfers and MTLRenderPassDescriptor loadActions.
++ *
++ * All functions here are NON-STATIC: they are referenced by name from
++ * the master ra_fns vtable assembled in ra_metal.m. Keep the prototypes
++ * matching struct ra_fns in video/out/gpu/ra.h exactly.
++ *
++ * Phase-1 status: the common path (whole-texture clear, same-size /
++ * same-format blit, simple uploads/downloads) is real. Anything that
++ * would need a transient render pass (scaled blit, scissored clear,
++ * format conversion) is gated on phase 2 and grep-marked TODO(phase-2).
++ */
++
++#import "ra_metal.h"
++#include "mpv_talloc.h"
++#include "common/msg.h"
++
++/* ------------------------------------------------------------------ */
++/* Internal helpers (file-local, not part of the vtable)              */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Translate (dimensions, params) → MTLTextureType. Metal exposes 1D, 2D
++ * and 3D as distinct types (plus array / cube / multisample variants we
++ * don't use). This is the metal analogue of the GL switch in
++ * gl_tex_create_blank (ra_gl.c:295).
++ */
++static MTLTextureType metal_texture_type(const struct ra_tex_params *params)
++{
++    switch (params->dimensions) {
++    case 1: return MTLTextureType1D;
++    case 2: return MTLTextureType2D;
++    case 3: return MTLTextureType3D;
++    default: return MTLTextureType2D; /* caller validated; defensive */
++    }
++}
++
++/*
++ * Compute MTLTextureUsage from ra_tex_params. ShaderRead covers
++ * render_src (sampling in a fragment/compute shader); RenderTarget
++ * covers anything that needs an MTLRenderPassDescriptor attachment
++ * (render_dst, blit_src/blit_dst — Metal's blit encoder doesn't strictly
++ * require RenderTarget, but mpv's BLIT path may fall back through a
++ * render pass for scaled blits in phase 2, so request it up-front);
++ * ShaderWrite covers RA_VARTYPE_IMG_W (storage_dst).
++ */
++static MTLTextureUsage metal_texture_usage(const struct ra_tex_params *params)
++{
++    MTLTextureUsage usage = 0;
++    if (params->render_src)
++        usage |= MTLTextureUsageShaderRead;
++    if (params->render_dst || params->blit_src || params->blit_dst ||
++        params->downloadable)
++    {
++        usage |= MTLTextureUsageRenderTarget;
++    }
++    if (params->storage_dst)
++        usage |= MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
++    if (usage == 0)
++        usage = MTLTextureUsageShaderRead; /* sensible default */
++    return usage;
++}
++
++/*
++ * Pick a storage mode. Private = GPU-only (fastest, the default).
++ * Shared = CPU+GPU coherent — required when the caller wants to read
++ * the texture back via tex_download(). host_mutable textures stay
++ * Private; the upload path stages through a Shared MTLBuffer.
++ */
++static MTLStorageMode metal_texture_storage(const struct ra_tex_params *params)
++{
++    if (params->downloadable)
++        return MTLStorageModeShared;
++    return MTLStorageModePrivate;
++}
++
++/*
++ * Stage `data` (CPU memory) into `texture` via a transient Shared
++ * MTLBuffer + blit encoder. Shared inside ra_metal_textures.m: used by
++ * both initial_data (tex_create) and the buffer-less upload path
++ * (tex_upload with params->src). The blit is issued on the per-frame
++ * command buffer so it's serialized with everything else in the frame.
++ */
++static bool metal_stage_to_texture(struct ra *ra, id<MTLTexture> texture,
++                                   const void *data, size_t bytes_per_row,
++                                   MTLRegion region, int dimensions)
++{
++    struct ra_metal *p = ra_metal_get(ra);
++    size_t total = bytes_per_row * region.size.height *
++                   (dimensions == 3 ? region.size.depth : 1);
++
++    id<MTLBuffer> staging =
++        [p->device newBufferWithBytes:data
++                               length:total
++                              options:MTLResourceStorageModeShared];
++    if (!staging) {
++        MP_ERR(ra, "metal: failed to allocate %zu-byte staging buffer\n", total);
++        return false;
++    }
++
++    id<MTLCommandBuffer> cb = ra_metal_cmd_buf(ra);
++    id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoder];
++    [enc copyFromBuffer:staging
++           sourceOffset:0
++      sourceBytesPerRow:bytes_per_row
++    sourceBytesPerImage:(dimensions == 3 ? bytes_per_row * region.size.height : 0)
++             sourceSize:region.size
++              toTexture:texture
++       destinationSlice:0
++       destinationLevel:0
++      destinationOrigin:region.origin];
++    [enc endEncoding];
++    return true;
++}
++
++/* ------------------------------------------------------------------ */
++/* tex_destroy / tex_create                                           */
++/* ------------------------------------------------------------------ */
++
++void metal_tex_destroy(struct ra *ra, struct ra_tex *tex)
++{
++    (void)ra;
++    if (!tex)
++        return;
++    struct ra_tex_metal *tex_metal = tex->priv;
++    if (tex_metal) {
++        /*
++         * Wrapped textures (CAMetalDrawable, hwdec surfaces) are owned
++         * by the caller — drop the strong ref but don't otherwise touch
++         * the underlying object. For owned textures, nilling the strong
++         * ref under ARC is what actually triggers the release.
++         */
++        if (!tex_metal->is_wrapped)
++            tex_metal->texture = nil;
++        else
++            tex_metal->texture = nil; /* drop our ref either way */
++    }
++    talloc_free(tex_metal);
++    talloc_free(tex);
++}
++
++struct ra_tex *metal_tex_create(struct ra *ra,
++                                const struct ra_tex_params *params)
++{
++    struct ra_metal *p = ra_metal_get(ra);
++    mp_assert(!params->format->dummy_format);
++
++    /*
++     * Edge case rejection mirroring gl_tex_create_blank's check at
++     * ra_gl.c:310: downloadable requires a 2D renderable texture.
++     * Additionally reject 1D textures used as compute storage targets —
++     * Metal supports it in principle but our binding layout assumes 2D
++     * for image-writable slots.
++     */
++    if (params->downloadable && !(params->dimensions == 2 &&
++                                  params->format->renderable))
++    {
++        MP_ERR(ra, "metal: downloadable texture must be 2D + renderable\n");
++        return NULL;
++    }
++    if (params->dimensions == 1 && params->storage_dst &&
++        params->format->ctype != RA_CTYPE_UNORM &&
++        params->format->ctype != RA_CTYPE_FLOAT)
++    {
++        MP_ERR(ra, "metal: 1D storage textures must be RGB-like\n");
++        return NULL;
++    }
++
++    MTLPixelFormat pf = ra_metal_pixel_format(params->format);
++    if (pf == MTLPixelFormatInvalid) {
++        MP_ERR(ra, "metal: no MTLPixelFormat for ra_format '%s'\n",
++               params->format->name ? params->format->name : "?");
++        return NULL;
++    }
++
++    MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
++    desc.textureType = metal_texture_type(params);
++    desc.pixelFormat = pf;
++    desc.width       = params->w;
++    desc.height      = (params->dimensions >= 2) ? params->h : 1;
++    desc.depth       = (params->dimensions == 3) ? params->d : 1;
++    desc.mipmapLevelCount = 1;
++    desc.sampleCount      = 1;
++    desc.arrayLength      = 1;
++    desc.usage       = metal_texture_usage(params);
++    desc.storageMode = metal_texture_storage(params);
++
++    id<MTLTexture> mtl_tex = [p->device newTextureWithDescriptor:desc];
++    if (!mtl_tex) {
++        MP_ERR(ra,
++               "metal: newTextureWithDescriptor failed "
++               "(%dx%dx%d fmt=%s usage=0x%lx)\n",
++               (int)desc.width, (int)desc.height, (int)desc.depth,
++               params->format->name ? params->format->name : "?",
++               (unsigned long)desc.usage);
++        return NULL;
++    }
++
++    struct ra_tex *tex = talloc_zero(NULL, struct ra_tex);
++    tex->params = *params;
++    tex->params.initial_data = NULL; /* don't expose stale pointer */
++
++    struct ra_tex_metal *tex_metal = talloc_zero(NULL, struct ra_tex_metal);
++    tex_metal->texture    = mtl_tex;
++    tex_metal->is_wrapped = false;
++    tex->priv = tex_metal;
++
++    if (params->initial_data) {
++        MTLRegion region = MTLRegionMake3D(0, 0, 0,
++                                           params->w,
++                                           (params->dimensions >= 2) ? params->h : 1,
++                                           (params->dimensions == 3) ? params->d : 1);
++        size_t bpr = (size_t)params->format->pixel_size * (size_t)params->w;
++        if (params->dimensions == 1) {
++            /* 1D path: Metal accepts replaceRegion directly. */
++            [mtl_tex replaceRegion:region
++                       mipmapLevel:0
++                         withBytes:params->initial_data
++                       bytesPerRow:bpr];
++        } else if (!metal_stage_to_texture(ra, mtl_tex, params->initial_data,
++                                           bpr, region, params->dimensions))
++        {
++            metal_tex_destroy(ra, tex);
++            return NULL;
++        }
++    }
++
++    return tex;
++}
++
++/* ------------------------------------------------------------------ */
++/* tex_upload / tex_download                                          */
++/* ------------------------------------------------------------------ */
++
++bool metal_tex_upload(struct ra *ra, const struct ra_tex_upload_params *params)
++{
++    struct ra_tex *tex = params->tex;
++    struct ra_tex_metal *tex_metal = tex->priv;
++    mp_assert(tex->params.host_mutable);
++    mp_assert(!params->buf || !params->src);
++
++    /* TODO(phase-2): honour params->invalidate via
++     *   MTLRenderPassDescriptor loadAction=DontCare on the next pass.
++     *   The Metal blit encoder has no equivalent of glInvalidateTexImage,
++     *   so we'd have to defer the hint to the next render pass that
++     *   targets `tex`. For now we always preserve existing contents. */
++
++    struct mp_rect rc = {0, 0, tex->params.w, tex->params.h};
++    if (params->rc && tex->params.dimensions == 2)
++        rc = *params->rc;
++    int rc_w = (tex->params.dimensions >= 1) ? (rc.x1 - rc.x0) : 0;
++    int rc_h = (tex->params.dimensions >= 2) ? (rc.y1 - rc.y0) : 1;
++    int rc_d = (tex->params.dimensions == 3) ? tex->params.d : 1;
++    MTLRegion region = MTLRegionMake3D(rc.x0,
++                                       (tex->params.dimensions >= 2) ? rc.y0 : 0,
++                                       0,
++                                       rc_w, rc_h, rc_d);
++    size_t bpr = params->stride ?
++                 (size_t)params->stride :
++                 (size_t)tex->params.format->pixel_size * (size_t)rc_w;
++
++    /* 1D fast path: Metal's replaceRegion works on host-visible storage,
++     * but it also works on Private storage via an internal copy. We
++     * always go through it — 1D textures are tiny (LUTs, primarily) and
++     * the kernel-side staging is cheaper than spinning up a blit pass. */
++    if (tex->params.dimensions == 1) {
++        const void *src = NULL;
++        if (params->buf) {
++            struct ra_buf_metal *buf_metal = params->buf->priv;
++            src = (const uint8_t *)[buf_metal->buffer contents] +
++                  params->buf_offset;
++        } else {
++            src = params->src;
++        }
++        [tex_metal->texture replaceRegion:region
++                              mipmapLevel:0
++                                withBytes:src
++                              bytesPerRow:bpr];
++        return true;
++    }
++
++    /* Buffer-sourced upload: blit-copy from the caller's MTLBuffer. */
++    if (params->buf) {
++        struct ra_buf_metal *buf_metal = params->buf->priv;
++        id<MTLCommandBuffer> cb = ra_metal_cmd_buf(ra);
++        id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoder];
++        [enc copyFromBuffer:buf_metal->buffer
++               sourceOffset:params->buf_offset
++          sourceBytesPerRow:bpr
++        sourceBytesPerImage:(tex->params.dimensions == 3 ? bpr * rc_h : 0)
++                 sourceSize:region.size
++                  toTexture:tex_metal->texture
++           destinationSlice:0
++           destinationLevel:0
++          destinationOrigin:region.origin];
++        [enc endEncoding];
++
++        /* Pin the buffer to this command buffer so buf_poll reports it
++         * in-use until the GPU is done reading from it. */
++        buf_metal->last_used_cb = cb;
++        return true;
++    }
++
++    /* Direct upload from CPU memory: stage through a transient Shared
++     * MTLBuffer. Same code path used for initial_data. */
++    return metal_stage_to_texture(ra, tex_metal->texture, params->src,
++                                  bpr, region, tex->params.dimensions);
++}
++
++bool metal_tex_download(struct ra *ra, struct ra_tex_download_params *params)
++{
++    struct ra_metal *p = ra_metal_get(ra);
++    struct ra_tex *tex = params->tex;
++    struct ra_tex_metal *tex_metal = tex->priv;
++
++    if (tex->params.dimensions != 2) {
++        MP_ERR(ra, "metal: tex_download only supports 2D textures\n");
++        return false;
++    }
++    if (!tex->params.render_dst) {
++        MP_ERR(ra, "metal: tex_download requires render_dst=true\n");
++        return false;
++    }
++
++    size_t bpr_packed = (size_t)tex->params.format->pixel_size *
++                        (size_t)tex->params.w;
++    size_t total = bpr_packed * (size_t)tex->params.h;
++
++    id<MTLBuffer> staging =
++        [p->device newBufferWithLength:total
++                               options:MTLResourceStorageModeShared];
++    if (!staging) {
++        MP_ERR(ra, "metal: tex_download failed to allocate %zu-byte staging\n",
++               total);
++        return false;
++    }
++
++    id<MTLCommandBuffer> cb = ra_metal_cmd_buf(ra);
++    id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoder];
++    [enc copyFromTexture:tex_metal->texture
++             sourceSlice:0
++             sourceLevel:0
++            sourceOrigin:MTLOriginMake(0, 0, 0)
++              sourceSize:MTLSizeMake(tex->params.w, tex->params.h, 1)
++                toBuffer:staging
++       destinationOffset:0
++  destinationBytesPerRow:bpr_packed
++destinationBytesPerImage:total];
++    [enc endEncoding];
++
++    /*
++     * tex_download is synchronous from the caller's POV — commit the
++     * frame's command buffer and block until the GPU has resolved.
++     * ra_metal_commit_frame() will re-allocate the cmd_buf on next use.
++     */
++    [cb commit];
++    [cb waitUntilCompleted];
++    p->cmd_buf = nil;
++
++    const uint8_t *src = (const uint8_t *)[staging contents];
++    uint8_t *dst = params->dst;
++    size_t dst_stride = params->stride ? (size_t)params->stride : bpr_packed;
++    for (int y = 0; y < tex->params.h; y++) {
++        memcpy(dst + (size_t)y * dst_stride,
++               src + (size_t)y * bpr_packed,
++               bpr_packed);
++    }
++    return true;
++}
++
++/* ------------------------------------------------------------------ */
++/* buf_destroy / buf_create / buf_update / buf_poll                   */
++/* ------------------------------------------------------------------ */
++
++void metal_buf_destroy(struct ra *ra, struct ra_buf *buf)
++{
++    (void)ra;
++    if (!buf)
++        return;
++    struct ra_buf_metal *buf_metal = buf->priv;
++    if (buf_metal) {
++        /* ARC: nil the strong refs to release. */
++        buf_metal->buffer       = nil;
++        buf_metal->last_used_cb = nil;
++    }
++    talloc_free(buf_metal);
++    talloc_free(buf);
++}
++
++struct ra_buf *metal_buf_create(struct ra *ra,
++                                const struct ra_buf_params *params)
++{
++    struct ra_metal *p = ra_metal_get(ra);
++
++    /*
++     * Pick storage mode. The GL backend uses GL_STREAM_DRAW / STATIC_DRAW
++     * hints (ra_gl.c:631) which the driver maps to either host-visible
++     * or device-local memory. Metal makes us choose explicitly:
++     *
++     *   - host_mapped       → Shared (caller wants buf->data alive)
++     *   - UNIFORM, TEX_UPLOAD → Shared (small, written every frame)
++     *   - SHADER_STORAGE    → Private (GPU-resident SSBO, unless mapped)
++     */
++    MTLResourceOptions opts = MTLResourceStorageModeShared;
++    bool private_storage = false;
++    if (params->type == RA_BUF_TYPE_SHADER_STORAGE && !params->host_mapped) {
++        opts = MTLResourceStorageModePrivate;
++        private_storage = true;
++    }
++
++    id<MTLBuffer> mtl_buf;
++    if (params->initial_data && !private_storage) {
++        mtl_buf = [p->device newBufferWithBytes:params->initial_data
++                                         length:params->size
++                                        options:opts];
++    } else {
++        mtl_buf = [p->device newBufferWithLength:params->size options:opts];
++    }
++    if (!mtl_buf) {
++        MP_ERR(ra, "metal: newBuffer failed (size=%zu)\n", params->size);
++        return NULL;
++    }
++
++    struct ra_buf *buf = talloc_zero(NULL, struct ra_buf);
++    buf->params = *params;
++    buf->params.initial_data = NULL;
++
++    struct ra_buf_metal *buf_metal = talloc_zero(NULL, struct ra_buf_metal);
++    buf_metal->buffer = mtl_buf;
++    buf->priv = buf_metal;
++
++    if (params->host_mapped)
++        buf->data = [mtl_buf contents];
++
++    /* Private + initial_data: stage through a Shared buffer and blit. */
++    if (params->initial_data && private_storage) {
++        id<MTLBuffer> staging =
++            [p->device newBufferWithBytes:params->initial_data
++                                   length:params->size
++                                  options:MTLResourceStorageModeShared];
++        if (!staging) {
++            MP_ERR(ra, "metal: failed to stage initial_data into private buf\n");
++            metal_buf_destroy(ra, buf);
++            return NULL;
++        }
++        id<MTLCommandBuffer> cb = ra_metal_cmd_buf(ra);
++        id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoder];
++        [enc copyFromBuffer:staging
++               sourceOffset:0
++                   toBuffer:mtl_buf
++          destinationOffset:0
++                       size:params->size];
++        [enc endEncoding];
++        buf_metal->last_used_cb = cb;
++    }
++
++    return buf;
++}
++
++void metal_buf_update(struct ra *ra, struct ra_buf *buf, ptrdiff_t offset,
++                      const void *data, size_t size)
++{
++    struct ra_metal *p = ra_metal_get(ra);
++    struct ra_buf_metal *buf_metal = buf->priv;
++    mp_assert(buf->params.host_mutable);
++    mp_assert((offset & 3) == 0); /* spec: offset is a multiple of 4 */
++
++    /*
++     * Shared storage: direct memcpy. Metal's Shared mode is coherent on
++     * Apple silicon, so the GPU sees the write the next time we encode
++     * against the buffer. Equivalent to glBufferSubData for the
++     * persistently-mapped case.
++     */
++    if (buf_metal->buffer.storageMode == MTLStorageModeShared) {
++        memcpy((uint8_t *)[buf_metal->buffer contents] + offset, data, size);
++        return;
++    }
++
++    /*
++     * Private storage: build a transient Shared staging buffer and
++     * blit-copy onto the device-local target. Same shape as the
++     * initial_data path in metal_buf_create but parameterised by offset.
++     */
++    id<MTLBuffer> staging =
++        [p->device newBufferWithBytes:data
++                               length:size
++                              options:MTLResourceStorageModeShared];
++    if (!staging) {
++        MP_ERR(ra, "metal: buf_update failed to allocate staging\n");
++        return;
++    }
++    id<MTLCommandBuffer> cb = ra_metal_cmd_buf(ra);
++    id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoder];
++    [enc copyFromBuffer:staging
++           sourceOffset:0
++               toBuffer:buf_metal->buffer
++      destinationOffset:offset
++                   size:size];
++    [enc endEncoding];
++    buf_metal->last_used_cb = cb;
++}
++
++bool metal_buf_poll(struct ra *ra, struct ra_buf *buf)
++{
++    (void)ra;
++    struct ra_buf_metal *buf_metal = buf->priv;
++
++    /* Never been touched by the GPU → trivially reusable. Matches the
++     * gl_buf_poll early-out for un-fenced buffers (ra_gl.c:661). */
++    if (!buf_metal->last_used_cb)
++        return true;
++
++    MTLCommandBufferStatus status = buf_metal->last_used_cb.status;
++    if (status >= MTLCommandBufferStatusCompleted) {
++        /* Drop the ref so subsequent polls hit the fast path above. */
++        buf_metal->last_used_cb = nil;
++        return true;
++    }
++    return false;
++}
++
++/* ------------------------------------------------------------------ */
++/* clear / blit                                                       */
++/* ------------------------------------------------------------------ */
++
++void metal_clear(struct ra *ra, struct ra_tex *dst, float color[4],
++                 struct mp_rect *scissor)
++{
++    struct ra_metal *p = ra_metal_get(ra);
++    mp_assert(dst->params.render_dst);
++    struct ra_tex_metal *tex_metal = dst->priv;
++
++    bool full_rect = !scissor ||
++                     (scissor->x0 == 0 && scissor->y0 == 0 &&
++                      scissor->x1 == dst->params.w &&
++                      scissor->y1 == dst->params.h);
++
++    if (!full_rect) {
++        /* TODO(phase-2): scissored clear. Metal's loadAction=.clear
++         * always covers the full attachment; a sub-rect clear requires
++         * either a tiny render pass with a colored quad + scissor rect,
++         * or a compute kernel that writes the color over the region.
++         * The GL backend uses GL_SCISSOR_TEST around glClear
++         * (ra_gl.c:687-695); the Metal equivalent needs the render-pass
++         * code that's gated on phase-2 shader work. */
++        MP_FATAL(ra->log,
++            "metal: scissored clear not implemented "
++            "(TODO(phase-2): needs render-pass quad + scissor)\n");
++        return;
++    }
++
++    MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
++    rpd.colorAttachments[0].texture     = tex_metal->texture;
++    rpd.colorAttachments[0].loadAction  = MTLLoadActionClear;
++    rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
++    rpd.colorAttachments[0].clearColor  =
++        MTLClearColorMake(color[0], color[1], color[2], color[3]);
++
++    id<MTLCommandBuffer> cb = ra_metal_cmd_buf(ra);
++    id<MTLRenderCommandEncoder> enc =
++        [cb renderCommandEncoderWithDescriptor:rpd];
++    /* No draw calls — endEncoding commits the loadAction, which is the
++     * clear. Metal optimises an "empty" render pass into a pure clear. */
++    [enc endEncoding];
++    (void)p;
++}
++
++void metal_blit(struct ra *ra, struct ra_tex *dst, struct ra_tex *src,
++                struct mp_rect *dst_rc, struct mp_rect *src_rc)
++{
++    mp_assert(src->params.blit_src);
++    mp_assert(dst->params.blit_dst);
++
++    struct ra_tex_metal *src_metal = src->priv;
++    struct ra_tex_metal *dst_metal = dst->priv;
++
++    int dst_w = dst_rc->x1 - dst_rc->x0;
++    int dst_h = dst_rc->y1 - dst_rc->y0;
++    int src_w = src_rc->x1 - src_rc->x0;
++    int src_h = src_rc->y1 - src_rc->y0;
++
++    bool same_size   = (dst_w == src_w) && (dst_h == src_h);
++    bool same_format = (src->params.format == dst->params.format) ||
++                       (ra_metal_pixel_format(src->params.format) ==
++                        ra_metal_pixel_format(dst->params.format));
++
++    if (!same_size || !same_format) {
++        /* TODO(phase-2): scaled / format-converting blit. Implemented as
++         * a render pass drawing a fullscreen-ish quad sampling `src`
++         * into `dst`, with the linear/nearest filter chosen by
++         * src->params.src_linear. The GL backend defers this to
++         * glBlitFramebuffer (ra_gl.c:711), which Metal has no equivalent
++         * of — we need the phase-2 renderpass code to land first. */
++        MP_FATAL(ra->log,
++            "metal: scaled/format-converting blit not implemented "
++            "(src=%dx%d dst=%dx%d same_fmt=%d, "
++            "TODO(phase-2): needs render-pass blit shader)\n",
++            src_w, src_h, dst_w, dst_h, (int)same_format);
++        return;
++    }
++
++    /* Fast path: same size, same format → MTLBlitCommandEncoder
++     * copyFromTexture. Negative widths/heights (the GL backend's flip
++     * trick) aren't representable in the Metal blit encoder; if a flip
++     * is needed it has to go through the phase-2 render-pass blit too. */
++    if (dst_w < 0 || dst_h < 0 || src_w < 0 || src_h < 0) {
++        MP_FATAL(ra->log,
++            "metal: flipping blit not implemented "
++            "(TODO(phase-2): needs render-pass blit shader)\n");
++        return;
++    }
++
++    id<MTLCommandBuffer> cb = ra_metal_cmd_buf(ra);
++    id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoder];
++    [enc copyFromTexture:src_metal->texture
++             sourceSlice:0
++             sourceLevel:0
++            sourceOrigin:MTLOriginMake(src_rc->x0, src_rc->y0, 0)
++              sourceSize:MTLSizeMake(src_w, src_h, 1)
++               toTexture:dst_metal->texture
++        destinationSlice:0
++        destinationLevel:0
++       destinationOrigin:MTLOriginMake(dst_rc->x0, dst_rc->y0, 0)];
++    [enc endEncoding];
++}
