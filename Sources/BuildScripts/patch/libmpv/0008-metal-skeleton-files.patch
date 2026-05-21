@@ -1600,7 +1600,7 @@
 +}
 --- a/video/out/metal/ra_metal_renderpass.m
 +++ b/video/out/metal/ra_metal_renderpass.m
-@@ -0,0 +1,1142 @@
+@@ -0,0 +1,1126 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Apple Metal backend for mpv's render abstraction (ra). Parallel to
@@ -2222,45 +2222,25 @@
 +     * reflection API which N it picked, and store it for renderpass_run to
 +     * set via setVertex/Fragment/Bytes:length:atIndex:. */
 +    if (params->push_constants_size > 0) {
-+        spvc_compiler refl_c =
-+            (params->type == RA_RENDERPASS_TYPE_COMPUTE) ? comp.sc_compiler
-+                                                         : frag.sc_compiler;
-+        struct metal_shader_stage *refl_stage =
-+            (params->type == RA_RENDERPASS_TYPE_COMPUTE) ? &comp : &frag;
-+        /* Dump first 600 chars of MSL — look for where SPIRV-Cross put
-+         * push-const block. Search for "push_const" / "buffer(" markers. */
-+        if (refl_stage->msl) {
-+            size_t n = strlen(refl_stage->msl);
-+            MP_WARN(ra, "MSL DUMP (first 600/%zu):\n%.600s\n---END MSL---\n",
-+                    n, refl_stage->msl);
++        /* The push_constant block is typically declared once and consumed by
++         * MULTIPLE stages. For raster passes mpv tends to put the matrix +
++         * scaling uniforms in vertex; fragment may or may not see it. Probe
++         * vertex first; fall back to fragment / compute. */
++        spvc_compiler stages[3] = { NULL, NULL, NULL };
++        const char *stage_names[3] = { "VERT", "FRAG", "COMP" };
++        int n_stages = 0;
++        if (params->type == RA_RENDERPASS_TYPE_RASTER) {
++            stages[n_stages++] = vert.sc_compiler;
++            stages[n_stages++] = frag.sc_compiler;
++        } else {
++            stages[n_stages++] = comp.sc_compiler;
 +        }
-+        /* Iterate ALL resource types — see what SPIRV-Cross classified our
-+         * push-const as. */
-+        spvc_resources refl_res = NULL;
-+        if (refl_c && spvc_compiler_create_shader_resources(refl_c, &refl_res) == SPVC_SUCCESS) {
-+            static const struct { spvc_resource_type t; const char *n; } kTypes[] = {
-+                { SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, "SAMPLED_IMAGE" },
-+                { SPVC_RESOURCE_TYPE_STORAGE_IMAGE, "STORAGE_IMAGE" },
-+                { SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, "UNIFORM_BUFFER" },
-+                { SPVC_RESOURCE_TYPE_STORAGE_BUFFER, "STORAGE_BUFFER" },
-+                { SPVC_RESOURCE_TYPE_PUSH_CONSTANT, "PUSH_CONSTANT" },
-+                { SPVC_RESOURCE_TYPE_SUBPASS_INPUT, "SUBPASS_INPUT" },
-+                { SPVC_RESOURCE_TYPE_SEPARATE_IMAGE, "SEPARATE_IMAGE" },
-+                { SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS, "SEPARATE_SAMPLERS" },
-+            };
-+            for (size_t i = 0; i < MP_ARRAY_SIZE(kTypes); i++) {
-+                const spvc_reflected_resource *list = NULL;
-+                size_t count = 0;
-+                spvc_resources_get_resource_list_for_type(refl_res, kTypes[i].t, &list, &count);
-+                for (size_t j = 0; j < count; j++) {
-+                    unsigned msl_slot = spvc_compiler_msl_get_automatic_resource_binding(refl_c, list[j].id);
-+                    unsigned binding = spvc_compiler_get_decoration(refl_c, list[j].id, SpvDecorationBinding);
-+                    unsigned set = spvc_compiler_get_decoration(refl_c, list[j].id, SpvDecorationDescriptorSet);
-+                    MP_WARN(ra, "RES[%s] name=%s set=%u bind=%u msl_slot=%u\n",
-+                            kTypes[i].n, list[j].name ?: "(null)", set, binding, msl_slot);
-+                }
-+            }
-+            /* Re-fetch push_constant for actual binding. */
++        for (int s = 0; s < n_stages; s++) {
++            spvc_compiler refl_c = stages[s];
++            if (!refl_c) continue;
++            spvc_resources refl_res = NULL;
++            if (spvc_compiler_create_shader_resources(refl_c, &refl_res) != SPVC_SUCCESS)
++                continue;
 +            const spvc_reflected_resource *list = NULL;
 +            size_t count = 0;
 +            if (spvc_resources_get_resource_list_for_type(refl_res,
@@ -2269,12 +2249,16 @@
 +            {
 +                unsigned slot = spvc_compiler_msl_get_automatic_resource_binding(
 +                                    refl_c, list[0].id);
-+                if (slot != (unsigned)-1)
++                MP_WARN(ra, "PUSHC stage=%s slot=%u\n", stage_names[s], slot);
++                if (slot != (unsigned)-1 && pass_metal->push_constant_slot < 0)
 +                    pass_metal->push_constant_slot = (int)slot;
++            } else {
++                MP_WARN(ra, "PUSHC stage=%s no PUSH_CONSTANT resource\n",
++                        stage_names[s]);
 +            }
 +        }
-+        MP_WARN(ra, "PUSHC pass push_constants_size=%zu final_slot=%d\n",
-+                params->push_constants_size, pass_metal->push_constant_slot);
++        MP_WARN(ra, "PUSHC final slot=%d (size=%zu)\n",
++                pass_metal->push_constant_slot, params->push_constants_size);
 +    }
 +
 +    // === 7. Publish the params (copied so the caller can drop theirs) ===
