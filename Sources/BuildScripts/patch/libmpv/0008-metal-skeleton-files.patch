@@ -299,7 +299,7 @@
 +};
 --- a/video/out/metal/ra_metal.h
 +++ b/video/out/metal/ra_metal.h
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,139 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Internal header for the Apple Metal backend of mpv's render abstraction.
@@ -411,6 +411,12 @@
 +     * shader's `layout(local_size_x = ...)` qualifier. Populated by
 +     * metal_renderpass_create from SPIRV-Cross reflection. */
 +    MTLSize compute_threads_per_group;
++    /* MSL buffer slot for the push_constant block, or -1 if the pass has no
++     * push constants. Determined at renderpass_create via
++     * spvc_compiler_msl_get_automatic_resource_binding for the push_const
++     * SPIR-V resource. renderpass_run uses setVertexBytes/setFragmentBytes/
++     * setBytes atIndex:push_constant_slot if push_constants_size > 0. */
++    int push_constant_slot;
 +};
 +
 +/* Helpers that may be shared between chunks. */
@@ -435,7 +441,7 @@
 +#endif
 --- a/video/out/metal/ra_metal.m
 +++ b/video/out/metal/ra_metal.m
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,76 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Master file for mpv's Apple Metal RA backend. Defines the public
@@ -485,6 +491,8 @@
 +
 +/* mpv uses std140 packing for UBOs; shared with the GL backend. */
 +extern struct ra_layout std140_layout(struct ra_renderpass_input *inp);
++/* std430 for push constants (Vulkan layout(std430, push_constant)). */
++extern struct ra_layout std430_layout(struct ra_renderpass_input *inp);
 +
 +const struct ra_fns ra_fns_metal = {
 +    .destroy            = ra_metal_destroy_fns,
@@ -499,6 +507,7 @@
 +    .clear              = metal_clear,
 +    .blit               = metal_blit,
 +    .uniform_layout     = std140_layout,
++    .push_constant_layout = std430_layout,
 +    .desc_namespace     = metal_desc_namespace,
 +    .renderpass_create  = metal_renderpass_create,
 +    .renderpass_destroy = metal_renderpass_destroy,
@@ -511,7 +520,7 @@
 +};
 --- a/video/out/metal/ra_metal_init.m
 +++ b/video/out/metal/ra_metal_init.m
-@@ -0,0 +1,414 @@
+@@ -0,0 +1,412 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Metal RA backend -- init, lifecycle, and pixel formats.
@@ -762,13 +771,11 @@
 +     * consults the per-feature-set minimums are a safe lower bound and
 +     * avoid an init-time device query that would block in a unit test. */
 +    ra->max_texture_wh             = 16384;
-+    /* Phase-1: skip the push-constant path entirely. mpv's gl_sc
-+     * (shader_cache.c::update_uniform_params) calls
-+     * sc->ra->fns->push_constant_layout when (glsl_vulkan && max_pushc_size).
-+     * The vtable doesn't define that fn → NULL deref → SIGKILL on the second
-+     * render. d3d11 takes the same workaround. Phase-2 will wire it via
-+     * MTLRenderCommandEncoder.setBytes (the natural Metal push-const equiv). */
-+    ra->max_pushc_size             = 0;
++    /* Phase-2: push_constant_layout=std430_layout now wired in the vtable
++     * (ra_metal.m). Metal's setVertexBytes/setFragmentBytes/setBytes
++     * accept up to 4 KB inline — natural fit for mpv's push-const path.
++     * Bound matches std430's typical small struct size. */
++    ra->max_pushc_size             = 4096;
 +    ra->max_compute_group_threads  = 1024;
 +    ra->max_shmem                  = 32768; /* 32 KB threadgroup memory */
 +
@@ -1595,7 +1602,7 @@
 +}
 --- a/video/out/metal/ra_metal_renderpass.m
 +++ b/video/out/metal/ra_metal_renderpass.m
-@@ -0,0 +1,1051 @@
+@@ -0,0 +1,1106 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Apple Metal backend for mpv's render abstraction (ra). Parallel to
@@ -1634,6 +1641,7 @@
 +@property (nonatomic, assign) MTLSize computeThreadsPerGroup;
 +@property (nonatomic, strong) NSData *bindingIndices;  /* int[numInputs] */
 +@property (nonatomic, assign) int numInputs;
++@property (nonatomic, assign) int pushConstantSlot;   /* MSL buffer slot for push_constant block, -1 if none */
 +@end
 +@implementation MetalPassCacheEntry @end
 +
@@ -2063,6 +2071,7 @@
 +        pass_metal->compute_pso = cached.computePSO;
 +        pass_metal->compute_threads_per_group = cached.computeThreadsPerGroup;
 +        pass_metal->num_inputs = cached.numInputs;
++        pass_metal->push_constant_slot = cached.pushConstantSlot;
 +        if (cached.numInputs > 0 && cached.bindingIndices) {
 +            pass_metal->binding_indices = talloc_array(pass_metal, int, cached.numInputs);
 +            memcpy(pass_metal->binding_indices, cached.bindingIndices.bytes,
@@ -2111,6 +2120,7 @@
 +    pass_metal = talloc_zero(pass, struct ra_renderpass_metal);
 +    pass->priv = pass_metal;
 +    pass_metal->num_inputs = params->num_inputs;
++    pass_metal->push_constant_slot = -1;  /* set in reflection step if pushc present */
 +    if (params->num_inputs > 0) {
 +        pass_metal->binding_indices =
 +            talloc_zero_array(pass_metal, int, params->num_inputs);
@@ -2207,6 +2217,32 @@
 +     * (no reflection-by-name lookup needed). */
 +    (void)metal_lookup_binding;  /* legacy helper, kept for reference */
 +
++    // === 6a. Push-constant MSL slot ===
++    /* mpv's gl_sc emits a `layout(std430, push_constant) uniform PushC` block
++     * when ra->max_pushc_size > 0 (see shader_cache.c:687). SPIRV-Cross
++     * translates that to MSL with a [[buffer(N)]] parameter — we ask the
++     * reflection API which N it picked, and store it for renderpass_run to
++     * set via setVertex/Fragment/Bytes:length:atIndex:. */
++    if (params->push_constants_size > 0) {
++        spvc_compiler refl_c =
++            (params->type == RA_RENDERPASS_TYPE_COMPUTE) ? comp.sc_compiler
++                                                         : frag.sc_compiler;
++        spvc_resources refl_res = NULL;
++        if (refl_c && spvc_compiler_create_shader_resources(refl_c, &refl_res) == SPVC_SUCCESS) {
++            const spvc_reflected_resource *list = NULL;
++            size_t count = 0;
++            if (spvc_resources_get_resource_list_for_type(refl_res,
++                    SPVC_RESOURCE_TYPE_PUSH_CONSTANT, &list, &count) == SPVC_SUCCESS
++                && count > 0)
++            {
++                unsigned slot = spvc_compiler_msl_get_automatic_resource_binding(
++                                    refl_c, list[0].id);
++                if (slot != (unsigned)-1)
++                    pass_metal->push_constant_slot = (int)slot;
++            }
++        }
++    }
++
 +    // === 7. Publish the params (copied so the caller can drop theirs) ===
 +    pass->params = *ra_renderpass_params_copy(pass, params);
 +    /* Metal doesn't reuse the SPIR-V text cache the way d3d11 does --
@@ -2225,6 +2261,7 @@
 +        entry.computePSO = pass_metal->compute_pso;
 +        entry.computeThreadsPerGroup = pass_metal->compute_threads_per_group;
 +        entry.numInputs = pass_metal->num_inputs;
++        entry.pushConstantSlot = pass_metal->push_constant_slot;
 +        if (pass_metal->num_inputs > 0 && pass_metal->binding_indices) {
 +            entry.bindingIndices =
 +                [NSData dataWithBytes:pass_metal->binding_indices
@@ -2370,6 +2407,21 @@
 +        m->active_render_enc = enc;
 +        [enc setRenderPipelineState:pm->render_pso];
 +
++        /* Push constants — bind once on both vertex + fragment stages.
++         * mpv populates params->push_constants buffer per dispatch with
++         * std430-laid-out data matching what gl_sc declared. */
++        if (pm->push_constant_slot >= 0
++            && params->push_constants
++            && pass->params.push_constants_size > 0)
++        {
++            [enc setVertexBytes:params->push_constants
++                         length:pass->params.push_constants_size
++                        atIndex:pm->push_constant_slot];
++            [enc setFragmentBytes:params->push_constants
++                           length:pass->params.push_constants_size
++                          atIndex:pm->push_constant_slot];
++        }
++
 +        MTLViewport vp = {
 +            .originX = params->viewport.x0,
 +            .originY = params->viewport.y0,
@@ -2484,6 +2536,16 @@
 +    case RA_RENDERPASS_TYPE_COMPUTE: {
 +        id<MTLComputeCommandEncoder> cenc = [cb computeCommandEncoder];
 +        [cenc setComputePipelineState:pm->compute_pso];
++
++        /* Push constants for compute shader. */
++        if (pm->push_constant_slot >= 0
++            && params->push_constants
++            && pass->params.push_constants_size > 0)
++        {
++            [cenc setBytes:params->push_constants
++                    length:pass->params.push_constants_size
++                   atIndex:pm->push_constant_slot];
++        }
 +
 +        for (int i = 0; i < params->num_values; i++) {
 +            const struct ra_renderpass_input_val *val = &params->values[i];
