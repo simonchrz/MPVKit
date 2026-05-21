@@ -1936,8 +1936,8 @@
 +                  : (stage_type == GLSL_SHADER_FRAGMENT)
 +                  ? SpvExecutionModelFragment
 +                  : SpvExecutionModelGLCompute;
-+        pcb.desc_set     = ~(unsigned)0;  /* ResourceBindingPushConstantDescriptorSet */
-+        pcb.binding      = ~(unsigned)0;  /* ResourceBindingPushConstantBinding */
++        pcb.desc_set     = ~(unsigned)0;  /* ResourceBindingPushConstantDescriptorSet = ~0u */
++        pcb.binding      = 0;             /* ResourceBindingPushConstantBinding       = 0 (NOT ~0u; SPIRV-Cross misnomer) */
 +        pcb.msl_buffer   = 28;
 +        pcb.msl_texture  = 0;
 +        pcb.msl_sampler  = 0;
