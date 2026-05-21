@@ -944,7 +944,7 @@
 +}
 --- a/video/out/metal/ra_metal_textures.m
 +++ b/video/out/metal/ra_metal_textures.m
-@@ -0,0 +1,     775 @@
+@@ -0,0 +1,     781 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Metal RA backend — textures, buffers, clear, blit.
@@ -1660,6 +1660,12 @@
 +    }
 +
 +    if (!same_format) {
++        MP_WARN(ra, "BLIT dst_tex=%dx%d (fmt=%s) src_tex=%dx%d (fmt=%s) "
++                    "dst_rc=(%d,%d)→(%d,%d) src_rc=(%d,%d)→(%d,%d)\n",
++            dst->params.w, dst->params.h, dst->params.format->name,
++            src->params.w, src->params.h, src->params.format->name,
++            dst_rc->x0, dst_rc->y0, dst_rc->x1, dst_rc->y1,
++            src_rc->x0, src_rc->y0, src_rc->x1, src_rc->y1);
 +        /* Format-converting blit (same size, different pixel format).
 +         * mpv hits this on every pause-redraw: the OSD-composited frame
 +         * lives in an internal RGBA16F-ish FBO, the drawable is
