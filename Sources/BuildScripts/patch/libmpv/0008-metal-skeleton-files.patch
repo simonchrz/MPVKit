@@ -528,7 +528,7 @@
 +};
 --- a/video/out/metal/ra_metal_init.m
 +++ b/video/out/metal/ra_metal_init.m
-@@ -0,0 +1,     413 @@
+@@ -0,0 +1,     421 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Metal RA backend -- init, lifecycle, and pixel formats.
@@ -724,7 +724,15 @@
 +    p->ctx     = ctx;
 +    p->queue   = queue ?: [device newCommandQueue];
 +    p->staging_pool = (__bridge_retained void *)[[NSMutableArray alloc] initWithCapacity:8];
-+    p->pipeline_cache = (__bridge_retained void *)[[NSMutableDictionary alloc] init];
++    /* NSCache statt NSMutableDictionary: thread-safe, evictet automatisch
++     * bei iOS Memory-Pressure-Notifications und limitiert count, sodass
++     * lange Sessions mit vielen Format-Wechseln nicht unbounded wachsen.
++     * Typische Session hat 20-50 unique passes — 128 lässt komfortabel
++     * Headroom für mehrere Videos in einer Sitzung. */
++    NSCache *pcache = [[NSCache alloc] init];
++    pcache.countLimit = 128;
++    pcache.name = @"kuckuck.metal.pipeline_cache";
++    p->pipeline_cache = (__bridge_retained void *)pcache;
 +
 +    /* SPIR-V compiler init. mpv's gl_sc generates GLSL; we compile that
 +     * to SPIR-V via shaderc, then translate to MSL via SPIRV-Cross. Without
@@ -2250,7 +2258,7 @@
 +     * ra_renderpass that reuses the cached library/PSO — saves ~150-300ms
 +     * per pass and avoids the per-pass MTLLibrary alloc that contributes
 +     * to long-playback memory pressure. */
-+    NSMutableDictionary *pipeline_cache = (__bridge NSMutableDictionary *)m->pipeline_cache;
++    NSCache *pipeline_cache = (__bridge NSCache *)m->pipeline_cache;
 +    NSMutableString *cache_key_buf = [NSMutableString new];
 +    if (params->vertex_shader)  [cache_key_buf appendFormat:@"V|%s|", params->vertex_shader];
 +    if (params->frag_shader)    [cache_key_buf appendFormat:@"F|%s|", params->frag_shader];
@@ -2260,7 +2268,7 @@
 +    [cache_key_buf appendFormat:@"B|%d|", params->enable_blend];
 +    NSString *cache_key = [cache_key_buf copy];
 +
-+    MetalPassCacheEntry *cached = pipeline_cache[cache_key];
++    MetalPassCacheEntry *cached = [pipeline_cache objectForKey:cache_key];
 +    if (cached) {
 +        pass = talloc_zero(NULL, struct ra_renderpass);
 +        pass_metal = talloc_zero(pass, struct ra_renderpass_metal);
@@ -2463,7 +2471,7 @@
 +                [NSData dataWithBytes:pass_metal->binding_indices
 +                               length:sizeof(int) * pass_metal->num_inputs];
 +        }
-+        pipeline_cache[cache_key] = entry;
++        [pipeline_cache setObject:entry forKey:cache_key];
 +    }
 +
 +    // === 9. Cleanup ===
