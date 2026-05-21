@@ -299,7 +299,7 @@
 +};
 --- a/video/out/metal/ra_metal.h
 +++ b/video/out/metal/ra_metal.h
-@@ -0,0 +1,     139 @@
+@@ -0,0 +1,     147 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Internal header for the Apple Metal backend of mpv's render abstraction.
@@ -386,6 +386,14 @@
 +     * + MTLLibrary + MTLRenderPipelineState compile chain — saves ~150-300ms
 +     * per renderpass_create. Same CF-bridge trick as staging_pool. */
 +    void *pipeline_cache;
++    /* Lazily-built shader+PSO for format-converting blit (used by
++     * metal_blit when src/dst formats differ — pause path goes through
++     * this when mpv blits its OSD-composited frame to the drawable in a
++     * different format). Library kept alive so the PSO stays valid.
++     * Keyed by destination MTLPixelFormat (NSNumber → MetalBlitEntry,
++     * declared in ra_metal_textures.m). void* + CF-bridging matches the
++     * pipeline_cache pattern. */
++    void *blit_cache;
 +};
 +
 +struct ra_tex_metal {
@@ -520,7 +528,7 @@
 +};
 --- a/video/out/metal/ra_metal_init.m
 +++ b/video/out/metal/ra_metal_init.m
-@@ -0,0 +1,     409 @@
+@@ -0,0 +1,     413 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Metal RA backend -- init, lifecycle, and pixel formats.
@@ -918,6 +926,10 @@
 +            CFRelease(p->pipeline_cache);
 +            p->pipeline_cache = NULL;
 +        }
++        if (p->blit_cache) {
++            CFRelease(p->blit_cache);
++            p->blit_cache = NULL;
++        }
 +    }
 +    /* `p` is a talloc child of `ra`, so it dies with the parent. */
 +    talloc_free(ra);
@@ -932,7 +944,7 @@
 +}
 --- a/video/out/metal/ra_metal_textures.m
 +++ b/video/out/metal/ra_metal_textures.m
-@@ -0,0 +1,     664 @@
+@@ -0,0 +1,     775 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Metal RA backend — textures, buffers, clear, blit.
@@ -956,6 +968,84 @@
 +#import "ra_metal.h"
 +#include "mpv_talloc.h"
 +#include "common/msg.h"
++
++/* Cache entry for format-converting blit (one PSO per dst-pixelformat,
++ * library kept alive so the PSO stays valid). Stored in
++ * ra_metal->blit_cache (NSMutableDictionary keyed by NSNumber-wrapped
++ * MTLPixelFormat). */
++@interface MetalBlitEntry : NSObject
++@property (nonatomic, strong) id<MTLLibrary> library;
++@property (nonatomic, strong) id<MTLRenderPipelineState> pso;
++@end
++@implementation MetalBlitEntry @end
++
++/* MSL source for the blit shader. Fullscreen-triangle via vertex_id
++ * (no vertex buffer needed), single texture sample → frag output.
++ * Y is flipped in the fragment because Metal's framebuffer origin is
++ * top-left while our sampled texture's expected sampling convention
++ * comes from mpv's pipeline (which assumes bottom-up after the
++ * compositing-to-drawable step). */
++static NSString *const kMetalBlitMSL =
++    @"#include <metal_stdlib>\n"
++    @"using namespace metal;\n"
++    @"struct VOut { float4 pos [[position]]; float2 uv; };\n"
++    @"vertex VOut blit_v(uint vid [[vertex_id]]) {\n"
++    @"  float2 uv = float2((vid << 1u) & 2u, vid & 2u);\n"
++    @"  VOut o;\n"
++    @"  o.pos = float4(uv * 2.0 - 1.0, 0.0, 1.0);\n"
++    @"  o.uv = float2(uv.x, 1.0 - uv.y);\n"
++    @"  return o;\n"
++    @"}\n"
++    @"fragment float4 blit_f(VOut v [[stage_in]],\n"
++    @"                       texture2d<float> tex [[texture(0)]],\n"
++    @"                       sampler s [[sampler(0)]]) {\n"
++    @"  return tex.sample(s, v.uv);\n"
++    @"}\n";
++
++/* Build (or fetch from cache) the blit PSO for the given destination
++ * pixel format. Returns nil on compile/link failure (caller logs). */
++static MetalBlitEntry *metal_blit_pso(struct ra *ra, MTLPixelFormat dst_fmt)
++{
++    struct ra_metal *m = ra_metal_get(ra);
++    NSMutableDictionary<NSNumber *, MetalBlitEntry *> *cache =
++        (__bridge NSMutableDictionary *)m->blit_cache;
++    if (!cache) {
++        cache = [NSMutableDictionary new];
++        m->blit_cache = (__bridge_retained void *)cache;
++    }
++    NSNumber *key = @((NSUInteger)dst_fmt);
++    MetalBlitEntry *entry = cache[key];
++    if (entry) return entry;
++
++    NSError *err = nil;
++    MTLCompileOptions *copts = [MTLCompileOptions new];
++    [copts setLanguageVersion:MTLLanguageVersion3_2];
++    id<MTLLibrary> lib =
++        [m->device newLibraryWithSource:kMetalBlitMSL options:copts error:&err];
++    if (!lib) {
++        MP_ERR(ra, "metal: blit library compile failed: %s\n",
++               err.localizedDescription.UTF8String);
++        return nil;
++    }
++
++    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
++    pd.vertexFunction   = [lib newFunctionWithName:@"blit_v"];
++    pd.fragmentFunction = [lib newFunctionWithName:@"blit_f"];
++    pd.colorAttachments[0].pixelFormat = dst_fmt;
++    id<MTLRenderPipelineState> pso =
++        [m->device newRenderPipelineStateWithDescriptor:pd error:&err];
++    if (!pso) {
++        MP_ERR(ra, "metal: blit PSO failed: %s\n",
++               err.localizedDescription.UTF8String);
++        return nil;
++    }
++
++    entry = [MetalBlitEntry new];
++    entry.library = lib;
++    entry.pso = pso;
++    cache[key] = entry;
++    return entry;
++}
 +
 +/* ------------------------------------------------------------------ */
 +/* Internal helpers (file-local, not part of the vtable)              */
@@ -1558,18 +1648,51 @@
 +                       (ra_metal_pixel_format(src->params.format) ==
 +                        ra_metal_pixel_format(dst->params.format));
 +
-+    if (!same_size || !same_format) {
-+        /* TODO(phase-2): scaled / format-converting blit. Implemented as
-+         * a render pass drawing a fullscreen-ish quad sampling `src`
-+         * into `dst`, with the linear/nearest filter chosen by
-+         * src->params.src_linear. The GL backend defers this to
-+         * glBlitFramebuffer (ra_gl.c:711), which Metal has no equivalent
-+         * of — we need the phase-2 renderpass code to land first. */
++    if (!same_size) {
++        /* TODO: scaled blit (different rect sizes). Would need
++         * uv-scaling uniforms in the blit shader. Not hit by mpv's
++         * pause-redraw path so deferred. */
 +        MP_FATAL(ra,
-+            "metal: scaled/format-converting blit not implemented "
-+            "(src=%dx%d dst=%dx%d same_fmt=%d, "
-+            "TODO(phase-2): needs render-pass blit shader)\n",
-+            src_w, src_h, dst_w, dst_h, (int)same_format);
++            "metal: scaled blit not implemented "
++            "(src=%dx%d dst=%dx%d)\n",
++            src_w, src_h, dst_w, dst_h);
++        return;
++    }
++
++    if (!same_format) {
++        /* Format-converting blit (same size, different pixel format).
++         * mpv hits this on every pause-redraw: the OSD-composited frame
++         * lives in an internal RGBA16F-ish FBO, the drawable is
++         * BGRA8Unorm — copyFromTexture can't bridge that. Drive a
++         * one-pass render that samples src → dst via a fullscreen
++         * triangle. PSO is built lazily per dst-pixelformat. */
++        MTLPixelFormat dst_fmt = ra_metal_pixel_format(dst->params.format);
++        MetalBlitEntry *entry = metal_blit_pso(ra, dst_fmt);
++        if (!entry) return;  /* error already logged */
++
++        id<MTLCommandBuffer> cb = ra_metal_cmd_buf(ra);
++        MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor new];
++        rpd.colorAttachments[0].texture = dst_metal->texture;
++        rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
++        rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
++        id<MTLRenderCommandEncoder> enc =
++            [cb renderCommandEncoderWithDescriptor:rpd];
++        [enc setRenderPipelineState:entry.pso];
++        MTLViewport vp = {
++            .originX = dst_rc->x0,
++            .originY = dst_rc->y0,
++            .width   = dst_w,
++            .height  = dst_h,
++            .znear = 0, .zfar = 1,
++        };
++        [enc setViewport:vp];
++        [enc setFragmentTexture:src_metal->texture atIndex:0];
++        [enc setFragmentSamplerState:
++                ra_metal_sampler(ra, src->params.src_linear, false)
++                             atIndex:0];
++        [enc drawPrimitives:MTLPrimitiveTypeTriangle
++                vertexStart:0 vertexCount:3];
++        [enc endEncoding];
 +        return;
 +    }
 +
