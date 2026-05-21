@@ -520,7 +520,7 @@
 +};
 --- a/video/out/metal/ra_metal_init.m
 +++ b/video/out/metal/ra_metal_init.m
-@@ -0,0 +1,410 @@
+@@ -0,0 +1,418 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Metal RA backend -- init, lifecycle, and pixel formats.
@@ -771,9 +771,17 @@
 +     * consults the per-feature-set minimums are a safe lower bound and
 +     * avoid an init-time device query that would block in a unit test. */
 +    ra->max_texture_wh             = 16384;
-+    /* Phase-2: push_constant_layout=std430_layout + MSL setBytes path,
-+     * see ra_metal.m vtable + metal_renderpass_run. */
-+    ra->max_pushc_size             = 4096;
++    /* Phase-2 attempt at push_constant_layout=std430 + setBytes binding
++     * produced all-blue output (ios-metal.14/.15). PUSHC reflection trace
++     * showed: mpv has pushc_size=56 to send, but SPIRV-Cross returns
++     * count=0 for SPVC_RESOURCE_TYPE_PUSH_CONSTANT — meaning shaderc or
++     * SPIRV-Cross is dropping/rewriting the `layout(push_constant)` block.
++     * Possibly shaderc's default Vulkan-version target doesn't preserve
++     * push_constant storage class, OR SPIRV-Cross MSL translation rewrites
++     * it to a UBO at descriptor (0,0) → clashes with our texture bindings.
++     * Either way: UBO emulation path (pushc_size=0) is known-good. Vtable
++     * slot stays wired for future Phase-3 retry. */
++    ra->max_pushc_size             = 0;
 +    ra->max_compute_group_threads  = 1024;
 +    ra->max_shmem                  = 32768; /* 32 KB threadgroup memory */
 +
@@ -1600,7 +1608,7 @@
 +}
 --- a/video/out/metal/ra_metal_renderpass.m
 +++ b/video/out/metal/ra_metal_renderpass.m
-@@ -0,0 +1,1110 @@
+@@ -0,0 +1,1105 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Apple Metal backend for mpv's render abstraction (ra). Parallel to
@@ -2231,18 +2239,13 @@
 +            size_t count = 0;
 +            spvc_result list_rc = spvc_resources_get_resource_list_for_type(refl_res,
 +                    SPVC_RESOURCE_TYPE_PUSH_CONSTANT, &list, &count);
-+            MP_WARN(ra, "PUSHC reflect: list_rc=%d count=%zu pushc_size=%zu\n",
-+                    (int)list_rc, count, params->push_constants_size);
 +            if (list_rc == SPVC_SUCCESS && count > 0) {
 +                unsigned slot = spvc_compiler_msl_get_automatic_resource_binding(
 +                                    refl_c, list[0].id);
-+                MP_WARN(ra, "PUSHC slot lookup: name=%s id=%u slot=%u\n",
-+                        list[0].name ?: "(null)", list[0].id, slot);
 +                if (slot != (unsigned)-1)
 +                    pass_metal->push_constant_slot = (int)slot;
 +            }
 +        }
-+        MP_WARN(ra, "PUSHC final push_constant_slot=%d\n", pass_metal->push_constant_slot);
 +    }
 +
 +    // === 7. Publish the params (copied so the caller can drop theirs) ===
