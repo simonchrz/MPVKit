@@ -1599,7 +1599,7 @@
 +}
 --- a/video/out/metal/ra_metal_renderpass.m
 +++ b/video/out/metal/ra_metal_renderpass.m
-@@ -0,0 +1,    1156 @@
+@@ -0,0 +1,    1158 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Apple Metal backend for mpv's render abstraction (ra). Parallel to
@@ -1867,13 +1867,15 @@
 +        return false;
 +    }
 +
-+    /* Metal 3.0 (0x30000 == 3*0x10000) -- iOS 16+ / macOS 13+. Required by
-+     * SPIRV-Cross's compute output for `atomic_thread_fence(..., scope)`
-+     * which uses `thread_scope_threadgroup` (MSL 3+ identifier). All current
-+     * iPhones/iPads we deploy to are on iOS 17+, so this is a safe baseline.
-+     * Matches the [copts setLanguageVersion:MTLLanguageVersion3_0] below. */
++    /* MSL 3.2 (iOS 18+ / macOS 15+). SPIRV-Cross encodes MSL version as
++     * decimal `major*10000 + minor*100 + patch` (NOT bit-packed hex despite
++     * what skeleton's history of 0x20004 suggested). At/above 3.2 it emits
++     * `atomic_thread_fence(..., memory_order_seq_cst, thread_scope_threadgroup)`
++     * which requires Apple's MSL compiler to also be set to 3.2 or higher
++     * (the identifiers don't exist in earlier MSL). Matches the
++     * [copts setLanguageVersion:MTLLanguageVersion3_2] below. */
 +    spvc_compiler_options_set_uint(opts,
-+        SPVC_COMPILER_OPTION_MSL_VERSION, 0x30000);
++        SPVC_COMPILER_OPTION_MSL_VERSION, 30200);
 +
 +    /* SPIRV-Cross target platform. We always pick iOS here -- the
 +     * skeleton's Metal context is currently iOS-only (libmpv_metal.m
@@ -1983,7 +1985,7 @@
 +    /* MSL -> MTLLibrary. */
 +    NSString *src = [NSString stringWithUTF8String:stage->msl];
 +    MTLCompileOptions *copts = [MTLCompileOptions new];
-+    [copts setLanguageVersion:MTLLanguageVersion3_0];
++    [copts setLanguageVersion:MTLLanguageVersion3_2];
 +
 +    NSError *err = nil;
 +    stage->library = [device newLibraryWithSource:src
