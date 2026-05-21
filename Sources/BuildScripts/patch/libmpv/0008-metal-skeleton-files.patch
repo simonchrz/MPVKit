@@ -1600,7 +1600,7 @@
 +}
 --- a/video/out/metal/ra_metal_renderpass.m
 +++ b/video/out/metal/ra_metal_renderpass.m
-@@ -0,0 +1,    1203 @@
+@@ -0,0 +1,    1107 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Apple Metal backend for mpv's render abstraction (ra). Parallel to
@@ -1941,49 +1941,13 @@
 +        pcb.msl_buffer   = 28;
 +        pcb.msl_texture  = 0;
 +        pcb.msl_sampler  = 0;
-+        spvc_result pcb_rc = spvc_compiler_msl_add_resource_binding(
-+                                  stage->sc_compiler, &pcb);
-+        MP_WARN(ra, "PCB add stage=%d set=0x%x bind=%u msl_buf=%u rc=%d\n",
-+                (int)pcb.stage, pcb.desc_set, pcb.binding,
-+                pcb.msl_buffer, (int)pcb_rc);
-+
-+        /* Reflect push_constant resources and log their var IDs; we'll
-+         * query their post-compile MSL slots below to verify the pin. */
-+        const spvc_reflected_resource *pclist = NULL;
-+        size_t pccount = 0;
-+        if (spvc_resources_get_resource_list_for_type(res,
-+                SPVC_RESOURCE_TYPE_PUSH_CONSTANT, &pclist, &pccount)
-+                == SPVC_SUCCESS) {
-+            for (size_t i = 0; i < pccount; i++) {
-+                MP_WARN(ra, "PCB reflect[%zu] id=%u name=%s\n",
-+                        i, (unsigned)pclist[i].id,
-+                        pclist[i].name ? pclist[i].name : "<noname>");
-+            }
-+        }
++        spvc_compiler_msl_add_resource_binding(stage->sc_compiler, &pcb);
 +    }
 +
 +    if (spvc_compiler_compile(stage->sc_compiler, &stage->msl) != SPVC_SUCCESS) {
 +        MP_ERR(ra, "metal: spvc_compiler_compile (MSL) failed: %s\n",
 +               spvc_context_get_last_error_string(stage->sc_ctx));
 +        return false;
-+    }
-+
-+    /* Post-compile: query the slot SPIRV-Cross actually assigned to each
-+     * push_constant block. If our pin took effect we expect 28; if it
-+     * silently failed we'll see auto-allocated 0/1 here. */
-+    if (res) {
-+        const spvc_reflected_resource *pclist2 = NULL;
-+        size_t pccount2 = 0;
-+        if (spvc_resources_get_resource_list_for_type(res,
-+                SPVC_RESOURCE_TYPE_PUSH_CONSTANT, &pclist2, &pccount2)
-+                == SPVC_SUCCESS) {
-+            for (size_t i = 0; i < pccount2; i++) {
-+                unsigned auto_slot = spvc_compiler_msl_get_automatic_resource_binding(
-+                    stage->sc_compiler, pclist2[i].id);
-+                MP_WARN(ra, "PCB post-compile id=%u auto_msl_slot=%u\n",
-+                        (unsigned)pclist2[i].id, auto_slot);
-+            }
-+        }
 +    }
 +
 +    /* MSL -> MTLLibrary. */
@@ -2271,72 +2235,12 @@
 +    (void)metal_lookup_binding;  /* legacy helper, kept for reference */
 +
 +    // === 6a. Push-constant MSL slot ===
-+    /* mpv's gl_sc emits a `layout(std430, push_constant) uniform PushC` block
-+     * when ra->max_pushc_size > 0 (see shader_cache.c:687). SPIRV-Cross
-+     * translates that to MSL with a [[buffer(N)]] parameter — we ask the
-+     * reflection API which N it picked, and store it for renderpass_run to
-+     * set via setVertex/Fragment/Bytes:length:atIndex:. */
-+    if (params->push_constants_size > 0) {
-+        struct { spvc_compiler c; struct metal_shader_stage *s; const char *n; } stages[3] = {
-+            { vert.sc_compiler, &vert, "VERT" },
-+            { frag.sc_compiler, &frag, "FRAG" },
-+            { comp.sc_compiler, &comp, "COMP" },
-+        };
-+        int n_stages = (params->type == RA_RENDERPASS_TYPE_RASTER) ? 2 : 1;
-+        if (params->type == RA_RENDERPASS_TYPE_COMPUTE) {
-+            stages[0] = stages[2];  /* move comp into first slot */
-+        }
-+        for (int s = 0; s < n_stages; s++) {
-+            spvc_compiler refl_c = stages[s].c;
-+            if (!refl_c) continue;
-+            /* Per-line MSL dump (mpv's MP_WARN truncates at \n, multi-line
-+             * single-call messages lose everything past the first line). */
-+            if (stages[s].s->msl) {
-+                size_t n = strlen(stages[s].s->msl);
-+                MP_WARN(ra, "==== MSL %s (%zu bytes) ====\n", stages[s].n, n);
-+                const char *p = stages[s].s->msl;
-+                const char *end = p + n;
-+                int ln = 0;
-+                while (p < end) {
-+                    const char *nl = memchr(p, '\n', end - p);
-+                    size_t len = nl ? (size_t)(nl - p) : (size_t)(end - p);
-+                    MP_WARN(ra, "MSL %s L%03d: %.*s\n",
-+                            stages[s].n, ln++, (int)len, p);
-+                    p = nl ? nl + 1 : end;
-+                }
-+                MP_WARN(ra, "==== END MSL %s ====\n", stages[s].n);
-+            }
-+            spvc_resources refl_res = NULL;
-+            if (spvc_compiler_create_shader_resources(refl_c, &refl_res) != SPVC_SUCCESS)
-+                continue;
-+            /* Iterate ALL resource types so we see where pushc actually
-+             * landed (if SPIRV-Cross re-categorized it). */
-+            static const struct { spvc_resource_type t; const char *n; } kT[] = {
-+                { SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, "SAMPLED" },
-+                { SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, "UBO" },
-+                { SPVC_RESOURCE_TYPE_STORAGE_BUFFER, "SSBO" },
-+                { SPVC_RESOURCE_TYPE_PUSH_CONSTANT, "PUSHC" },
-+            };
-+            for (size_t k = 0; k < MP_ARRAY_SIZE(kT); k++) {
-+                const spvc_reflected_resource *list = NULL;
-+                size_t count = 0;
-+                spvc_resources_get_resource_list_for_type(refl_res, kT[k].t, &list, &count);
-+                for (size_t i = 0; i < count; i++) {
-+                    unsigned ms = spvc_compiler_msl_get_automatic_resource_binding(refl_c, list[i].id);
-+                    unsigned bd = spvc_compiler_get_decoration(refl_c, list[i].id, SpvDecorationBinding);
-+                    unsigned ds = spvc_compiler_get_decoration(refl_c, list[i].id, SpvDecorationDescriptorSet);
-+                    MP_WARN(ra, "REFL[%s/%s] name=%s set=%u bind=%u msl=%u\n",
-+                            stages[s].n, kT[k].n, list[i].name ?: "(null)", ds, bd, ms);
-+                }
-+            }
-+        }
-+        /* We hard-pinned push_const to MSL slot 28 in metal_compile_stage
-+         * (msl_add_resource_binding override). Trust that — reflection has
-+         * been unreliable here. */
++    /* metal_compile_stage pinned push_const to MSL [[buffer(28)]] via
++     * spvc_compiler_msl_add_resource_binding (desc_set=~0u, binding=0 — the
++     * SPIRV-Cross magic for push-const). The Metal side delivers the bytes
++     * via setVertex/FragmentBytes:length:atIndex:28 in renderpass_run. */
++    if (params->push_constants_size > 0)
 +        pass_metal->push_constant_slot = 28;
-+        MP_WARN(ra, "PUSHC final slot=%d size=%zu\n",
-+                pass_metal->push_constant_slot, params->push_constants_size);
-+    }
 +
 +    // === 7. Publish the params (copied so the caller can drop theirs) ===
 +    pass->params = *ra_renderpass_params_copy(pass, params);
