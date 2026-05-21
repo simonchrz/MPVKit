@@ -1600,7 +1600,7 @@
 +}
 --- a/video/out/metal/ra_metal_renderpass.m
 +++ b/video/out/metal/ra_metal_renderpass.m
-@@ -0,0 +1,1155 @@
+@@ -0,0 +1,1167 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Apple Metal backend for mpv's render abstraction (ra). Parallel to
@@ -1923,6 +1923,25 @@
 +                spvc_compiler_msl_add_resource_binding(stage->sc_compiler, &rb);
 +            }
 +        }
++        /* Push-constant has no layout(binding=N) decoration; without an
++         * explicit override SPIRV-Cross auto-assigns it MSL buffer(0),
++         * which collides with the UBO we just pinned to buffer(0) — two
++         * `constant Struct&` parameters at the same slot in the emitted
++         * MSL → undefined behaviour, all-blue output. Pin push_const to
++         * slot 28 (well below the vertex buffer at 30, well above any
++         * normal UBO/SSBO mpv generates). */
++        spvc_msl_resource_binding pcb = {0};
++        pcb.stage = (stage_type == GLSL_SHADER_VERTEX)
++                  ? SpvExecutionModelVertex
++                  : (stage_type == GLSL_SHADER_FRAGMENT)
++                  ? SpvExecutionModelFragment
++                  : SpvExecutionModelGLCompute;
++        pcb.desc_set     = ~(unsigned)0;  /* ResourceBindingPushConstantDescriptorSet */
++        pcb.binding      = ~(unsigned)0;  /* ResourceBindingPushConstantBinding */
++        pcb.msl_buffer   = 28;
++        pcb.msl_texture  = 0;
++        pcb.msl_sampler  = 0;
++        spvc_compiler_msl_add_resource_binding(stage->sc_compiler, &pcb);
 +    }
 +
 +    if (spvc_compiler_compile(stage->sc_compiler, &stage->msl) != SPVC_SUCCESS) {
@@ -2274,18 +2293,11 @@
 +                            stages[s].n, kT[k].n, list[i].name ?: "(null)", ds, bd, ms);
 +                }
 +            }
-+            /* Take first pushc slot found across stages. */
-+            const spvc_reflected_resource *list = NULL;
-+            size_t count = 0;
-+            if (spvc_resources_get_resource_list_for_type(refl_res,
-+                    SPVC_RESOURCE_TYPE_PUSH_CONSTANT, &list, &count) == SPVC_SUCCESS
-+                && count > 0 && pass_metal->push_constant_slot < 0)
-+            {
-+                unsigned slot = spvc_compiler_msl_get_automatic_resource_binding(refl_c, list[0].id);
-+                if (slot != (unsigned)-1)
-+                    pass_metal->push_constant_slot = (int)slot;
-+            }
 +        }
++        /* We hard-pinned push_const to MSL slot 28 in metal_compile_stage
++         * (msl_add_resource_binding override). Trust that — reflection has
++         * been unreliable here. */
++        pass_metal->push_constant_slot = 28;
 +        MP_WARN(ra, "PUSHC final slot=%d size=%zu\n",
 +                pass_metal->push_constant_slot, params->push_constants_size);
 +    }
