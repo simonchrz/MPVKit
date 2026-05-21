@@ -2253,20 +2253,20 @@
 +        for (int s = 0; s < n_stages; s++) {
 +            spvc_compiler refl_c = stages[s].c;
 +            if (!refl_c) continue;
-+            /* FULL MSL dump per stage so we can grep [[buffer(N)]]. */
++            /* Per-line MSL dump (mpv's MP_WARN truncates at \n, multi-line
++             * single-call messages lose everything past the first line). */
 +            if (stages[s].s->msl) {
 +                size_t n = strlen(stages[s].s->msl);
-+                /* MP_WARN truncates long messages; split into 800-char chunks
-+                 * so the full MSL survives the log. */
 +                MP_WARN(ra, "==== MSL %s (%zu bytes) ====\n", stages[s].n, n);
 +                const char *p = stages[s].s->msl;
-+                size_t remaining = n;
-+                int chunk = 0;
-+                while (remaining > 0) {
-+                    size_t take = remaining > 800 ? 800 : remaining;
-+                    MP_WARN(ra, "MSL %s chunk %d: %.*s\n",
-+                            stages[s].n, chunk, (int)take, p);
-+                    p += take; remaining -= take; chunk++;
++                const char *end = p + n;
++                int ln = 0;
++                while (p < end) {
++                    const char *nl = memchr(p, '\n', end - p);
++                    size_t len = nl ? (size_t)(nl - p) : (size_t)(end - p);
++                    MP_WARN(ra, "MSL %s L%03d: %.*s\n",
++                            stages[s].n, ln++, (int)len, p);
++                    p = nl ? nl + 1 : end;
 +                }
 +                MP_WARN(ra, "==== END MSL %s ====\n", stages[s].n);
 +            }
