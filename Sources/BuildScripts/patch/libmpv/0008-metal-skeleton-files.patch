@@ -1,6 +1,6 @@
 --- a/include/mpv/render_mtl.h
 +++ b/include/mpv/render_mtl.h
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,     127 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Permission to use, copy, modify, and/or distribute this software for any
@@ -130,7 +130,7 @@
 +#endif
 --- a/video/out/metal/libmpv_metal.m
 +++ b/video/out/metal/libmpv_metal.m
-@@ -0,0 +1,166 @@
+@@ -0,0 +1,     166 @@
 +/*
 + * libmpv Metal backend bridge.
 + *
@@ -299,7 +299,7 @@
 +};
 --- a/video/out/metal/ra_metal.h
 +++ b/video/out/metal/ra_metal.h
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,     139 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Internal header for the Apple Metal backend of mpv's render abstraction.
@@ -441,7 +441,7 @@
 +#endif
 --- a/video/out/metal/ra_metal.m
 +++ b/video/out/metal/ra_metal.m
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,      76 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Master file for mpv's Apple Metal RA backend. Defines the public
@@ -520,7 +520,7 @@
 +};
 --- a/video/out/metal/ra_metal_init.m
 +++ b/video/out/metal/ra_metal_init.m
-@@ -0,0 +1,410 @@
+@@ -0,0 +1,     409 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Metal RA backend -- init, lifecycle, and pixel formats.
@@ -742,13 +742,11 @@
 +     * Granular fallbacks (e.g. compute on older iOS A8) are not worth
 +     * the maintenance burden -- the minimum deployment target is
 +     * iOS 13/macOS 10.15 for our shaderc dependency anyway. */
-+    /* Phase-1 disables compute capability. The compute renderpass path
-+     * (metal_compile_stage → SPIRV-Cross MSL → newComputePipelineState) hits
-+     * an undiagnosed NULL+4 deref after ~40s of playback when mpv dispatches
-+     * a compute shader for upscaling (gl_sc_dispatch_compute → renderpass_create).
-+     * Dropping RA_CAP_COMPUTE forces mpv into the fragment-shader fallback
-+     * for all scaling passes — slower, but Phase-1-correct. The compute path
-+     * comes back in Phase-2 with proper threadgroup-size handling. */
++    /* Phase-3 (.25+): RA_CAP_COMPUTE re-enabled. Phase-1's NULL+4 deref
++     * in metal_compile_stage was diagnosed before push_const,
++     * spirv-compiler-acquisition, and MSL-binding-mapping fixes landed —
++     * worth re-validating now that the raster path is stable. If it still
++     * crashes, the console capture will show the current stack. */
 +    ra->caps = RA_CAP_TEX_1D
 +             | RA_CAP_TEX_3D
 +             | RA_CAP_BLIT
@@ -757,7 +755,8 @@
 +             | RA_CAP_BUF_RW
 +             | RA_CAP_FRAGCOORD
 +             | RA_CAP_GLOBAL_UNIFORM
-+             | RA_CAP_GATHER;
++             | RA_CAP_GATHER
++             | RA_CAP_COMPUTE;
 +
 +    /* GLSL 4.50 + Vulkan dialect: matches what SPIRV-Cross expects on
 +     * the input side. SPIRV-Cross will then emit MSL. ra->glsl_es stays
@@ -933,7 +932,7 @@
 +}
 --- a/video/out/metal/ra_metal_textures.m
 +++ b/video/out/metal/ra_metal_textures.m
-@@ -0,0 +1,664 @@
+@@ -0,0 +1,     664 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Metal RA backend — textures, buffers, clear, blit.
