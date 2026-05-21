@@ -1599,7 +1599,7 @@
 +}
 --- a/video/out/metal/ra_metal_renderpass.m
 +++ b/video/out/metal/ra_metal_renderpass.m
-@@ -0,0 +1,    1107 @@
+@@ -0,0 +1,    1156 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Apple Metal backend for mpv's render abstraction (ra). Parallel to
@@ -1667,6 +1667,17 @@
 + */
 +#ifndef kMetalInlineBytesLimit
 +#define kMetalInlineBytesLimit 4096
++#endif
++
++/* MSL has one [[texture(N)]] slot space per shader stage, while Vulkan/GLSL
++ * permits a sampled image and a storage (write) image to share (set,
++ * binding) under different descriptor types. mpv's compute shaders do this
++ * (e.g. `image2D out_image` and `sampler2D texture0` both at binding=0).
++ * We move every STORAGE_IMAGE binding up by this offset on both the SPIR-V
++ * side (via spvc_compiler_set_decoration) and the Metal-side bind call,
++ * so the two never collide in the emitted [[texture(N)]] decoration. */
++#ifndef kMetalStorageImageSlotOffset
++#define kMetalStorageImageSlotOffset 16
 +#endif
 +
 +// ============ INIT + FORMATS + LIFECYCLE ============
@@ -1856,10 +1867,13 @@
 +        return false;
 +    }
 +
-+    /* Metal 2.4 (0x20004 == 2*0x10000 + 4) -- iOS 15 / macOS 12 baseline.
-+     * Matches the [copts setLanguageVersion:MTLLanguageVersion2_4] below. */
++    /* Metal 3.0 (0x30000 == 3*0x10000) -- iOS 16+ / macOS 13+. Required by
++     * SPIRV-Cross's compute output for `atomic_thread_fence(..., scope)`
++     * which uses `thread_scope_threadgroup` (MSL 3+ identifier). All current
++     * iPhones/iPads we deploy to are on iOS 17+, so this is a safe baseline.
++     * Matches the [copts setLanguageVersion:MTLLanguageVersion3_0] below. */
 +    spvc_compiler_options_set_uint(opts,
-+        SPVC_COMPILER_OPTION_MSL_VERSION, 0x20004);
++        SPVC_COMPILER_OPTION_MSL_VERSION, 0x30000);
 +
 +    /* SPIRV-Cross target platform. We always pick iOS here -- the
 +     * skeleton's Metal context is currently iOS-only (libmpv_metal.m
@@ -1908,6 +1922,23 @@
 +                                  list[i].id, SpvDecorationDescriptorSet);
 +                unsigned bind = spvc_compiler_get_decoration(stage->sc_compiler,
 +                                  list[i].id, SpvDecorationBinding);
++                /* MSL has ONE [[texture(N)]] slot space. Vulkan/GLSL lets a
++                 * write-only image and a sampled image share (set, binding)
++                 * because they are different descriptor types. mpv's compute
++                 * shaders rely on this — `image2D out_image` and
++                 * `sampler2D texture0` both at binding=0. SPIRV-Cross's
++                 * resource_bindings map is keyed only by (stage, set, binding)
++                 * so a single pin can't separate them. Offset STORAGE_IMAGE
++                 * by kMetalStorageImageSlotOffset both in the SPIR-V binding
++                 * decoration AND in renderpass_run's setComputeTexture call,
++                 * so SAMPLED stays at its natural slot and STORAGE moves up. */
++                if (kTypes[t] == SPVC_RESOURCE_TYPE_STORAGE_IMAGE) {
++                    bind += kMetalStorageImageSlotOffset;
++                    spvc_compiler_set_decoration(stage->sc_compiler,
++                                                 list[i].id,
++                                                 SpvDecorationBinding,
++                                                 bind);
++                }
 +                spvc_msl_resource_binding rb = {0};
 +                rb.stage = (stage_type == GLSL_SHADER_VERTEX)
 +                         ? SpvExecutionModelVertex
@@ -1952,7 +1983,7 @@
 +    /* MSL -> MTLLibrary. */
 +    NSString *src = [NSString stringWithUTF8String:stage->msl];
 +    MTLCompileOptions *copts = [MTLCompileOptions new];
-+    [copts setLanguageVersion:MTLLanguageVersion2_4];
++    [copts setLanguageVersion:MTLLanguageVersion3_0];
 +
 +    NSError *err = nil;
 +    stage->library = [device newLibraryWithSource:src
@@ -2225,6 +2256,21 @@
 +            goto fail;
 +        }
 +        pass_metal->library = comp.library;
++
++        /* Pull the GLSL `layout(local_size_x = N, local_size_y = M, ...) in`
++         * declaration out of the SPIR-V so dispatch knows the threadgroup
++         * size. SPIRV-Cross exposes it via the ExecutionMode argument API.
++         * Falls back to (1,1,1) — legal, but starves the GPU. */
++        unsigned lx = spvc_compiler_get_execution_mode_argument_by_index(
++            comp.sc_compiler, SpvExecutionModeLocalSize, 0);
++        unsigned ly = spvc_compiler_get_execution_mode_argument_by_index(
++            comp.sc_compiler, SpvExecutionModeLocalSize, 1);
++        unsigned lz = spvc_compiler_get_execution_mode_argument_by_index(
++            comp.sc_compiler, SpvExecutionModeLocalSize, 2);
++        if (lx == 0) lx = 1;
++        if (ly == 0) ly = 1;
++        if (lz == 0) lz = 1;
++        pass_metal->compute_threads_per_group = MTLSizeMake(lx, ly, lz);
 +    }
 +
 +    // === 6. Binding indices == mpv input.binding ===
@@ -2471,9 +2517,11 @@
 +            case RA_VARTYPE_IMG_W: {
 +                struct ra_tex *t = *(struct ra_tex **)val->data;
 +                struct ra_tex_metal *tm = t->priv;
-+                /* Metal doesn't distinguish image vs sampled-image
-+                 * binding tables on the fragment stage; same setter. */
-+                [enc setFragmentTexture:tm->texture atIndex:slot];
++                /* Storage images live offset from sampled textures in the
++                 * MSL [[texture(N)]] space to avoid collision when GLSL
++                 * gives an image and a sampler the same binding number. */
++                [enc setFragmentTexture:tm->texture
++                                atIndex:slot + kMetalStorageImageSlotOffset];
 +                break;
 +            }
 +            case RA_VARTYPE_BUF_RO:
@@ -2566,7 +2614,8 @@
 +            case RA_VARTYPE_IMG_W: {
 +                struct ra_tex *t = *(struct ra_tex **)val->data;
 +                struct ra_tex_metal *tm = t->priv;
-+                [cenc setTexture:tm->texture atIndex:slot];
++                [cenc setTexture:tm->texture
++                         atIndex:slot + kMetalStorageImageSlotOffset];
 +                break;
 +            }
 +            case RA_VARTYPE_BUF_RO:
