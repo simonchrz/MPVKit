@@ -944,7 +944,7 @@
 +}
 --- a/video/out/metal/ra_metal_textures.m
 +++ b/video/out/metal/ra_metal_textures.m
-@@ -0,0 +1,     781 @@
+@@ -0,0 +1,     802 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Metal RA backend — textures, buffers, clear, blit.
@@ -980,20 +980,27 @@
 +@implementation MetalBlitEntry @end
 +
 +/* MSL source for the blit shader. Fullscreen-triangle via vertex_id
-+ * (no vertex buffer needed), single texture sample → frag output.
-+ * Y is flipped in the fragment because Metal's framebuffer origin is
-+ * top-left while our sampled texture's expected sampling convention
-+ * comes from mpv's pipeline (which assumes bottom-up after the
-+ * compositing-to-drawable step). */
++ * (no vertex buffer needed). The vertex shader maps the triangle's
++ * normalised 0..1 space into the src_rc-within-src normalised UV range
++ * passed via a uniform — required because mpv blits sub-regions of the
++ * source texture (e.g. video letterboxed inside a full-screen FBO),
++ * NOT the whole texture. Without the transform the entire src gets
++ * stretched into the dst-viewport, producing a squished image.
++ *
++ * Y is flipped in the texcoord because the triangle's NDC-Y up maps to
++ * Metal's framebuffer-Y down, so sampling needs the inverse to keep
++ * the image right-side up. */
 +static NSString *const kMetalBlitMSL =
 +    @"#include <metal_stdlib>\n"
 +    @"using namespace metal;\n"
++    @"struct BlitParams { float2 uv_offset; float2 uv_scale; };\n"
 +    @"struct VOut { float4 pos [[position]]; float2 uv; };\n"
-+    @"vertex VOut blit_v(uint vid [[vertex_id]]) {\n"
-+    @"  float2 uv = float2((vid << 1u) & 2u, vid & 2u);\n"
++    @"vertex VOut blit_v(uint vid [[vertex_id]],\n"
++    @"                   constant BlitParams& bp [[buffer(0)]]) {\n"
++    @"  float2 t = float2((vid << 1u) & 2u, vid & 2u);\n"
 +    @"  VOut o;\n"
-+    @"  o.pos = float4(uv * 2.0 - 1.0, 0.0, 1.0);\n"
-+    @"  o.uv = float2(uv.x, 1.0 - uv.y);\n"
++    @"  o.pos = float4(t * 2.0 - 1.0, 0.0, 1.0);\n"
++    @"  o.uv = bp.uv_offset + float2(t.x, 1.0 - t.y) * bp.uv_scale;\n"
 +    @"  return o;\n"
 +    @"}\n"
 +    @"fragment float4 blit_f(VOut v [[stage_in]],\n"
@@ -1660,12 +1667,6 @@
 +    }
 +
 +    if (!same_format) {
-+        MP_WARN(ra, "BLIT dst_tex=%dx%d (fmt=%s) src_tex=%dx%d (fmt=%s) "
-+                    "dst_rc=(%d,%d)→(%d,%d) src_rc=(%d,%d)→(%d,%d)\n",
-+            dst->params.w, dst->params.h, dst->params.format->name,
-+            src->params.w, src->params.h, src->params.format->name,
-+            dst_rc->x0, dst_rc->y0, dst_rc->x1, dst_rc->y1,
-+            src_rc->x0, src_rc->y0, src_rc->x1, src_rc->y1);
 +        /* Format-converting blit (same size, different pixel format).
 +         * mpv hits this on every pause-redraw: the OSD-composited frame
 +         * lives in an internal RGBA16F-ish FBO, the drawable is
@@ -1675,6 +1676,25 @@
 +        MTLPixelFormat dst_fmt = ra_metal_pixel_format(dst->params.format);
 +        MetalBlitEntry *entry = metal_blit_pso(ra, dst_fmt);
 +        if (!entry) return;  /* error already logged */
++
++        /* Convert src_rc (pixel coords within the src texture) into the
++         * normalized 0..1 UV range that the shader expects. mpv blits
++         * sub-regions (e.g. video at y=972..1650 inside a 2622-tall
++         * FBO); without this transform we'd sample the whole src and
++         * stretch it into the dst-viewport — squished image. */
++        struct {
++            float uv_offset[2];
++            float uv_scale[2];
++        } bp = {
++            .uv_offset = {
++                (float)src_rc->x0 / (float)src->params.w,
++                (float)src_rc->y0 / (float)src->params.h,
++            },
++            .uv_scale = {
++                (float)src_w / (float)src->params.w,
++                (float)src_h / (float)src->params.h,
++            },
++        };
 +
 +        id<MTLCommandBuffer> cb = ra_metal_cmd_buf(ra);
 +        MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor new];
@@ -1692,6 +1712,7 @@
 +            .znear = 0, .zfar = 1,
 +        };
 +        [enc setViewport:vp];
++        [enc setVertexBytes:&bp length:sizeof(bp) atIndex:0];
 +        [enc setFragmentTexture:src_metal->texture atIndex:0];
 +        [enc setFragmentSamplerState:
 +                ra_metal_sampler(ra, src->params.src_linear, false)
