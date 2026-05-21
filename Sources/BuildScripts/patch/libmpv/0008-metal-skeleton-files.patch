@@ -1600,7 +1600,7 @@
 +}
 --- a/video/out/metal/ra_metal_renderpass.m
 +++ b/video/out/metal/ra_metal_renderpass.m
-@@ -0,0 +1,1167 @@
+@@ -0,0 +1,    1203 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Apple Metal backend for mpv's render abstraction (ra). Parallel to
@@ -1936,18 +1936,54 @@
 +                  : (stage_type == GLSL_SHADER_FRAGMENT)
 +                  ? SpvExecutionModelFragment
 +                  : SpvExecutionModelGLCompute;
-+        pcb.desc_set     = ~(unsigned)0;  /* ResourceBindingPushConstantDescriptorSet = ~0u */
-+        pcb.binding      = 0;             /* ResourceBindingPushConstantBinding       = 0 (NOT ~0u; SPIRV-Cross misnomer) */
++        pcb.desc_set     = 0xFFFFFFFFu;   /* ResourceBindingPushConstantDescriptorSet */
++        pcb.binding      = 0;             /* ResourceBindingPushConstantBinding (binding=0, NOT ~0u) */
 +        pcb.msl_buffer   = 28;
 +        pcb.msl_texture  = 0;
 +        pcb.msl_sampler  = 0;
-+        spvc_compiler_msl_add_resource_binding(stage->sc_compiler, &pcb);
++        spvc_result pcb_rc = spvc_compiler_msl_add_resource_binding(
++                                  stage->sc_compiler, &pcb);
++        MP_WARN(ra, "PCB add stage=%d set=0x%x bind=%u msl_buf=%u rc=%d\n",
++                (int)pcb.stage, pcb.desc_set, pcb.binding,
++                pcb.msl_buffer, (int)pcb_rc);
++
++        /* Reflect push_constant resources and log their var IDs; we'll
++         * query their post-compile MSL slots below to verify the pin. */
++        const spvc_reflected_resource *pclist = NULL;
++        size_t pccount = 0;
++        if (spvc_resources_get_resource_list_for_type(res,
++                SPVC_RESOURCE_TYPE_PUSH_CONSTANT, &pclist, &pccount)
++                == SPVC_SUCCESS) {
++            for (size_t i = 0; i < pccount; i++) {
++                MP_WARN(ra, "PCB reflect[%zu] id=%u name=%s\n",
++                        i, (unsigned)pclist[i].id,
++                        pclist[i].name ? pclist[i].name : "<noname>");
++            }
++        }
 +    }
 +
 +    if (spvc_compiler_compile(stage->sc_compiler, &stage->msl) != SPVC_SUCCESS) {
 +        MP_ERR(ra, "metal: spvc_compiler_compile (MSL) failed: %s\n",
 +               spvc_context_get_last_error_string(stage->sc_ctx));
 +        return false;
++    }
++
++    /* Post-compile: query the slot SPIRV-Cross actually assigned to each
++     * push_constant block. If our pin took effect we expect 28; if it
++     * silently failed we'll see auto-allocated 0/1 here. */
++    if (res) {
++        const spvc_reflected_resource *pclist2 = NULL;
++        size_t pccount2 = 0;
++        if (spvc_resources_get_resource_list_for_type(res,
++                SPVC_RESOURCE_TYPE_PUSH_CONSTANT, &pclist2, &pccount2)
++                == SPVC_SUCCESS) {
++            for (size_t i = 0; i < pccount2; i++) {
++                unsigned auto_slot = spvc_compiler_msl_get_automatic_resource_binding(
++                    stage->sc_compiler, pclist2[i].id);
++                MP_WARN(ra, "PCB post-compile id=%u auto_msl_slot=%u\n",
++                        (unsigned)pclist2[i].id, auto_slot);
++            }
++        }
 +    }
 +
 +    /* MSL -> MTLLibrary. */
