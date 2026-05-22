@@ -467,9 +467,11 @@ private class BuildMPV: CombineBaseBuild {
             "-Dplain-gl=enabled",
             "-Diconv=enabled",
             "-Duchardet=enabled",
-            "-Dvulkan=enabled",
-            "-Dmoltenvk=enabled",  // from patch option
-            "-Dmetal=auto",  // Phase-2 Metal RA backend (untested)
+            "-Dvulkan=disabled",
+            // Removed -Dmoltenvk= (was from custom 0001 patch, deleted in
+            // ios-metal.34): Phase-3 uses native Metal RA backend via
+            // -Dmetal=auto, no Vulkan/MoltenVK path needed.
+            "-Dmetal=auto",
 
 
             "-Djavascript=disabled",
@@ -507,7 +509,9 @@ private class BuildMPV: CombineBaseBuild {
             array.append("-Dlua=luajit")  // macos show video stats need enable 
         } else {
             array.append("-Dvideotoolbox-gl=disabled")
-            array.append("-Dvideotoolbox-pl=enabled")
+            // mpv master: -Dvideotoolbox-pl requires vulkan (vt-libplacebo uses Vulkan).
+            // Phase-3 disabled vulkan/MoltenVK, so vt-pl too. We use hwdec=videotoolbox-copy.
+            array.append("-Dvideotoolbox-pl=disabled")
             array.append("-Dswift-build=disabled")
             array.append("-Daudiounit=enabled")
             array.append("-Davfoundation=disabled")

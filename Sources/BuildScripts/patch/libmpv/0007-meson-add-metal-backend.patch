@@ -1,8 +1,8 @@
 diff --git a/meson.build b/meson.build
-index 42ece8e..6188e2e 100644
+index 7efc2db..3d9075a 100644
 --- a/meson.build
 +++ b/meson.build
-@@ -996,7 +996,7 @@ if features['sdl2-video']
+@@ -1013,7 +1013,7 @@ if features['sdl2-video']
  endif
  
  shaderc = dependency('shaderc', required:
@@ -11,7 +11,7 @@ index 42ece8e..6188e2e 100644
  features += {'shaderc': shaderc.found()}
  if features['shaderc']
      dependencies += shaderc
-@@ -1016,7 +1016,7 @@ if features['posix']
+@@ -1033,7 +1033,7 @@ if features['posix']
  endif
  
  spirv_cross = dependency('spirv-cross-c-shared', required:
@@ -20,8 +20,8 @@ index 42ece8e..6188e2e 100644
  features += {'spirv-cross': spirv_cross.found()}
  if features['spirv-cross']
      dependencies += spirv_cross
-@@ -1341,6 +1341,27 @@ if host_machine.system() == 'darwin'
-     endif
+@@ -1347,6 +1347,27 @@ if features['vulkan'] and features['x11']
+      sources += files('video/out/vulkan/context_xlib.c')
  endif
  
 +# Apple Metal render backend.
@@ -48,7 +48,7 @@ index 42ece8e..6188e2e 100644
  features += {'vk-khr-display': vulkan.type_name() == 'internal' or
                                 cc.has_function('vkCreateDisplayPlaneSurfaceKHR', prefix: '#include <vulkan/vulkan_core.h>',
                                                 dependencies: [vulkan])}
-@@ -1807,7 +1828,8 @@ if get_option('libmpv')
+@@ -1823,7 +1844,8 @@ if get_option('libmpv')
                   description: 'mpv media player client library')
  
      headers = ['include/mpv/client.h', 'include/mpv/render.h',
@@ -59,13 +59,13 @@ index 42ece8e..6188e2e 100644
  
      # Allow projects to build with libmpv by cloning into ./subprojects/mpv
 diff --git a/meson.options b/meson.options
-index 81bc931..4be9fdc 100644
+index 35e174c..ac4685e 100644
 --- a/meson.options
 +++ b/meson.options
-@@ -104,6 +104,7 @@ option('ios-gl', type: 'feature', value: 'auto', description: 'iOS OpenGL ES int
+@@ -106,6 +106,7 @@ option('gl-dxinterop-d3d9', type: 'feature', value: 'auto', description: 'OpenGL
+ option('ios-gl', type: 'feature', value: 'auto', description: 'iOS OpenGL ES interop support')
  option('videotoolbox-gl', type: 'feature', value: 'auto', description: 'Videotoolbox with OpenGL')
  option('videotoolbox-pl', type: 'feature', value: 'auto', description: 'Videotoolbox with libplacebo')
- option('moltenvk', type: 'feature', value: 'auto', description: 'Moltenvk context')
 +option('metal', type: 'feature', value: 'auto', description: 'Apple Metal render backend (macOS/iOS only)')
  
  # macOS features
