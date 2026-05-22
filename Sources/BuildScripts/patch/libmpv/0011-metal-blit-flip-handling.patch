@@ -1,0 +1,94 @@
+From: Kuckuck developer
+Date: 2026-05-22
+Subject: [PATCH] metal_blit: handle flipped dst rect (pause-redraw)
+
+mpv's pause-redraw path in gl_video.c sets fbo->flip=true when the host
+sets MPV_RENDER_PARAM_FLIP_Y=1 (which Kuckuck does so the compute
+dither path renders right-side-up). That makes gl_video.c swap
+dst.y0/dst.y1 before calling ra->fns->blit(), arriving as dst_h < 0.
+
+Pre-fix metal_blit() FATAL'd on the "scaled blit not implemented"
+check because (dst_w == src_w) && (dst_h == src_h) failed (signed
+comparison, |dst_h| matched but the negative sign didn't). Result: no
+draw → black drawable on pause.
+
+Fix: detect the flipped case, normalize dimensions to positive, and
+route any non-trivial blit (different format OR flipped) through the
+fullscreen-triangle render-pass branch. The render-pass branch already
+handles arbitrary src→dst sampling via the BlitParams uv_offset /
+uv_scale uniform; we just need to mirror the scale on the flipped
+axis. MTLBlitCommandEncoder fast-path stays for true memcpy-equivalent
+blits.
+
+Reproduced & validated against video.c rev e8a72c4 (mpv master,
+2026-05-15) pause-redraw flow.
+
+diff --git a/video/out/metal/ra_metal_textures.m b/video/out/metal/ra_metal_textures.m
+--- a/video/out/metal/ra_metal_textures.m
++++ b/video/out/metal/ra_metal_textures.m
+@@ -700,10 +700,26 @@ void metal_blit(struct ra *ra, struct ra_tex *dst, struct ra_tex *src,
+     int src_w = src_rc->x1 - src_rc->x0;
+     int src_h = src_rc->y1 - src_rc->y0;
+
++    /* Detect flipped blit (negative dst dimensions). mpv's pause-redraw
++     * path in gl_video.c swaps dst.y0/y1 when fbo->flip is true (which
++     * we set via MPV_RENDER_PARAM_FLIP_Y=1 in Kuckuck) — that arrives
++     * here as dst_h < 0. Normalize to positive rect + remember flip
++     * flags; the render-pass branch below uses them to mirror via the
++     * uv_scale uniform. Pre-flip-fix path FATAL'd on the "scaled blit
++     * not implemented" check below because |dst_h| == src_h passed the
++     * abs check but the signed comparison didn't. */
++    bool flip_x = dst_w < 0;
++    bool flip_y = dst_h < 0;
++    if (flip_x) dst_w = -dst_w;
++    if (flip_y) dst_h = -dst_h;
++    int dst_x0 = flip_x ? dst_rc->x1 : dst_rc->x0;
++    int dst_y0 = flip_y ? dst_rc->y1 : dst_rc->y0;
++
+     bool same_size   = (dst_w == src_w) && (dst_h == src_h);
+     bool same_format = (src->params.format == dst->params.format) ||
+                        (ra_metal_pixel_format(src->params.format) ==
+                         ra_metal_pixel_format(dst->params.format));
++    bool flipped = flip_x || flip_y;
+
+     if (!same_size) {
+         /* TODO: scaled blit (different rect sizes). Would need
+@@ -716,7 +732,7 @@ void metal_blit(struct ra *ra, struct ra_tex *dst, struct ra_tex *src,
+         return;
+     }
+
+-    if (!same_format) {
++    if (!same_format || flipped) {
+         /* Format-converting blit (same size, different pixel format).
+          * mpv hits this on every pause-redraw: the OSD-composited frame
+          * lives in an internal RGBA16F-ish FBO, the drawable is
+@@ -741,6 +757,18 @@ void metal_blit(struct ra *ra, struct ra_tex *dst, struct ra_tex *src,
+                 (float)src_h / (float)src->params.h,
+             },
+         };
++        /* Flip: shift uv-origin to the far edge then negate the span.
++         * In the shader: uv = uv_offset + frag_uv * uv_scale. Plugging in
++         * fragment.uv ∈ {0..1}, we want fragment.uv=0 to sample src.high
++         * and fragment.uv=1 to sample src.low when flipped. */
++        if (flip_x) {
++            bp.uv_offset[0] += bp.uv_scale[0];
++            bp.uv_scale[0]   = -bp.uv_scale[0];
++        }
++        if (flip_y) {
++            bp.uv_offset[1] += bp.uv_scale[1];
++            bp.uv_scale[1]   = -bp.uv_scale[1];
++        }
+
+         id<MTLCommandBuffer> cb = ra_metal_cmd_buf(ra);
+         MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor new];
+@@ -751,8 +779,8 @@ void metal_blit(struct ra *ra, struct ra_tex *dst, struct ra_tex *src,
+             [cb renderCommandEncoderWithDescriptor:rpd];
+         [enc setRenderPipelineState:entry.pso];
+         MTLViewport vp = {
+-            .originX = dst_rc->x0,
+-            .originY = dst_rc->y0,
++            .originX = dst_x0,
++            .originY = dst_y0,
+             .width   = dst_w,
+             .height  = dst_h,
+             .znear = 0, .zfar = 1,
