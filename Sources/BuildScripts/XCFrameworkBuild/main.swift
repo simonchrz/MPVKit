@@ -52,7 +52,7 @@ enum Library: String, CaseIterable {
     var version: String {
         switch self {
         case .libmpv:
-            return "v0.41.0"
+            return "master"
         case .FFmpeg:
             return "n8.1.1"
         case .openssl:
@@ -477,6 +477,10 @@ private class BuildMPV: CombineBaseBuild {
             "-Djpeg=disabled",
             "-Dvapoursynth=disabled",
             "-Drubberband=disabled",
+            // New in mpv master (post v0.41.0): stream_curl backend needs
+            // libcurl which mpvkit doesn't ship. We route everything through
+            // FFmpeg's http(s) stack anyway — disable.
+            "-Dlibcurl=disabled",
         ]
         if BaseBuild.options.enableGPL {
             array.append("-Dgpl=true")

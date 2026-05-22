@@ -1,6 +1,6 @@
 --- a/include/mpv/render_mtl.h
 +++ b/include/mpv/render_mtl.h
-@@ -0,0 +1,     127 @@
+@@ -0,0 +1,127 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Permission to use, copy, modify, and/or distribute this software for any
@@ -130,7 +130,7 @@
 +#endif
 --- a/video/out/metal/libmpv_metal.m
 +++ b/video/out/metal/libmpv_metal.m
-@@ -0,0 +1,     166 @@
+@@ -0,0 +1,166 @@
 +/*
 + * libmpv Metal backend bridge.
 + *
@@ -299,7 +299,7 @@
 +};
 --- a/video/out/metal/ra_metal.h
 +++ b/video/out/metal/ra_metal.h
-@@ -0,0 +1,     147 @@
+@@ -0,0 +1,147 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Internal header for the Apple Metal backend of mpv's render abstraction.
@@ -449,7 +449,7 @@
 +#endif
 --- a/video/out/metal/ra_metal.m
 +++ b/video/out/metal/ra_metal.m
-@@ -0,0 +1,      76 @@
+@@ -0,0 +1,76 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Master file for mpv's Apple Metal RA backend. Defines the public
@@ -528,7 +528,7 @@
 +};
 --- a/video/out/metal/ra_metal_init.m
 +++ b/video/out/metal/ra_metal_init.m
-@@ -0,0 +1,     421 @@
+@@ -0,0 +1,421 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Metal RA backend -- init, lifecycle, and pixel formats.
@@ -952,7 +952,7 @@
 +}
 --- a/video/out/metal/ra_metal_textures.m
 +++ b/video/out/metal/ra_metal_textures.m
-@@ -0,0 +1,     802 @@
+@@ -0,0 +1,802 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Metal RA backend — textures, buffers, clear, blit.
@@ -1757,7 +1757,7 @@
 +}
 --- a/video/out/metal/ra_metal_renderpass.m
 +++ b/video/out/metal/ra_metal_renderpass.m
-@@ -0,0 +1,    1158 @@
+@@ -0,0 +1,1158 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Apple Metal backend for mpv's render abstraction (ra). Parallel to
