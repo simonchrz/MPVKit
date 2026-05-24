@@ -299,7 +299,7 @@
 +};
 --- a/video/out/metal/ra_metal.h
 +++ b/video/out/metal/ra_metal.h
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,168 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Internal header for the Apple Metal backend of mpv's render abstraction.
@@ -396,6 +396,17 @@
 +     * Binary anders ist, dann fängt das archive leer an. CF-bridged wie
 +     * staging_pool/pipeline_cache. */
 +    void *binary_archive;
++    /* PSO-Sidecar für Background-Warmup. binary_archive (oben) cacht den
++     * final MTLPipelineState-Build (~50-300ms/pass), aber die shaderc +
++     * SPIRV-Cross + MSL-Compile-Chain (~100-200ms/pass) muss eh laufen
++     * weil newRenderPipelineStateWithDescriptor: die MTLFunction-Objekte
++     * im Descriptor braucht. Mit einem persistierten descriptor-list
++     * können wir die compile-chain im Hintergrund beim App-Launch
++     * vorab ausführen, sodass die in-memory pipeline_cache schon warm
++     * ist wenn der User das erste Video tappt. Sidecar = NSMutableArray
++     * von NSDictionary-Entries (serialisierte ra_renderpass_params),
++     * disk-persisted als plist in NSCachesDirectory. */
++    void *pso_sidecar;
 +    /* Lazily-built shader+PSO for format-converting blit (used by
 +     * metal_blit when src/dst formats differ — pause path goes through
 +     * this when mpv blits its OSD-composited frame to the drawable in a
@@ -538,7 +549,7 @@
 +};
 --- a/video/out/metal/ra_metal_init.m
 +++ b/video/out/metal/ra_metal_init.m
-@@ -0,0 +1,490 @@
+@@ -0,0 +1,583 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Metal RA backend -- init, lifecycle, and pixel formats.
@@ -612,6 +623,76 @@
 +        /* best-effort — falls write fehlschlägt (disk full etc) rebuilden
 +         * wir beim nächsten Start halt die PSOs neu, kein Disaster. */
 +    }
++}
++
++/* PSO-Sidecar Cross-Session Persistenz. Speichert serialisierte
++ * ra_renderpass_params zu jedem cache-Entry damit ein Background-Thread
++ * beim nächsten App-Launch die compile-chain (shaderc + SPIRV-Cross +
++ * Metal lib+pso compile) vorab ausführen kann.
++ *
++ * Architektur: NSMutableArray<NSDictionary*> in ra_metal->pso_sidecar.
++ * Bei jedem PSO-Cache-Insert in renderpass_create wird ein NSDictionary
++ * mit den params angehängt. Bei ra_metal_destroy wird das Array via
++ * NSPropertyListSerialization als binary plist gespeichert. Beim
++ * nächsten Launch lädt ra_init_metal die plist und kickt einen
++ * Background-Thread an der pro Entry renderpass_create aufruft (das
++ * füllt pipeline_cache und MTLBinaryArchive). */
++NSString *metal_pso_sidecar_path(void)
++{
++    NSArray *paths = NSSearchPathForDirectoriesInDomains(
++        NSCachesDirectory, NSUserDomainMask, YES);
++    if (!paths.count) return nil;
++    return [paths[0] stringByAppendingPathComponent:@"MPVKit-PSO-descriptors.plist"];
++}
++
++NSMutableArray *metal_load_pso_sidecar(void)
++{
++    NSString *path = metal_pso_sidecar_path();
++    if (!path) return [NSMutableArray array];
++    NSData *data = [NSData dataWithContentsOfFile:path];
++    if (!data) return [NSMutableArray array];
++    NSError *err = nil;
++    id obj = [NSPropertyListSerialization
++              propertyListWithData:data
++                           options:NSPropertyListMutableContainers
++                            format:nil
++                             error:&err];
++    if ([obj isKindOfClass:[NSMutableArray class]]) return obj;
++    if ([obj isKindOfClass:[NSArray class]]) return [(NSArray *)obj mutableCopy];
++    return [NSMutableArray array];
++}
++
++void metal_save_pso_sidecar(NSArray *entries)
++{
++    if (!entries.count) return;
++    NSString *path = metal_pso_sidecar_path();
++    if (!path) return;
++    NSError *err = nil;
++    NSData *data = [NSPropertyListSerialization
++                    dataWithPropertyList:entries
++                                  format:NSPropertyListBinaryFormat_v1_0
++                                 options:0
++                                   error:&err];
++    if (data) [data writeToFile:path atomically:YES];
++    /* best-effort: bei write-Fehler (disk full etc) rebuilden wir beim
++     * nächsten Launch die PSOs halt komplett neu. */
++}
++
++/* Forward-declared in ra_metal.h: das warmup-replay ruft renderpass_create
++ * (definiert in ra_metal_renderpass.m) für jeden sidecar-entry auf. Wir
++ * können die struct ra_renderpass_params hier nicht direkt einbinden ohne
++ * gpu/ra.h erneut zu inkludieren — die Logik sitzt komplett im
++ * renderpass-file via metal_warmup_replay_one(). */
++extern void metal_warmup_replay_entries(struct ra *ra, NSArray *entries);
++
++void metal_kick_pso_warmup(struct ra *ra, NSArray *entries)
++{
++    if (!entries.count) return;
++    /* QOS_UTILITY damit wir nicht mit main/render-thread um Cycles
++     * kämpfen wenn der User direkt nach App-Launch ein Video tappt. */
++    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
++        metal_warmup_replay_entries(ra, entries);
++    });
 +}
 +
 +/* Defined by the master assembled file ra_metal.m. Declared here so
@@ -819,6 +900,22 @@
 +    id<MTLBinaryArchive> barchive =
 +        metal_load_or_create_binary_archive(device);
 +    p->binary_archive = (__bridge_retained void *)barchive;
++
++    /* PSO-Sidecar laden + Background-Warmup anstoßen. MTLBinaryArchive
++     * (oben) cacht den final PSO-build, aber GLSL→SPIR-V→MSL→MTLLibrary
++     * muss noch jedes Mal laufen weil newRenderPipelineState die
++     * MTLFunction-Objekte braucht. Mit Sidecar-Replay im Background-
++     * Thread läuft das während User durch's Menü navigiert, sodass
++     * pipeline_cache (in-memory NSCache, oben) warm ist wenn der erste
++     * Video-Tap kommt. */
++    NSMutableArray *sidecar = metal_load_pso_sidecar();
++    p->pso_sidecar = (__bridge_retained void *)sidecar;
++    if (sidecar.count > 0) {
++        /* Kopie zur Warmup-Thread weil pso_sidecar während der App-Session
++         * weitergeschrieben wird (jeder neue PSO-cache-Insert). */
++        NSArray *entries_copy = [sidecar copy];
++        metal_kick_pso_warmup(ra, entries_copy);
++    }
 +    if (!p->queue) {
 +        MP_FATAL(ra, "ra_init_metal: failed to allocate MTLCommandQueue\n");
 +        talloc_free(ra);
@@ -1008,6 +1105,13 @@
 +            p->binary_archive = NULL;
 +            metal_serialize_binary_archive(archive);
 +            archive = nil;
++        }
++        if (p->pso_sidecar) {
++            NSMutableArray *sidecar =
++                (__bridge_transfer NSMutableArray *)p->pso_sidecar;
++            p->pso_sidecar = NULL;
++            metal_save_pso_sidecar(sidecar);
++            sidecar = nil;
 +        }
 +        if (p->pipeline_cache) {
 +            CFRelease(p->pipeline_cache);
@@ -1846,7 +1950,7 @@
 +}
 --- a/video/out/metal/ra_metal_renderpass.m
 +++ b/video/out/metal/ra_metal_renderpass.m
-@@ -0,0 +1,1183 @@
+@@ -0,0 +1,1365 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Apple Metal backend for mpv's render abstraction (ra). Parallel to
@@ -1874,6 +1978,165 @@
 +/* spirv_conf was used by an earlier (broken) acquisition path. We now use
 + * ctx->spirv (populated by spirv_compiler_init in ra_init_metal). The decl
 + * stays here only because removing it cascades through include changes. */
++
++/* ============================================================ */
++/* PSO-Sidecar Serialize / Deserialize / Warmup-Replay           */
++/* ============================================================ */
++
++/* Forward-decl: metal_renderpass_create ist später in dieser Datei
++ * definiert, wird aber vom warmup-replay schon oben gerufen. */
++struct ra_renderpass *metal_renderpass_create(struct ra *ra,
++    const struct ra_renderpass_params *params);
++
++/* Serialisiert ra_renderpass_params zu einem NSDictionary für den
++ * persistenten PSO-Warmup-Sidecar. cache_key wird mit gespeichert um
++ * Deduplikation beim Append + Cache-Hit-Check beim Warmup-Replay zu
++ * ermöglichen. Wird in renderpass_create direkt nach dem Cache-Insert
++ * gerufen.
++ *
++ * Format-Pointer (target_format) werden über format->name gespeichert
++ * und beim Deserialize per ra_format-Lookup zurückaufgelöst. */
++NSDictionary *metal_serialize_renderpass_params(
++    const struct ra_renderpass_params *p, NSString *cache_key)
++{
++    NSMutableDictionary *d = [NSMutableDictionary dictionary];
++    d[@"cache_key"] = cache_key ?: @"";
++    d[@"type"] = @((int)p->type);
++    if (p->vertex_shader) d[@"vertex_shader"] = @(p->vertex_shader);
++    if (p->frag_shader)   d[@"frag_shader"]   = @(p->frag_shader);
++    if (p->compute_shader) d[@"compute_shader"] = @(p->compute_shader);
++    if (p->target_format && p->target_format->name)
++        d[@"target_format"] = @(p->target_format->name);
++    d[@"enable_blend"] = @(p->enable_blend);
++    d[@"blend_src_rgb"]   = @((int)p->blend_src_rgb);
++    d[@"blend_dst_rgb"]   = @((int)p->blend_dst_rgb);
++    d[@"blend_src_alpha"] = @((int)p->blend_src_alpha);
++    d[@"blend_dst_alpha"] = @((int)p->blend_dst_alpha);
++    d[@"push_constants_size"] = @((NSInteger)p->push_constants_size);
++    d[@"vertex_stride"]       = @(p->vertex_stride);
++
++    NSMutableArray *inputs = [NSMutableArray array];
++    for (int i = 0; i < p->num_inputs; i++) {
++        const struct ra_renderpass_input *in = &p->inputs[i];
++        [inputs addObject:@{
++            @"name":    in->name ? @(in->name) : @"",
++            @"type":    @((int)in->type),
++            @"dim_v":   @(in->dim_v),
++            @"dim_m":   @(in->dim_m),
++            @"offset":  @((NSInteger)in->offset),
++            @"binding": @(in->binding),
++        }];
++    }
++    d[@"inputs"] = inputs;
++
++    NSMutableArray *vattribs = [NSMutableArray array];
++    for (int i = 0; i < p->num_vertex_attribs; i++) {
++        const struct ra_renderpass_input *va = &p->vertex_attribs[i];
++        [vattribs addObject:@{
++            @"name":    va->name ? @(va->name) : @"",
++            @"type":    @((int)va->type),
++            @"dim_v":   @(va->dim_v),
++            @"dim_m":   @(va->dim_m),
++            @"offset":  @((NSInteger)va->offset),
++            @"binding": @(va->binding),
++        }];
++    }
++    d[@"vertex_attribs"] = vattribs;
++    return d;
++}
++
++/* Helper: ra_renderpass_input aus einem serialisiertem NSDictionary
++ * rekonstruieren. Name-Pointer ist talloc-child von ta_ctx, lebt nur
++ * solange ta_ctx existiert. */
++static void metal_deserialize_input(void *ta_ctx, NSDictionary *e,
++                                    struct ra_renderpass_input *out)
++{
++    NSString *name = e[@"name"];
++    out->name    = (name.length > 0) ? talloc_strdup(ta_ctx, name.UTF8String) : NULL;
++    out->type    = (enum ra_vartype)[e[@"type"] intValue];
++    out->dim_v   = [e[@"dim_v"] intValue];
++    out->dim_m   = [e[@"dim_m"] intValue];
++    out->offset  = (size_t)[e[@"offset"] longLongValue];
++    out->binding = [e[@"binding"] intValue];
++}
++
++/* Background-Thread-Entry: für jeden Sidecar-Entry die renderpass-
++ * compile-chain ausführen, sodass pipeline_cache (NSCache) warm ist
++ * bevor mpv das erste Mal renderpass_create ruft. Discarded den
++ * zurückgegebenen ra_renderpass — pipeline_cache hält strong-refs auf
++ * library + PSO, sodass das Object nach talloc_free weiter im Cache
++ * lebt.
++ *
++ * Thread-Safety: NSCache + MTLDevice sind threadsafe per Apple-Docs;
++ * shaderc + SPIRV-Cross arbeiten per-call mit eigenen Contexten;
++ * pso_sidecar-Append nutzt @synchronized. ra_metal_pixel_format ist
++ * lookup-only auf einer statischen Tabelle = ok. */
++void metal_warmup_replay_entries(struct ra *ra, NSArray *entries)
++{
++    if (!ra || !entries.count) return;
++
++    for (NSDictionary *e in entries) {
++        @autoreleasepool {
++            void *ta_ctx = talloc_new(NULL);
++            struct ra_renderpass_params p = {0};
++
++            p.type = (enum ra_renderpass_type)[e[@"type"] intValue];
++
++            NSString *vs = e[@"vertex_shader"];
++            NSString *fs = e[@"frag_shader"];
++            NSString *cs = e[@"compute_shader"];
++            if (vs.length > 0) p.vertex_shader  = talloc_strdup(ta_ctx, vs.UTF8String);
++            if (fs.length > 0) p.frag_shader    = talloc_strdup(ta_ctx, fs.UTF8String);
++            if (cs.length > 0) p.compute_shader = talloc_strdup(ta_ctx, cs.UTF8String);
++
++            NSString *fmt_name = e[@"target_format"];
++            if (fmt_name.length > 0) {
++                /* ra->formats wurde in ra_init_metal aus metal_formats[]
++                 * populated. Lookup by name. */
++                for (int i = 0; i < ra->num_formats; i++) {
++                    if (ra->formats[i] && ra->formats[i]->name &&
++                        strcmp(ra->formats[i]->name, fmt_name.UTF8String) == 0) {
++                        p.target_format = ra->formats[i];
++                        break;
++                    }
++                }
++            }
++
++            p.enable_blend     = [e[@"enable_blend"] boolValue];
++            p.blend_src_rgb    = (enum ra_blend)[e[@"blend_src_rgb"] intValue];
++            p.blend_dst_rgb    = (enum ra_blend)[e[@"blend_dst_rgb"] intValue];
++            p.blend_src_alpha  = (enum ra_blend)[e[@"blend_src_alpha"] intValue];
++            p.blend_dst_alpha  = (enum ra_blend)[e[@"blend_dst_alpha"] intValue];
++            p.push_constants_size = (size_t)[e[@"push_constants_size"] longLongValue];
++            p.vertex_stride       = [e[@"vertex_stride"] intValue];
++
++            NSArray *inputs_arr = e[@"inputs"];
++            p.num_inputs = (int)inputs_arr.count;
++            if (p.num_inputs > 0) {
++                p.inputs = talloc_zero_array(ta_ctx, struct ra_renderpass_input,
++                                             p.num_inputs);
++                for (int i = 0; i < p.num_inputs; i++)
++                    metal_deserialize_input(ta_ctx, inputs_arr[i], &p.inputs[i]);
++            }
++
++            NSArray *vattr_arr = e[@"vertex_attribs"];
++            p.num_vertex_attribs = (int)vattr_arr.count;
++            if (p.num_vertex_attribs > 0) {
++                p.vertex_attribs = talloc_zero_array(ta_ctx,
++                    struct ra_renderpass_input, p.num_vertex_attribs);
++                for (int i = 0; i < p.num_vertex_attribs; i++)
++                    metal_deserialize_input(ta_ctx, vattr_arr[i], &p.vertex_attribs[i]);
++            }
++
++            /* Replay! Discarded pass — pipeline_cache holds the PSO. */
++            struct ra_renderpass *pass = metal_renderpass_create(ra, &p);
++            if (pass) talloc_free(pass);
++            talloc_free(ta_ctx);
++        }
++    }
++}
++
++/* ============================================================ */
 +
 +/* Pipeline cache value object. We retain the MTLLibrary because it's the
 + * Metal-side container for the compiled GPU code that the PSO references
@@ -2586,6 +2849,29 @@
 +                               length:sizeof(int) * pass_metal->num_inputs];
 +        }
 +        [pipeline_cache setObject:entry forKey:cache_key];
++
++        /* PSO-Sidecar: serialize params so that next App-Launch's
++         * background-warmup-thread kann diese compile-chain wieder
++         * replayen bevor User Video tappt. Dedupliziert by cache_key
++         * damit das Sidecar nicht wächst wenn Warmup selber wieder
++         * renderpass_create triggert (= cache-miss-on-empty-NSCache
++         * beim allerersten Warmup-Schritt; ab dann sind die Calls
++         * cache-hits und kommen hier nicht mehr rein). */
++        NSMutableArray *sidecar = (__bridge NSMutableArray *)m->pso_sidecar;
++        if (sidecar) {
++            NSDictionary *serialized =
++                metal_serialize_renderpass_params(params, cache_key);
++            @synchronized (sidecar) {
++                BOOL already = NO;
++                for (NSDictionary *e in sidecar) {
++                    if ([e[@"cache_key"] isEqualToString:cache_key]) {
++                        already = YES;
++                        break;
++                    }
++                }
++                if (!already) [sidecar addObject:serialized];
++            }
++        }
 +    }
 +
 +    // === 9. Cleanup ===
