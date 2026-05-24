@@ -299,7 +299,7 @@
 +};
 --- a/video/out/metal/ra_metal.h
 +++ b/video/out/metal/ra_metal.h
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,157 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Internal header for the Apple Metal backend of mpv's render abstraction.
@@ -386,6 +386,16 @@
 +     * + MTLLibrary + MTLRenderPipelineState compile chain — saves ~150-300ms
 +     * per renderpass_create. Same CF-bridge trick as staging_pool. */
 +    void *pipeline_cache;
++    /* MTLBinaryArchive für Cross-Session-PSO-Cache. pipeline_cache oben ist
++     * per-Session; nach App-Kill rekompiliert mpv die 10-20 PSOs neu
++     * (50-300ms pro Pass = ~1-3s "Schwarz" auf erstem Video-Load post-
++     * Cold-Start). Archive wird beim init aus NSCachesDirectory geladen
++     * (oder leer erstellt wenn Datei fehlt/inkompatibel) und beim destroy
++     * via serializeToURL: zurückgeschrieben. Cache-Invalidation passiert
++     * automatisch: load schlägt fehl wenn GPU-Family wechselt oder mpv-
++     * Binary anders ist, dann fängt das archive leer an. CF-bridged wie
++     * staging_pool/pipeline_cache. */
++    void *binary_archive;
 +    /* Lazily-built shader+PSO for format-converting blit (used by
 +     * metal_blit when src/dst formats differ — pause path goes through
 +     * this when mpv blits its OSD-composited frame to the drawable in a
@@ -528,7 +538,7 @@
 +};
 --- a/video/out/metal/ra_metal_init.m
 +++ b/video/out/metal/ra_metal_init.m
-@@ -0,0 +1,421 @@
+@@ -0,0 +1,490 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Metal RA backend -- init, lifecycle, and pixel formats.
@@ -549,10 +559,60 @@
 + */
 +
 +#import <Metal/Metal.h>
++#import <Foundation/Foundation.h>
 +#import "ra_metal.h"
 +#include "mpv_talloc.h"
 +#include "common/msg.h"
 +#include "video/out/gpu/spirv.h"
++
++/* MTLBinaryArchive Cross-Session-Cache für kompilierte PSOs. Pfad in
++ * NSCachesDirectory damit's iOS-side automatisch purgable ist unter
++ * disk-pressure, aber normalerweise stabil zwischen App-Launches.
++ * Filename hat keine Version — Cache-Invalidation kommt automatisch
++ * über MTLBinaryArchive's Load-Validation: load schlägt fehl wenn
++ * GPU-Family oder mpv-binary anders ist, dann fängt empty an. */
++NSString *metal_binary_archive_path(void)
++{
++    NSArray *paths = NSSearchPathForDirectoriesInDomains(
++        NSCachesDirectory, NSUserDomainMask, YES);
++    if (!paths.count) return nil;
++    return [paths[0] stringByAppendingPathComponent:@"MPVKit-PSO.bin"];
++}
++
++id<MTLBinaryArchive> metal_load_or_create_binary_archive(id<MTLDevice> device)
++{
++    if (@available(iOS 14.0, macOS 11.0, tvOS 14.0, *)) {
++        MTLBinaryArchiveDescriptor *desc = [MTLBinaryArchiveDescriptor new];
++        NSString *path = metal_binary_archive_path();
++        if (path && [[NSFileManager defaultManager] fileExistsAtPath:path]) {
++            desc.url = [NSURL fileURLWithPath:path];
++        }
++        NSError *err = nil;
++        id<MTLBinaryArchive> a = [device newBinaryArchiveWithDescriptor:desc
++                                                                  error:&err];
++        /* Load fehlgeschlagen (z.B. anderes Device, mpv-bump): leer starten. */
++        if (!a && desc.url) {
++            desc.url = nil;
++            a = [device newBinaryArchiveWithDescriptor:desc error:nil];
++        }
++        return a;
++    }
++    return nil;
++}
++
++void metal_serialize_binary_archive(id<MTLBinaryArchive> archive)
++{
++    if (!archive) return;
++    if (@available(iOS 14.0, macOS 11.0, tvOS 14.0, *)) {
++        NSString *path = metal_binary_archive_path();
++        if (!path) return;
++        NSURL *url = [NSURL fileURLWithPath:path];
++        NSError *err = nil;
++        [archive serializeToURL:url error:&err];
++        /* best-effort — falls write fehlschlägt (disk full etc) rebuilden
++         * wir beim nächsten Start halt die PSOs neu, kein Disaster. */
++    }
++}
 +
 +/* Defined by the master assembled file ra_metal.m. Declared here so
 + * ra_init_metal() can wire `ra->fns = &ra_fns_metal` without pulling in
@@ -747,6 +807,18 @@
 +        talloc_free(ra);
 +        return false;
 +    }
++
++    /* Cross-Session-PSO-Cache via MTLBinaryArchive. Wenn die Datei vom
++     * früheren Launch da ist, läd Metal die fertig-kompilierten PSOs (=
++     * spart ~50-300ms pro Pass auf erstem Video-Tap nach Cold-Start).
++     * Fall: erstes Launch ever / GPU-Family-Wechsel / mpv-Bump → load
++     * schlägt fehl, archive startet leer und wird beim destroy frisch
++     * geschrieben. Init muss nach spirv_compiler_init kommen — falls der
++     * fehlschlägt wird ra mit talloc_free zerstört, dann führt
++     * ra_metal_destroy_fns eine evtl. allozierte archive sauber zurück. */
++    id<MTLBinaryArchive> barchive =
++        metal_load_or_create_binary_archive(device);
++    p->binary_archive = (__bridge_retained void *)barchive;
 +    if (!p->queue) {
 +        MP_FATAL(ra, "ra_init_metal: failed to allocate MTLCommandQueue\n");
 +        talloc_free(ra);
@@ -929,6 +1001,13 @@
 +        if (p->staging_pool) {
 +            CFRelease(p->staging_pool);
 +            p->staging_pool = NULL;
++        }
++        if (p->binary_archive) {
++            id<MTLBinaryArchive> archive =
++                (__bridge_transfer id<MTLBinaryArchive>)p->binary_archive;
++            p->binary_archive = NULL;
++            metal_serialize_binary_archive(archive);
++            archive = nil;
 +        }
 +        if (p->pipeline_cache) {
 +            CFRelease(p->pipeline_cache);
@@ -1767,7 +1846,7 @@
 +}
 --- a/video/out/metal/ra_metal_renderpass.m
 +++ b/video/out/metal/ra_metal_renderpass.m
-@@ -0,0 +1,1158 @@
+@@ -0,0 +1,1183 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Apple Metal backend for mpv's render abstraction (ra). Parallel to
@@ -2397,6 +2476,16 @@
 +            pd.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
 +        }
 +
++        /* MTLBinaryArchive für Cross-Session-PSO-Cache. Bei einem Cache-
++         * Hit lädt Metal das fertig-kompilierte PSO aus dem archive (statt
++         * ~50-300ms shaderc+SPIRV-Cross+Metal-compile). Der archive enthält
++         * dieselbe MTLRenderPipelineDescriptor-Hash-Logik wie unser in-
++         * memory pipeline_cache, nur persistent. */
++        id<MTLBinaryArchive> barchive =
++            (__bridge id<MTLBinaryArchive>)m->binary_archive;
++        if (barchive)
++            pd.binaryArchives = @[barchive];
++
 +        NSError *pso_err = nil;
 +        pass_metal->render_pso =
 +            [device newRenderPipelineStateWithDescriptor:pd error:&pso_err];
@@ -2407,6 +2496,10 @@
 +                       : "unknown error");
 +            goto fail;
 +        }
++        /* PSO erfolgreich kompiliert → in archive aufnehmen damit nächste
++         * Session den compile-skip kriegt. Fehler ignorieren — best-effort. */
++        if (barchive)
++            [barchive addRenderPipelineFunctionsWithDescriptor:pd error:nil];
 +        /* Keep the fragment library alive on the pass priv. Vertex library
 +         * is kept alive transitively via the pipeline state; we publish the
 +         * fragment one because debug-marker / reflection paths may need
@@ -2414,17 +2507,28 @@
 +        pass_metal->library = frag.library;
 +    } else {
 +        // === 5'. Compute pipeline state ===
++        id<MTLBinaryArchive> barchive =
++            (__bridge id<MTLBinaryArchive>)m->binary_archive;
++        MTLComputePipelineDescriptor *cd = [MTLComputePipelineDescriptor new];
++        cd.computeFunction = comp.function;
++        if (barchive)
++            cd.binaryArchives = @[barchive];
++
 +        NSError *cpo_err = nil;
 +        pass_metal->compute_pso =
-+            [device newComputePipelineStateWithFunction:comp.function
-+                                                  error:&cpo_err];
++            [device newComputePipelineStateWithDescriptor:cd
++                                                  options:MTLPipelineOptionNone
++                                               reflection:nil
++                                                    error:&cpo_err];
 +        if (!pass_metal->compute_pso) {
-+            MP_ERR(ra, "metal: newComputePipelineStateWithFunction failed: %s\n",
++            MP_ERR(ra, "metal: newComputePipelineStateWithDescriptor failed: %s\n",
 +                   cpo_err.localizedDescription
 +                       ? cpo_err.localizedDescription.UTF8String
 +                       : "unknown error");
 +            goto fail;
 +        }
++        if (barchive)
++            [barchive addComputePipelineFunctionsWithDescriptor:cd error:nil];
 +        pass_metal->library = comp.library;
 +
 +        /* Pull the GLSL `layout(local_size_x = N, local_size_y = M, ...) in`
