@@ -952,7 +952,7 @@
 +}
 --- a/video/out/metal/ra_metal_textures.m
 +++ b/video/out/metal/ra_metal_textures.m
-@@ -0,0 +1,802 @@
+@@ -0,0 +1,812 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Metal RA backend — textures, buffers, clear, blit.
@@ -1117,6 +1117,16 @@
 +static MTLStorageMode metal_texture_storage(const struct ra_tex_params *params)
 +{
 +    if (params->downloadable)
++        return MTLStorageModeShared;
++    /* 1D textures get uploaded via [MTLTexture replaceRegion:...] which
++     * requires CPU access. Some Apple GPUs (A19 Pro/iPhone 17 Pro) tolerate
++     * the call on Private storage via an internal copy, others (M1-class
++     * iPad Air) SIGABRT in mpv_render_context_render with `_validate-
++     * ReplaceRegion: CPU access for textures with MTLResourceStorageMode-
++     * Private storage mode is disallowed`. 1D textures in mpv are tiny
++     * LUTs — host-coherent storage has negligible cost and avoids the
++     * iPad-side crash. */
++    if (params->dimensions == 1)
 +        return MTLStorageModeShared;
 +    return MTLStorageModePrivate;
 +}
