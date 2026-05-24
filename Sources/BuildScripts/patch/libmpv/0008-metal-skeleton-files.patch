@@ -299,7 +299,7 @@
 +};
 --- a/video/out/metal/ra_metal.h
 +++ b/video/out/metal/ra_metal.h
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,178 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Internal header for the Apple Metal backend of mpv's render abstraction.
@@ -334,6 +334,16 @@
 +                                      id<MTLTexture> texture,
 +                                      int w, int h,
 +                                      id<MTLCommandBuffer> command_buffer);
++
++/**
++ * Wrap an externally-owned MTLTexture (= z.B. CVMetalTextureCache-erzeugt
++ * von VideoToolbox hwdec) als sample-able ra_tex. Caller retains ownership
++ * der underlying texture; ra_metal kopiert nur den Pointer.
++ */
++struct ra_tex *ra_metal_wrap_external_texture(struct ra_ctx *ctx,
++                                              id<MTLTexture> texture,
++                                              const struct ra_format *fmt,
++                                              int w, int h);
 +
 +/**
 + * Commit the current frame's command buffer. If `display_synced` is true,
@@ -549,7 +559,7 @@
 +};
 --- a/video/out/metal/ra_metal_init.m
 +++ b/video/out/metal/ra_metal_init.m
-@@ -0,0 +1,583 @@
+@@ -0,0 +1,610 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Metal RA backend -- init, lifecycle, and pixel formats.
@@ -1051,6 +1061,33 @@
 +        .blit_dst   = true,
 +    };
 +
++    struct ra_tex_metal *tm = talloc_zero(tex, struct ra_tex_metal);
++    tm->texture    = texture;
++    tm->is_wrapped = true;
++    tex->priv      = tm;
++    return tex;
++}
++
++/* Wrap externally-owned MTLTexture (= CVMetalTextureCache von hwdec_vt_metal)
++ * als sampleable ra_tex. Im Unterschied zu ra_metal_wrap_drawable: dies hier
++ * setzt render_src+blit_src statt render_dst, weil die Texture im Shader
++ * gesampled wird (= YUV-plane), nicht als render-target dient. fmt kommt vom
++ * mpv ra_format-system (= r8/rg8/r16/rg16 für YUV planes). */
++struct ra_tex *ra_metal_wrap_external_texture(struct ra_ctx *ctx,
++                                              id<MTLTexture> texture,
++                                              const struct ra_format *fmt,
++                                              int w, int h)
++{
++    if (!ctx || !ctx->ra || !texture || !fmt) return NULL;
++    struct ra_tex *tex = talloc_zero(ctx->ra, struct ra_tex);
++    tex->params = (struct ra_tex_params){
++        .dimensions = 2,
++        .w = w, .h = h, .d = 1,
++        .format     = fmt,
++        .render_src = true,
++        .src_linear = true,
++        .blit_src   = true,
++    };
 +    struct ra_tex_metal *tm = talloc_zero(tex, struct ra_tex_metal);
 +    tm->texture    = texture;
 +    tm->is_wrapped = true;

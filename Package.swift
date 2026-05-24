@@ -253,38 +253,38 @@ let package = Package(
 
         .binaryTarget(
             name: "Libavcodec",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-master-n8.1-ios-metal.39/Libavcodec.xcframework.zip",
-            checksum: "f52b80ca30f23ad8259fbfdf677eb4b7b72aeeb4d8ab50ccd0645c2da1dda46f"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-master-n8.1-ios-metal.40/Libavcodec.xcframework.zip",
+            checksum: "18f6b54b5b44209f947355089540a85f2e9226113b61365a828794ac464079b2"
         ),
         .binaryTarget(
             name: "Libavdevice",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-master-n8.1-ios-metal.39/Libavdevice.xcframework.zip",
-            checksum: "90ef6ae67645e69b001aa1f25fbee830e392a3923b728a25bd5fb2dfc36b761c"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-master-n8.1-ios-metal.40/Libavdevice.xcframework.zip",
+            checksum: "ed1a8f9e25d00f421170e4fd98839c2491446fd30c948481e2c8f53af1bfb243"
         ),
         .binaryTarget(
             name: "Libavformat",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-master-n8.1-ios-metal.39/Libavformat.xcframework.zip",
-            checksum: "31261cdae1ebd58c8d593b07b42c9f0fdaf1d90c499dc8b2d83fb1adf66ef061"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-master-n8.1-ios-metal.40/Libavformat.xcframework.zip",
+            checksum: "56eff22f1db5e65582d95821031f9d8afd808939859262517d089d316080166f"
         ),
         .binaryTarget(
             name: "Libavfilter",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-master-n8.1-ios-metal.39/Libavfilter.xcframework.zip",
-            checksum: "0cb11cd32fc7822cf12aad81c7214382368c85bcadbd379ca598284e4d001966"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-master-n8.1-ios-metal.40/Libavfilter.xcframework.zip",
+            checksum: "d0203856daa4df289db295eaf98044b3b8a63d43fc92d417f2fb315150fe283d"
         ),
         .binaryTarget(
             name: "Libavutil",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-master-n8.1-ios-metal.39/Libavutil.xcframework.zip",
-            checksum: "86454d214f85617d24fb0b8486a93c4d0b43f3a79f2ce063c60ffce2ff1990cb"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-master-n8.1-ios-metal.40/Libavutil.xcframework.zip",
+            checksum: "e5b564385af38ac1a61d90e928775ef660b980989c768e841130573d90b65b15"
         ),
         .binaryTarget(
             name: "Libswresample",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-master-n8.1-ios-metal.39/Libswresample.xcframework.zip",
-            checksum: "727cb452a7850075b451b343435c21ba1beedb65ace055a7b8b7a059a48b0e2d"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-master-n8.1-ios-metal.40/Libswresample.xcframework.zip",
+            checksum: "431ec364961a82a2240389263d278567eee8e6c1cbfc41674191b00d2bb40477"
         ),
         .binaryTarget(
             name: "Libswscale",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-master-n8.1-ios-metal.39/Libswscale.xcframework.zip",
-            checksum: "47bf945bbbfa4fe1c74173af6f9562711ac572e9cfb594f7d68869a99be58d83"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-master-n8.1-ios-metal.40/Libswscale.xcframework.zip",
+            checksum: "958b4420e71af80523ab53c0a783cd99b09f0ce9de0bdeccfd01f1cde258cf20"
         ),
 
         .binaryTarget(
@@ -301,8 +301,8 @@ let package = Package(
 
         .binaryTarget(
             name: "Libmpv",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-master-n8.1-ios-metal.39/Libmpv.xcframework.zip",
-            checksum: "3f14124ab1afdf5dd03f36ebdba8a4ead291893b3907c91c28c5aabb7b97402e"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-master-n8.1-ios-metal.40/Libmpv.xcframework.zip",
+            checksum: "67f6788af3fc0d3fc02c9ec0333c6020013cd953859fc0a6d2397cd3716247d4"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
