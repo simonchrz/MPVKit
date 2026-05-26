@@ -514,7 +514,7 @@
 +#endif
 --- a/video/out/metal/ra_metal.m
 +++ b/video/out/metal/ra_metal.m
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,211 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Master file for mpv's Apple Metal RA backend. Defines the public
@@ -557,6 +557,7 @@
 + * von ra_metal_renderpass.m gerufen. */
 +extern void metal_save_pso_sidecar(NSArray *entries);
 +void        metal_kick_pso_sidecar_save(void *sidecar_bridge);
++void        metal_log_cache_key(const char *status, NSString *cache_key, const char *vsh);
 +
 +/* ---------------------------------------------------------------------
 + * PSO-Sidecar resilient save
@@ -625,6 +626,44 @@
 +     * async-save kickt aber iOS den Prozess suspended bevor der dispatch-
 +     * Block läuft. */
 +    metal_save_pso_sidecar(snapshot);
++}
++
++/* ---------------------------------------------------------------------
++ * Cache-Key-Logging (ios-metal.44)
++ * Diagnose-Logging um zu prüfen ob cache_keys cross-session stabil sind.
++ * Hypothese: shader-text enthält session-varying-content (timestamps,
++ * pointer-hashes), wodurch cache_keys aus voriger Session nie matchen.
++ * Schreibt nach Documents/MPVKit-cache-keys.log (append).
++ * --------------------------------------------------------------------- */
++#include <time.h>
++static FILE         *g_cache_key_log_fp = NULL;
++static dispatch_once_t g_cache_key_log_once;
++
++static void metal_cache_key_log_init(void)
++{
++    NSArray *paths = NSSearchPathForDirectoriesInDomains(
++        NSDocumentDirectory, NSUserDomainMask, YES);
++    if (!paths.count) return;
++    NSString *path = [paths[0] stringByAppendingPathComponent:@"MPVKit-cache-keys.log"];
++    g_cache_key_log_fp = fopen(path.UTF8String, "a");
++    if (g_cache_key_log_fp) {
++        fprintf(g_cache_key_log_fp, "=== mpv-launch pid=%d ===\n", getpid());
++        fflush(g_cache_key_log_fp);
++    }
++}
++
++void metal_log_cache_key(const char *status, NSString *cache_key, const char *vsh)
++{
++    dispatch_once(&g_cache_key_log_once, ^{ metal_cache_key_log_init(); });
++    if (!g_cache_key_log_fp) return;
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    double t = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
++    fprintf(g_cache_key_log_fp, "%.3f %s key=\"%s\" vsh_first80=\"%.80s\"\n",
++        t, status,
++        cache_key.UTF8String ? cache_key.UTF8String : "",
++        vsh ? vsh : "");
++    fflush(g_cache_key_log_fp);
 +}
 +
 +/* Prototypes for the non-static functions defined in the three chunks. */
@@ -2117,7 +2156,7 @@
 +}
 --- a/video/out/metal/ra_metal_renderpass.m
 +++ b/video/out/metal/ra_metal_renderpass.m
-@@ -0,0 +1,1385 @@
+@@ -0,0 +1,1390 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Apple Metal backend for mpv's render abstraction (ra). Parallel to
@@ -2150,6 +2189,9 @@
 +
 +/* PSO-Sidecar resilient-save kick (Definition in ra_metal.m). */
 +extern void metal_kick_pso_sidecar_save(void *sidecar_bridge);
++
++/* Cache-Key-Logging (Definition in ra_metal.m). */
++extern void metal_log_cache_key(const char *status, NSString *cache_key, const char *vsh);
 +
 +/* spirv_conf was used by an earlier (broken) acquisition path. We now use
 + * ctx->spirv (populated by spirv_compiler_init in ra_init_metal). The decl
@@ -2801,6 +2843,8 @@
 +
 +    atomic_fetch_add(&mpv_metal_pso_lookups, 1);
 +    MetalPassCacheEntry *cached = [pipeline_cache objectForKey:cache_key];
++    metal_log_cache_key(cached ? "hit" : "miss", cache_key,
++        params->vertex_shader ? params->vertex_shader : "");
 +    if (cached) {
 +        atomic_fetch_add(&mpv_metal_pso_hits, 1);
 +        pass = talloc_zero(NULL, struct ra_renderpass);
