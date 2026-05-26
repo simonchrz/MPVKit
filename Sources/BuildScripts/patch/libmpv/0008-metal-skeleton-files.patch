@@ -1191,7 +1191,7 @@
 +    .renderable     = true,
 +};
 +
-+static const struct ra_format drawable_dummy_ra_format = {
++const struct ra_format drawable_dummy_ra_format = {
 +    .name           = "unknown_drawable",
 +    .priv           = (void *)&drawable_dummy_metal_format,
 +    .ctype          = RA_CTYPE_UNORM,
@@ -2156,7 +2156,7 @@
 +}
 --- a/video/out/metal/ra_metal_renderpass.m
 +++ b/video/out/metal/ra_metal_renderpass.m
-@@ -0,0 +1,1390 @@
+@@ -0,0 +1,1409 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Apple Metal backend for mpv's render abstraction (ra). Parallel to
@@ -2192,6 +2192,11 @@
 +
 +/* Cache-Key-Logging (Definition in ra_metal.m). */
 +extern void metal_log_cache_key(const char *status, NSString *cache_key, const char *vsh);
++
++/* Drawable's synthetic ra_format (Definition in ra_metal_init.m).
++ * Wird im Warmup-Replay als target_format gesetzt wenn der Sidecar-Entry
++ * "unknown_drawable" als format-Namen hat. */
++extern const struct ra_format drawable_dummy_ra_format;
 +
 +/* spirv_conf was used by an earlier (broken) acquisition path. We now use
 + * ctx->spirv (populated by spirv_compiler_init in ra_init_metal). The decl
@@ -2310,12 +2315,26 @@
 +            NSString *fmt_name = e[@"target_format"];
 +            if (fmt_name.length > 0) {
 +                /* ra->formats wurde in ra_init_metal aus metal_formats[]
-+                 * populated. Lookup by name. */
-+                for (int i = 0; i < ra->num_formats; i++) {
-+                    if (ra->formats[i] && ra->formats[i]->name &&
-+                        strcmp(ra->formats[i]->name, fmt_name.UTF8String) == 0) {
-+                        p.target_format = ra->formats[i];
-+                        break;
++                 * populated. Lookup by name.
++                 *
++                 * Special case: "unknown_drawable" ist der synthetic
++                 * format der zur Laufzeit dem CAMetalDrawable als
++                 * ra_format pinned wird (drawable_dummy_ra_format) und
++                 * NICHT in ra->formats[] registriert ist. Ohne Special-
++                 * Case findet die Lookup-Loop ihn nicht → p.target_format
++                 * bleibt NULL → metal_renderpass_create returnt NULL →
++                 * warmup verfehlt genau die PSOs die für den Drawable
++                 * gebraucht werden (= jeder pass der direkt ins
++                 * Backbuffer rendert). */
++                if (strcmp(fmt_name.UTF8String, "unknown_drawable") == 0) {
++                    p.target_format = &drawable_dummy_ra_format;
++                } else {
++                    for (int i = 0; i < ra->num_formats; i++) {
++                        if (ra->formats[i] && ra->formats[i]->name &&
++                            strcmp(ra->formats[i]->name, fmt_name.UTF8String) == 0) {
++                            p.target_format = ra->formats[i];
++                            break;
++                        }
 +                    }
 +                }
 +            }
