@@ -1,6 +1,6 @@
 --- a/include/mpv/render_mtl.h
 +++ b/include/mpv/render_mtl.h
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,161 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Permission to use, copy, modify, and/or distribute this software for any
@@ -146,6 +146,16 @@
 + * `out` darf nicht NULL sein.
 + */
 +void mpv_metal_pso_stats_get(mpv_metal_pso_stats *out);
++
++/**
++ * Force-flush den PSO-Sidecar auf disk (synchron). Aufrufen aus
++ * `applicationWillResignActive` / Scene-background-Handler, weil iOS
++ * Force-Quit / OS-Kill den graceful-shutdown-Pfad in ra_metal_destroy
++ * umgeht — und der async-debounced-save kann im suspended Process
++ * stuck bleiben. Cheap (<10ms für ~30 sidecar-entries). No-op wenn
++ * noch keine Metal-RA-Instanz aktiv war.
++ */
++void mpv_metal_pso_sidecar_flush(void);
 +
 +#ifdef __cplusplus
 +}
@@ -504,7 +514,7 @@
 +#endif
 --- a/video/out/metal/ra_metal.m
 +++ b/video/out/metal/ra_metal.m
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,172 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Master file for mpv's Apple Metal RA backend. Defines the public
@@ -540,6 +550,81 @@
 +    out->lookups        = atomic_load(&mpv_metal_pso_lookups);
 +    out->hits           = atomic_load(&mpv_metal_pso_hits);
 +    out->warmup_replays = atomic_load(&mpv_metal_pso_warmup_replays);
++}
++
++/* Forward-decls für die Sidecar-Save-Helpers. metal_save_pso_sidecar
++ * ist in ra_metal_init.m definiert; metal_kick_pso_sidecar_save wird
++ * von ra_metal_renderpass.m gerufen. */
++extern void metal_save_pso_sidecar(NSArray *entries);
++void        metal_kick_pso_sidecar_save(void *sidecar_bridge);
++
++/* ---------------------------------------------------------------------
++ * PSO-Sidecar resilient save
++ *
++ * Vorher (ios-metal.39): metal_save_pso_sidecar wurde nur in
++ * ra_metal_destroy_fns gerufen. iOS Force-Quit oder OS-Kill umgeht
++ * destroy → sidecar.plist auf disk veraltet, neue PSO-compiles aus
++ * der laufenden Session gehen verloren = nächste Session muss sie
++ * wieder neu kompilieren.
++ *
++ * Fix: async-debounced save nach jedem sidecar-addObject (kick),
++ * plus eine sync-Flush-API für die App (will-resign-active).
++ *
++ * Coalesce: ein pending-save reicht. Wenn währenddessen weitere
++ * Appends kommen, werden die beim selben Save-Block mitgenommen
++ * (NSArray-copy snapshot innerhalb der serial queue).
++ * --------------------------------------------------------------------- */
++static dispatch_queue_t metal_pso_sidecar_save_queue(void)
++{
++    static dispatch_queue_t q;
++    static dispatch_once_t once;
++    dispatch_once(&once, ^{
++        q = dispatch_queue_create("mpv.metal.pso-sidecar-save", DISPATCH_QUEUE_SERIAL);
++    });
++    return q;
++}
++
++static _Atomic uintptr_t g_active_pso_sidecar     = 0;
++static _Atomic int       g_pso_sidecar_save_pending = 0;
++
++void metal_kick_pso_sidecar_save(void *sidecar_bridge)
++{
++    if (!sidecar_bridge) return;
++    /* Aktiven Sidecar-Pointer für den Sync-Flush-Pfad merken. Wird vom
++     * sync-flush gelesen wenn die App applicationWillResignActive triggert. */
++    atomic_store(&g_active_pso_sidecar, (uintptr_t)sidecar_bridge);
++
++    /* Coalesce: wenn schon ein Save gequeued ist, kein weiteres. Das
++     * Snapshot innerhalb der serial queue nimmt eh den aktuellsten Stand. */
++    int expected = 0;
++    if (!atomic_compare_exchange_strong(&g_pso_sidecar_save_pending, &expected, 1))
++        return;
++
++    NSMutableArray *sidecar = (__bridge NSMutableArray *)sidecar_bridge;
++    dispatch_async(metal_pso_sidecar_save_queue(), ^{
++        atomic_store(&g_pso_sidecar_save_pending, 0);
++        NSArray *snapshot = nil;
++        @synchronized (sidecar) {
++            snapshot = [sidecar copy];
++        }
++        metal_save_pso_sidecar(snapshot);
++    });
++}
++
++void mpv_metal_pso_sidecar_flush(void)
++{
++    uintptr_t p = atomic_load(&g_active_pso_sidecar);
++    if (!p) return;
++    NSMutableArray *sidecar = (__bridge NSMutableArray *)(void *)p;
++    NSArray *snapshot = nil;
++    @synchronized (sidecar) {
++        snapshot = [sidecar copy];
++    }
++    /* Sync save — läuft auf caller's thread (typisch main während Scene-
++     * background). Cheap (<10ms für ~30 Entries) und vermeidet die Race wo
++     * async-save kickt aber iOS den Prozess suspended bevor der dispatch-
++     * Block läuft. */
++    metal_save_pso_sidecar(snapshot);
 +}
 +
 +/* Prototypes for the non-static functions defined in the three chunks. */
@@ -2032,7 +2117,7 @@
 +}
 --- a/video/out/metal/ra_metal_renderpass.m
 +++ b/video/out/metal/ra_metal_renderpass.m
-@@ -0,0 +1,1376 @@
+@@ -0,0 +1,1385 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Apple Metal backend for mpv's render abstraction (ra). Parallel to
@@ -2062,6 +2147,9 @@
 +extern _Atomic int64_t mpv_metal_pso_lookups;
 +extern _Atomic int64_t mpv_metal_pso_hits;
 +extern _Atomic int64_t mpv_metal_pso_warmup_replays;
++
++/* PSO-Sidecar resilient-save kick (Definition in ra_metal.m). */
++extern void metal_kick_pso_sidecar_save(void *sidecar_bridge);
 +
 +/* spirv_conf was used by an earlier (broken) acquisition path. We now use
 + * ctx->spirv (populated by spirv_compiler_init in ra_init_metal). The decl
@@ -2962,7 +3050,13 @@
 +                        break;
 +                    }
 +                }
-+                if (!already) [sidecar addObject:serialized];
++                if (!already) {
++                    [sidecar addObject:serialized];
++                    /* Async-debounced save — sonst geht der neue Entry bei
++                     * iOS Force-Quit / OS-Kill verloren weil destroy
++                     * umgangen wird. */
++                    metal_kick_pso_sidecar_save(m->pso_sidecar);
++                }
 +            }
 +        }
 +    }
