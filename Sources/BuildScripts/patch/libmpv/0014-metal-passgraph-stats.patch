@@ -1,0 +1,125 @@
+diff --git a/include/mpv/render_mtl.h b/include/mpv/render_mtl.h
+index e06153d..09c18a4 100644
+--- a/include/mpv/render_mtl.h
++++ b/include/mpv/render_mtl.h
+@@ -144,6 +144,33 @@ typedef struct mpv_metal_pso_stats {
+  */
+ void mpv_metal_pso_stats_get(mpv_metal_pso_stats *out);
+ 
++/**
++ * Renderpass-Graph-Statistics für externe Diagnostik. Counter werden
++ * atomic vom Metal-RA-Backend in metal_renderpass_run inkrementiert,
++ * pro ausgeführtem Pass. Anwendungsfall: messen wie viele der pro Frame
++ * dispatchten Passes über den Compute- vs Raster-Pfad laufen, und wie
++ * viele aufeinanderfolgende Raster-Passes dasselbe Render-Target treffen
++ * (= Merge-Kandidaten, die Load/Store-Bandbreite auf intermediate FBOs
++ * sparen würden). Siehe RA_CAP_PARALLEL_COMPUTE / Chroma-Merge-Pfad.
++ */
++typedef struct mpv_metal_passgraph_stats {
++    /* Total Anzahl ausgeführter renderpass_run-Calls (raster + compute). */
++    int64_t total_passes;
++    /* Davon über den Raster-(Fragment-)Pfad (renderCommandEncoder). */
++    int64_t raster_passes;
++    /* Davon über den Compute-Pfad (computeCommandEncoder). */
++    int64_t compute_passes;
++    /* Anzahl Raster-Passes deren Target == Target des direkt vorhergehenden
++     * Raster-Passes ist (consecutive same-FBO = potenziell mergebar). */
++    int64_t same_target_pairs;
++} mpv_metal_passgraph_stats;
++
++/**
++ * Snapshot der aktuellen Renderpass-Graph-Stats. Threadsafe via
++ * atomic-loads. `out` darf nicht NULL sein.
++ */
++void mpv_metal_passgraph_stats_get(mpv_metal_passgraph_stats *out);
++
+ /**
+  * Force-flush den PSO-Sidecar auf disk (synchron). Aufrufen aus
+  * `applicationWillResignActive` / Scene-background-Handler, weil iOS
+diff --git a/video/out/metal/ra_metal.m b/video/out/metal/ra_metal.m
+index 57d0c20..c07ee82 100644
+--- a/video/out/metal/ra_metal.m
++++ b/video/out/metal/ra_metal.m
+@@ -35,6 +35,26 @@ void mpv_metal_pso_stats_get(mpv_metal_pso_stats *out)
+     out->warmup_replays = atomic_load(&mpv_metal_pso_warmup_replays);
+ }
+ 
++/* ---------------------------------------------------------------------
++ * Renderpass-Graph-Statistics
++ * Process-globale atomic-Counter, inkrementiert von metal_renderpass_run
++ * (ra_metal_renderpass.m) pro ausgeführtem Pass. Single-writer (VO-Render-
++ * Thread), Multi-reader (App-Snapshot von beliebigem Thread) → atomic.
++ * --------------------------------------------------------------------- */
++_Atomic int64_t mpv_metal_pg_total       = 0;
++_Atomic int64_t mpv_metal_pg_raster      = 0;
++_Atomic int64_t mpv_metal_pg_compute     = 0;
++_Atomic int64_t mpv_metal_pg_same_target = 0;
++
++void mpv_metal_passgraph_stats_get(mpv_metal_passgraph_stats *out)
++{
++    if (!out) return;
++    out->total_passes      = atomic_load(&mpv_metal_pg_total);
++    out->raster_passes     = atomic_load(&mpv_metal_pg_raster);
++    out->compute_passes    = atomic_load(&mpv_metal_pg_compute);
++    out->same_target_pairs = atomic_load(&mpv_metal_pg_same_target);
++}
++
+ /* Forward-decls für die Sidecar-Save-Helpers. metal_save_pso_sidecar
+  * ist in ra_metal_init.m definiert; metal_kick_pso_sidecar_save wird
+  * von ra_metal_renderpass.m gerufen. */
+diff --git a/video/out/metal/ra_metal_renderpass.m b/video/out/metal/ra_metal_renderpass.m
+index f9ca0fb..94f21c3 100644
+--- a/video/out/metal/ra_metal_renderpass.m
++++ b/video/out/metal/ra_metal_renderpass.m
+@@ -28,6 +28,15 @@
+ extern _Atomic int64_t mpv_metal_pso_hits;
+ extern _Atomic int64_t mpv_metal_pso_warmup_replays;
+ 
++/* Renderpass-Graph-Stats Counter (Definition in ra_metal.m). */
++extern _Atomic int64_t mpv_metal_pg_total;
++extern _Atomic int64_t mpv_metal_pg_raster;
++extern _Atomic int64_t mpv_metal_pg_compute;
++extern _Atomic int64_t mpv_metal_pg_same_target;
++/* Letztes Raster-Target zum Erkennen consecutive same-FBO-Pairs. Nur vom
++ * Single-Writer VO-Render-Thread in metal_renderpass_run berührt. */
++static _Atomic uintptr_t mpv_metal_pg_last_target = 0;
++
+ /* PSO-Sidecar resilient-save kick (Definition in ra_metal.m). */
+ extern void metal_kick_pso_sidecar_save(void *sidecar_bridge);
+ 
+@@ -1058,6 +1067,8 @@ void metal_renderpass_run(struct ra *ra,
+         return;
+     }
+ 
++    atomic_fetch_add_explicit(&mpv_metal_pg_total, 1, memory_order_relaxed);
++
+     /*
+      * Collect loose-uniform inputs into a single std140 block. We sweep
+      * params->values once before issuing the encoder, since the same
+@@ -1091,6 +1102,18 @@ void metal_renderpass_run(struct ra *ra,
+ 
+     switch (pass->params.type) {
+     case RA_RENDERPASS_TYPE_RASTER: {
++        atomic_fetch_add_explicit(&mpv_metal_pg_raster, 1, memory_order_relaxed);
++        /* Consecutive same-FBO-Erkennung: Target des aktuellen Raster-Passes
++         * mit dem des vorherigen vergleichen. Pointer-Identität reicht — die
++         * ra_tex-Objekte der Scaler-Chain werden frame-über-frame wiederbenutzt;
++         * gezählt wird Adjazenz im globalen Pass-Stream (App sampelt Δ). */
++        uintptr_t tgt = (uintptr_t)params->target;
++        uintptr_t prev = atomic_exchange_explicit(&mpv_metal_pg_last_target, tgt,
++                                                   memory_order_relaxed);
++        if (prev == tgt)
++            atomic_fetch_add_explicit(&mpv_metal_pg_same_target, 1,
++                                      memory_order_relaxed);
++
+         MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor new];
+         id<MTLTexture> target_tex =
+             ((struct ra_tex_metal *)params->target->priv)->texture;
+@@ -1249,6 +1272,7 @@ void metal_renderpass_run(struct ra *ra,
+     }
+ 
+     case RA_RENDERPASS_TYPE_COMPUTE: {
++        atomic_fetch_add_explicit(&mpv_metal_pg_compute, 1, memory_order_relaxed);
+         id<MTLComputeCommandEncoder> cenc = [cb computeCommandEncoder];
+         [cenc setComputePipelineState:pm->compute_pso];
+ 
