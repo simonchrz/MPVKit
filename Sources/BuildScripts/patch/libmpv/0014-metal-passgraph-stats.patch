@@ -1,8 +1,8 @@
 diff --git a/include/mpv/render_mtl.h b/include/mpv/render_mtl.h
-index e06153d..09c18a4 100644
+index e06153d..d8f84f6 100644
 --- a/include/mpv/render_mtl.h
 +++ b/include/mpv/render_mtl.h
-@@ -144,6 +144,33 @@ typedef struct mpv_metal_pso_stats {
+@@ -144,6 +144,36 @@ typedef struct mpv_metal_pso_stats {
   */
  void mpv_metal_pso_stats_get(mpv_metal_pso_stats *out);
  
@@ -25,6 +25,9 @@ index e06153d..09c18a4 100644
 +    /* Anzahl Raster-Passes deren Target == Target des direkt vorhergehenden
 +     * Raster-Passes ist (consecutive same-FBO = potenziell mergebar). */
 +    int64_t same_target_pairs;
++    /* Anzahl gerenderter Frames (done_frame-Calls). Zur per-frame-Normierung:
++     * raster_passes - frames = interne raster→raster-Transitions. */
++    int64_t frames;
 +} mpv_metal_passgraph_stats;
 +
 +/**
@@ -36,11 +39,37 @@ index e06153d..09c18a4 100644
  /**
   * Force-flush den PSO-Sidecar auf disk (synchron). Aufrufen aus
   * `applicationWillResignActive` / Scene-background-Handler, weil iOS
+diff --git a/video/out/metal/libmpv_metal.m b/video/out/metal/libmpv_metal.m
+index 1df3beb..a3c6ed2 100644
+--- a/video/out/metal/libmpv_metal.m
++++ b/video/out/metal/libmpv_metal.m
+@@ -20,6 +20,12 @@
+ #include "video/out/gpu/libmpv_gpu.h"
+ #include "video/out/gpu/ra.h"
+ #include "video/out/libmpv.h"
++#include <stdatomic.h>
++
++/* Renderpass-Graph-Stats Frame-Counter (Definition in ra_metal.m). Pro
++ * done_frame (= ein committeter Frame) inkrementiert, damit die App die
++ * Pass-Counts per-frame normieren kann. */
++extern _Atomic int64_t mpv_metal_pg_frames;
+ 
+ // Forward declarations of the ra_metal helpers. These symbols live in
+ // ra_metal.m and resolve at link time; declaring them here keeps libmpv_metal.m
+@@ -138,6 +144,8 @@ static void done_frame(struct libmpv_gpu_context *ctx, bool ds)
+ {
+     struct priv *p = ctx->priv;
+ 
++    atomic_fetch_add_explicit(&mpv_metal_pg_frames, 1, memory_order_relaxed);
++
+     // Metal equivalent of ra_gl_ctx_submit_frame: commit the command buffer
+     // that ra_metal has been encoding into. Presentation (presentDrawable:) is
+     // the host app's job — we never own the CAMetalDrawable.
 diff --git a/video/out/metal/ra_metal.m b/video/out/metal/ra_metal.m
-index 57d0c20..c07ee82 100644
+index 57d0c20..d8b6fa4 100644
 --- a/video/out/metal/ra_metal.m
 +++ b/video/out/metal/ra_metal.m
-@@ -35,6 +35,26 @@ void mpv_metal_pso_stats_get(mpv_metal_pso_stats *out)
+@@ -35,6 +35,28 @@ void mpv_metal_pso_stats_get(mpv_metal_pso_stats *out)
      out->warmup_replays = atomic_load(&mpv_metal_pso_warmup_replays);
  }
  
@@ -54,6 +83,7 @@ index 57d0c20..c07ee82 100644
 +_Atomic int64_t mpv_metal_pg_raster      = 0;
 +_Atomic int64_t mpv_metal_pg_compute     = 0;
 +_Atomic int64_t mpv_metal_pg_same_target = 0;
++_Atomic int64_t mpv_metal_pg_frames      = 0;
 +
 +void mpv_metal_passgraph_stats_get(mpv_metal_passgraph_stats *out)
 +{
@@ -62,6 +92,7 @@ index 57d0c20..c07ee82 100644
 +    out->raster_passes     = atomic_load(&mpv_metal_pg_raster);
 +    out->compute_passes    = atomic_load(&mpv_metal_pg_compute);
 +    out->same_target_pairs = atomic_load(&mpv_metal_pg_same_target);
++    out->frames            = atomic_load(&mpv_metal_pg_frames);
 +}
 +
  /* Forward-decls für die Sidecar-Save-Helpers. metal_save_pso_sidecar
