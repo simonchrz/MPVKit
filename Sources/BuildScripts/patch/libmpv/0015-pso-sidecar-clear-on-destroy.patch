@@ -1,0 +1,65 @@
+diff --git a/video/out/metal/ra_metal.m b/video/out/metal/ra_metal.m
+index f6b87fe..09f73dc 100644
+--- a/video/out/metal/ra_metal.m
++++ b/video/out/metal/ra_metal.m
+@@ -62,6 +62,7 @@ void mpv_metal_passgraph_stats_get(mpv_metal_passgraph_stats *out)
+  * von ra_metal_renderpass.m gerufen. */
+ extern void metal_save_pso_sidecar(NSArray *entries);
+ void        metal_kick_pso_sidecar_save(void *sidecar_bridge);
++void        metal_clear_pso_sidecar_if(void *sidecar_bridge);
+ void        metal_log_cache_key(const char *status, NSString *cache_key, const char *vsh);
+ 
+ /* ---------------------------------------------------------------------
+@@ -107,6 +108,11 @@ void metal_kick_pso_sidecar_save(void *sidecar_bridge)
+         return;
+ 
+     NSMutableArray *sidecar = (__bridge NSMutableArray *)sidecar_bridge;
++    /* Non-ARC: der Block captured `sidecar` ohne retain. Würde die Metal-
++     * Instanz zwischen kick und Block-Lauf zerstört (ra_metal_destroy_fns
++     * CFRelease't das Array), dereft das @synchronized/copy freed memory.
++     * Explicit retain hier + release am Block-Ende hält es am Leben. */
++    [sidecar retain];
+     dispatch_async(metal_pso_sidecar_save_queue(), ^{
+         atomic_store(&g_pso_sidecar_save_pending, 0);
+         NSArray *snapshot = nil;
+@@ -114,9 +120,22 @@ void metal_kick_pso_sidecar_save(void *sidecar_bridge)
+             snapshot = [sidecar copy];
+         }
+         metal_save_pso_sidecar(snapshot);
++        [sidecar release];
+     });
+ }
+ 
++/* Clear den prozess-globalen Sync-Flush-Pointer wenn er auf GENAU dieses
++ * Sidecar-Array zeigt. Aufgerufen aus ra_metal_destroy_fns BEVOR das Array
++ * freigegeben wird → mpv_metal_pso_sidecar_flush() dereft danach nie mehr
++ * freed memory (UAF, Crashreport 235468D2). CAS statt blindem store damit
++ * ein parallel anderer aktiver Player den Global nicht fälschlich nullt. */
++void metal_clear_pso_sidecar_if(void *sidecar_bridge)
++{
++    if (!sidecar_bridge) return;
++    uintptr_t expected = (uintptr_t)sidecar_bridge;
++    atomic_compare_exchange_strong(&g_active_pso_sidecar, &expected, 0);
++}
++
+ void mpv_metal_pso_sidecar_flush(void)
+ {
+     uintptr_t p = atomic_load(&g_active_pso_sidecar);
+diff --git a/video/out/metal/ra_metal_init.m b/video/out/metal/ra_metal_init.m
+index a60b435..fb7b053 100644
+--- a/video/out/metal/ra_metal_init.m
++++ b/video/out/metal/ra_metal_init.m
+@@ -715,6 +715,13 @@ void ra_metal_destroy_fns(struct ra *ra)
+             archive = nil;
+         }
+         if (p->pso_sidecar) {
++            /* Den prozess-globalen Sync-Flush-Pointer (g_active_pso_sidecar
++             * in ra_metal.m) clearen BEVOR das Array freigegeben wird —
++             * sonst dereft mpv_metal_pso_sidecar_flush() nach dieser
++             * Zerstörung freed memory (UAF, Crashreport 235468D2). CAS nur
++             * wenn er auf GENAU dieses Array zeigt. */
++            extern void metal_clear_pso_sidecar_if(void *sidecar_bridge);
++            metal_clear_pso_sidecar_if(p->pso_sidecar);
+             /* Non-ARC: __bridge_transfer wäre no-op. Explicit dance:
+              * read pointer, save, CFRelease balancen das CFRetain im init. */
+             NSMutableArray *sidecar =
