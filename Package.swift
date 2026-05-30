@@ -242,8 +242,8 @@ let package = Package(
         .binaryTarget(
             name: "Libplacebo",
             // Our Metal-backend fork build (was the 7.360 prebuilt, no Metal).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.2/Libplacebo.xcframework.zip",
-            checksum: "a8c01bd98fc2b290bbb62d345cd0940e6fa4fd73a32c20ce6304d3930780fe03"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.3/Libplacebo.xcframework.zip",
+            checksum: "7794c826212e8bb9125900670644cd27dc6aad728991da6948f4cf1d57a26e34"
         ),
 
         .binaryTarget(
