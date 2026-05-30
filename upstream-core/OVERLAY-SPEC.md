@@ -30,11 +30,14 @@ renderpass.m ~843-853, 1112) BLEIBT Kern — nur Telemetrie/Persistenz/Diagnosti
 - 717-731: destroy — `metal_clear_pso_sidecar_if` + `metal_save_pso_sidecar` + CFRelease(pso_sidecar)
 - **BLEIBT:** RA-Init/Destroy-Kern (device/queue/formats/binary_archive ist separat zu prüfen — MTLBinaryArchive ist evtl. auch Overlay/Optional)
 
-## ra_metal_textures.m — entfernen
-- 28-47: tex-upload-Dump-Helper (fopen/vfprintf nach NSCachesDir)
-- 317, 364: Dump-Calls im blit/commit-Pfad
-- 529-561: sample-rate-limited Dump in tex_upload
-- **BLEIBT:** tex_create/upload/download/buf_*/clear/blit + `metal_blit_pso` (Format-Convert, Kern)
+## ra_metal_textures.m — entfernen (⚠ STRUKTURELL VERWOBEN, kein Block-Delete)
+- 28-50: tex-upload-Dump-Helper (`metal_tx_log_file` + `metal_tx_logf`)
+- 293-295: `readback_n` + `use_separate_cb`-Decl (`rb_n<6 && dimensions==2 && ...`)
+- **297-301: cb-SELECTION un-weaven** → `if(use_separate_cb){cb=[queue commandBuffer]}else{cb=ra_metal_cmd_buf(ra)}` ersetzen durch nur `id<MTLCommandBuffer> cb = ra_metal_cmd_buf(ra);` (else-Zweig = Kern-Pfad).
+- 314-384: `if(use_separate_cb){...return true;}` Readback-Diag-Block (mit early-return!) löschen.
+- 534-561: `should_dump`-Block + `call_count`-Decl in tex_upload.
+- **BLEIBT:** tex_create/upload/download/buf_*/clear/blit + `metal_blit_pso`, der Upload-Blit (302-311) + Pool-Return-Handler (386-395) sind KERN.
+- **Lektion:** die Diag ist NICHT additiv — sie hijackt die cb-Auswahl. Hand-Edit mit Flow-Verständnis nötig, kein sed/awk.
 
 ## ra_metal.h (struct ra_metal) — Overlay-Felder prüfen+extrahieren
 - `pso_sidecar`, `warmup_group`, `warmup_cancel`, passgraph-pass-list → Overlay-Felder.
