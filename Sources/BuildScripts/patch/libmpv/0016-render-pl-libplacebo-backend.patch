@@ -9,10 +9,10 @@ index 02efefb..f64c418 100644
 +extern const struct render_backend_fns render_backend_pl;
 diff --git a/video/out/render_pl.c b/video/out/render_pl.c
 new file mode 100644
-index 0000000..ca75aca
+index 0000000..18c5276
 --- /dev/null
 +++ b/video/out/render_pl.c
-@@ -0,0 +1,348 @@
+@@ -0,0 +1,401 @@
 +/*
 + * libmpv render-API backend driven by libplacebo (pl_renderer) instead of the
 + * mpv `ra` abstraction. This is the future-proofing path: mpv is deprecating
@@ -39,7 +39,11 @@ index 0000000..ca75aca
 +#include <libplacebo/renderer.h>
 +#include <libplacebo/metal.h>
 +#include <libplacebo/swapchain.h>
++#include <libplacebo/cache.h>
 +#include <libplacebo/utils/frame_queue.h>
++
++#include <stdio.h>
++#include <limits.h>
 +
 +#define PL_LIBAV_IMPLEMENTATION 1
 +#include <libplacebo/utils/libav.h>
@@ -54,6 +58,7 @@ index 0000000..ca75aca
 +    pl_metal metal;          // owns the MTLDevice/queue wrapper
 +    pl_gpu gpu;              // == metal->gpu
 +    pl_renderer rr;
++    pl_cache cache;          // persisted GLSL->MSL transpile cache (disk-backed)
 +
 +    struct mp_image_params img_params;
 +    struct mp_rect src, dst;
@@ -119,6 +124,18 @@ index 0000000..ca75aca
 +    talloc_free(fr);
 +}
 +
++// Disk path for the shader cache: the app sandbox's Library/Caches (purgeable
++// by iOS under pressure, persistent across launches otherwise). Returns false
++// if HOME is unset or the path doesn't fit.
++static bool pl_cache_file_path(char *buf, size_t size)
++{
++    const char *home = getenv("HOME");
++    if (!home)
++        return false;
++    int n = snprintf(buf, size, "%s/Library/Caches/render_pl_msl.cache", home);
++    return n > 0 && (size_t) n < size;
++}
++
 +static int pl_init(struct render_backend *ctx, mpv_render_param *params)
 +{
 +    // Opt-in gate. render_backend_pl is registered before render_backend_gpu
@@ -158,6 +175,27 @@ index 0000000..ca75aca
 +        return MPV_ERROR_GENERIC;
 +    }
 +    p->gpu = p->metal->gpu;
++
++    // Persisted shader cache: the Metal backend stores each pass's transpiled
++    // MSL here (keyed by GLSL hash), so a warm cache loaded from disk lets the
++    // first frame after a cold start skip the ~full-renderer shader transpile
++    // (otherwise several seconds of black). Attach before the renderer compiles
++    // anything (passes are built lazily on first render).
++    p->cache = pl_cache_create(pl_cache_params(
++        .log            = p->pllog,
++        .max_total_size = 16 << 20,   // 16 MiB — comfortably covers the graph
++    ));
++    if (p->cache) {
++        char path[PATH_MAX];
++        if (pl_cache_file_path(path, sizeof(path))) {
++            FILE *f = fopen(path, "rb");
++            if (f) {
++                pl_cache_load_file(p->cache, f);
++                fclose(f);
++            }
++        }
++        pl_gpu_set_cache(p->gpu, p->cache);
++    }
 +
 +    p->rr = pl_renderer_create(p->pllog, p->gpu);
 +    if (!p->rr)
@@ -345,6 +383,21 @@ index 0000000..ca75aca
 +    // the AVFrames + mp_image refs) and the plane textures it owns.
 +    pl_queue_destroy(&p->queue);
 +    pl_renderer_destroy(&p->rr);
++    // Flush the (now warm) shader cache back to disk, then detach it from the
++    // gpu before the gpu itself is destroyed.
++    if (p->cache) {
++        char path[PATH_MAX];
++        if (pl_cache_file_path(path, sizeof(path))) {
++            FILE *f = fopen(path, "wb");
++            if (f) {
++                pl_cache_save_file(p->cache, f);
++                fclose(f);
++            }
++        }
++        if (p->gpu)
++            pl_gpu_set_cache(p->gpu, NULL);
++        pl_cache_destroy(&p->cache);
++    }
 +    pl_metal_destroy(&p->metal);
 +    // p->pllog is a talloc child of p; freed with ctx->priv.
 +}
