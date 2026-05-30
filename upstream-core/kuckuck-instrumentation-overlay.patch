@@ -67,6 +67,39 @@
  #ifdef __cplusplus
  }
  #endif
+--- a/video/out/metal/ra_metal.h
++++ b/video/out/metal/ra_metal.h
+@@ -114,6 +114,7 @@
+      * ist wenn der User das erste Video tappt. Sidecar = NSMutableArray
+      * von NSDictionary-Entries (serialisierte ra_renderpass_params),
+      * disk-persisted als plist in NSCachesDirectory. */
++    void *pso_sidecar;
+     /* Synchronisation für PSO-warmup-thread. dispatch_async im
+      * metal_kick_pso_warmup captured nur einen raw ra-pointer; wenn
+      * destroy fired bevor warmup fertig ist, hat der background-thread
+@@ -122,6 +123,8 @@
+      * heap-stelle. warmup_group trackt die laufende background-work,
+      * warmup_cancel signalisiert dem worker früh aufzuhören. Destroy
+      * setzt cancel, wartet auf group, dann erst Cleanup. */
++    void *warmup_group;        /* dispatch_group_t, CF-bridged */
++    volatile int warmup_cancel; /* 0 = run, 1 = bail out asap */
+     /* Lazily-built shader+PSO for format-converting blit (used by
+      * metal_blit when src/dst formats differ — pause path goes through
+      * this when mpv blits its OSD-composited frame to the drawable in a
+@@ -148,10 +151,13 @@
+      * tile-shading-merge-Kandidaten). Ring-size 32 deckt selbst worst-
+      * case (HDR + error-diffusion = ~11 passes) komfortabel. Falls
+      * überschritten → einfach beim 32. abbrechen, der Win wäre eh marginal. */
++    int pg_count;
++    bool pg_is_compute[32];
+     /* __unsafe_unretained: ARC darf hier nicht retain'en weil's ein C-array
+      * in einer talloc-allocated C-struct ist. Wir halten den pointer nur
+      * für die Dauer eines frames; lifetime managed vom caller (mpv core
+      * + ra_tex). */
++    __unsafe_unretained id<MTLTexture> pg_targets[32];
+ };
+ 
+ struct ra_tex_metal {
 --- a/video/out/metal/ra_metal.m
 +++ b/video/out/metal/ra_metal.m
 @@ -2,13 +2,194 @@
@@ -446,7 +479,7 @@
       *   MTLRenderPassDescriptor loadAction=DontCare on the next pass.
 --- a/video/out/metal/ra_metal_renderpass.m
 +++ b/video/out/metal/ra_metal_renderpass.m
-@@ -26,6 +26,61 @@
+@@ -26,18 +26,153 @@
  #include <stdio.h>
  #include <CommonCrypto/CommonDigest.h>
  
@@ -508,7 +541,15 @@
  
  /* PSO-Cache-Stats Counter (Definition in ra_metal.m). */
  extern _Atomic int64_t mpv_metal_pso_lookups;
-@@ -41,8 +96,83 @@
+ extern _Atomic int64_t mpv_metal_pso_hits;
++extern _Atomic int64_t mpv_metal_pso_warmup_replays;
++extern _Atomic int64_t mpv_metal_pg_total;
++extern _Atomic int64_t mpv_metal_pg_raster;
++extern _Atomic int64_t mpv_metal_pg_compute;
+ 
+ /* PSO-Sidecar resilient-save kick (Definition in ra_metal.m). */
++extern void metal_kick_pso_sidecar_save(void *sidecar_bridge);
+ 
  /* Cache-Key-Logging (Definition in ra_metal.m). */
  extern void metal_log_cache_key(const char *status, NSString *cache_key, const char *vsh);
  
@@ -592,10 +633,11 @@
  /* Drawable's synthetic ra_format (Definition in ra_metal_init.m).
   * Wird im Warmup-Replay als target_format gesetzt wenn der Sidecar-Entry
   * "unknown_drawable" als format-Namen hat. */
-@@ -52,6 +182,185 @@
+@@ -46,8 +181,187 @@
+ /* spirv_conf was used by an earlier (broken) acquisition path. We now use
   * ctx->spirv (populated by spirv_compiler_init in ra_init_metal). The decl
   * stays here only because removing it cascades through include changes. */
- 
++
 +/* ============================================================ */
 +/* PSO-Sidecar Serialize / Deserialize / Warmup-Replay           */
 +/* ============================================================ */
@@ -631,7 +673,7 @@
 +    d[@"blend_dst_alpha"] = @((int)p->blend_dst_alpha);
 +    d[@"push_constants_size"] = @((NSInteger)p->push_constants_size);
 +    d[@"vertex_stride"]       = @(p->vertex_stride);
-+
+ 
 +    NSMutableArray *inputs = [NSMutableArray array];
 +    for (int i = 0; i < p->num_inputs; i++) {
 +        const struct ra_renderpass_input *in = &p->inputs[i];
@@ -645,7 +687,7 @@
 +        }];
 +    }
 +    d[@"inputs"] = inputs;
-+
+ 
 +    NSMutableArray *vattribs = [NSMutableArray array];
 +    for (int i = 0; i < p->num_vertex_attribs; i++) {
 +        const struct ra_renderpass_input *va = &p->vertex_attribs[i];
@@ -775,10 +817,11 @@
 +        }
 +    }
 +}
- 
++
  /* ============================================================ */
  
-@@ -410,6 +719,7 @@
+ /* Pipeline cache value object. We retain the MTLLibrary because it's the
+@@ -405,6 +719,7 @@
      }
  
      /* Shader-dump diagnostic (ios-metal.50). */
@@ -786,7 +829,7 @@
  
      /* MSL -> MTLLibrary. */
      NSString *src = [NSString stringWithUTF8String:stage->msl];
-@@ -539,9 +849,40 @@
+@@ -534,9 +849,40 @@
      [cache_key_buf appendFormat:@"B|%d|", params->enable_blend];
      NSString *cache_key = [cache_key_buf copy];
  
@@ -794,7 +837,7 @@
      MetalPassCacheEntry *cached = [pipeline_cache objectForKey:cache_key];
 +    metal_log_cache_key(cached ? "hit" : "miss", cache_key,
 +        params->vertex_shader ? params->vertex_shader : "");
-+
+ 
 +    /* ----- Runtime-instrumentation (ios-metal.52) ----- */
 +    char vbuf[17], fbuf[17], cbuf[17];
 +    const char *vsh_hash = metal_rp_glsl_hash_buf(params->vertex_shader, vbuf);
@@ -821,13 +864,13 @@
 +    }
 +    metal_rp_logf("  vertex_stride=%zu cached=%s\n",
 +        (size_t)params->vertex_stride, cached ? "yes" : "no");
- 
++
      if (cached) {
 +        atomic_fetch_add(&mpv_metal_pso_hits, 1);
          pass = talloc_zero(NULL, struct ra_renderpass);
          pass_metal = talloc_zero(pass, struct ra_renderpass_metal);
          pass->priv = pass_metal;
-@@ -770,6 +1111,34 @@
+@@ -765,6 +1111,34 @@
          }
          [pipeline_cache setObject:entry forKey:cache_key];
  
@@ -862,7 +905,7 @@
      }
  
      // === 9. Cleanup ===
-@@ -859,6 +1228,101 @@
+@@ -854,6 +1228,101 @@
          return;
      }
  
@@ -964,7 +1007,7 @@
  
      /*
       * Collect loose-uniform inputs into a single std140 block. We sweep
-@@ -898,6 +1362,9 @@
+@@ -893,6 +1362,9 @@
          have_uniform_block = true;
      }
  
@@ -974,16 +1017,21 @@
  
      switch (pass->params.type) {
      case RA_RENDERPASS_TYPE_RASTER: {
-@@ -909,6 +1376,8 @@
+@@ -904,6 +1376,13 @@
          /* Phase-1 tile-shading-feasibility tracking: record (target, raster)
           * im per-frame-ring. ra_metal_commit_frame walked das ring + zählt
           * same-target-adjacent-pairs. */
 +        atomic_fetch_add(&mpv_metal_pg_total, 1);
 +        atomic_fetch_add(&mpv_metal_pg_raster, 1);
-         if (m->pg_count < 32) {
-             m->pg_is_compute[m->pg_count] = false;
-             m->pg_targets[m->pg_count]    = target_tex;
-@@ -1063,11 +1532,160 @@
++        if (m->pg_count < 32) {
++            m->pg_is_compute[m->pg_count] = false;
++            m->pg_targets[m->pg_count]    = target_tex;
++            m->pg_count++;
++        }
+         /* mpv's ra_renderpass_run_params has no invalidate flag; preserve
+          * target contents (MTLLoadActionLoad), mirroring the GL backend
+          * which doesn't glClear before issuing draw calls. */
+@@ -1053,11 +1532,165 @@
          [enc endEncoding];
          m->active_render_enc = nil;
  
@@ -1141,9 +1189,14 @@
          /* Phase-1 tracking: compute hat keinen target_tex im pass-sense. */
 +        atomic_fetch_add(&mpv_metal_pg_total, 1);
 +        atomic_fetch_add(&mpv_metal_pg_compute, 1);
-         if (m->pg_count < 32) {
-             m->pg_is_compute[m->pg_count] = true;
-             m->pg_targets[m->pg_count]    = nil;
++        if (m->pg_count < 32) {
++            m->pg_is_compute[m->pg_count] = true;
++            m->pg_targets[m->pg_count]    = nil;
++            m->pg_count++;
++        }
+ 
+         id<MTLComputeCommandEncoder> cenc = [cb computeCommandEncoder];
+         [cenc setComputePipelineState:pm->compute_pso];
 --- a/video/out/metal/ra_metal_init.m
 +++ b/video/out/metal/ra_metal_init.m
 @@ -86,15 +86,82 @@

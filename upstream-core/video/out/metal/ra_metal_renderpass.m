@@ -30,13 +30,8 @@
 /* PSO-Cache-Stats Counter (Definition in ra_metal.m). */
 extern _Atomic int64_t mpv_metal_pso_lookups;
 extern _Atomic int64_t mpv_metal_pso_hits;
-extern _Atomic int64_t mpv_metal_pso_warmup_replays;
-extern _Atomic int64_t mpv_metal_pg_total;
-extern _Atomic int64_t mpv_metal_pg_raster;
-extern _Atomic int64_t mpv_metal_pg_compute;
 
 /* PSO-Sidecar resilient-save kick (Definition in ra_metal.m). */
-extern void metal_kick_pso_sidecar_save(void *sidecar_bridge);
 
 /* Cache-Key-Logging (Definition in ra_metal.m). */
 extern void metal_log_cache_key(const char *status, NSString *cache_key, const char *vsh);
@@ -909,11 +904,6 @@ void metal_renderpass_run(struct ra *ra,
         /* Phase-1 tile-shading-feasibility tracking: record (target, raster)
          * im per-frame-ring. ra_metal_commit_frame walked das ring + zählt
          * same-target-adjacent-pairs. */
-        if (m->pg_count < 32) {
-            m->pg_is_compute[m->pg_count] = false;
-            m->pg_targets[m->pg_count]    = target_tex;
-            m->pg_count++;
-        }
         /* mpv's ra_renderpass_run_params has no invalidate flag; preserve
          * target contents (MTLLoadActionLoad), mirroring the GL backend
          * which doesn't glClear before issuing draw calls. */
@@ -1068,11 +1058,6 @@ void metal_renderpass_run(struct ra *ra,
 
     case RA_RENDERPASS_TYPE_COMPUTE: {
         /* Phase-1 tracking: compute hat keinen target_tex im pass-sense. */
-        if (m->pg_count < 32) {
-            m->pg_is_compute[m->pg_count] = true;
-            m->pg_targets[m->pg_count]    = nil;
-            m->pg_count++;
-        }
 
         id<MTLComputeCommandEncoder> cenc = [cb computeCommandEncoder];
         [cenc setComputePipelineState:pm->compute_pso];
