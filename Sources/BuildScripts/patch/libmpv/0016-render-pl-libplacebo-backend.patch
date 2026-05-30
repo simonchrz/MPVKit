@@ -9,10 +9,10 @@ index 02efefb..f64c418 100644
 +extern const struct render_backend_fns render_backend_pl;
 diff --git a/video/out/render_pl.c b/video/out/render_pl.c
 new file mode 100644
-index 0000000..059389f
+index 0000000..924ee30
 --- /dev/null
 +++ b/video/out/render_pl.c
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,223 @@
 +/*
 + * libmpv render-API backend driven by libplacebo (pl_renderer) instead of the
 + * mpv `ra` abstraction. This is the future-proofing path: mpv is deprecating
@@ -65,6 +65,16 @@ index 0000000..059389f
 +
 +static int pl_init(struct render_backend *ctx, mpv_render_param *params)
 +{
++    // Opt-in gate. render_backend_pl is registered before render_backend_gpu
++    // so it gets first crack at the Metal render API, but stays dormant unless
++    // explicitly enabled — the proven ra_metal path (render_backend_gpu)
++    // handles Metal by default. Set MPV_RENDER_PL=1 in the environment to route
++    // Metal rendering through libplacebo instead. Reversible without a rebuild;
++    // instant fallback by unsetting it. Remove this gate once validated.
++    const char *optin = getenv("MPV_RENDER_PL");
++    if (!optin || optin[0] != '1')
++        return MPV_ERROR_NOT_IMPLEMENTED;
++
 +    ctx->priv = talloc_zero(NULL, struct priv);
 +    struct priv *p = ctx->priv;
 +
@@ -227,22 +237,23 @@ index 0000000..059389f
 +    .destroy         = pl_destroy,
 +};
 diff --git a/video/out/vo_libmpv.c b/video/out/vo_libmpv.c
-index a91016d..992214c 100644
+index a91016d..0abc636 100644
 --- a/video/out/vo_libmpv.c
 +++ b/video/out/vo_libmpv.c
-@@ -113,6 +113,12 @@ struct mpv_render_context {
+@@ -112,6 +112,13 @@ struct mpv_render_context {
+ };
  
  const struct render_backend_fns *render_backends[] = {
-     &render_backend_gpu,
 +#if HAVE_METAL
 +    // libplacebo-driven path (future-proofing vs vo_gpu deprecation). Listed
-+    // after render_backend_gpu so the proven ra_metal path keeps handling the
-+    // Metal render API until render_backend_pl's frame path is complete.
++    // first so it gets the Metal render API, but its init() is gated on
++    // MPV_RENDER_PL=1 and otherwise returns NOT_IMPLEMENTED, so the proven
++    // ra_metal path (render_backend_gpu) handles Metal by default.
 +    &render_backend_pl,
 +#endif
+     &render_backend_gpu,
      &render_backend_sw,
      NULL
- };
 diff --git a/meson.build b/meson.build
 --- a/meson.build
 +++ b/meson.build
