@@ -134,10 +134,9 @@ enum Library: String, CaseIterable {
             return "https://github.com/mpvkit/lcms2-build/releases/download/\(self.version)/lcms2-all.zip"
         case .libplacebo:
             // Build from our fork (Metal backend) instead of the prebuilt 7.360
-            // zip, so libmpv links the Metal-capable libplacebo. Local path
-            // clones the committed `metal-backend` branch; point this at a
-            // pushed remote for CI / other machines.
-            return "/Users/simon/src/libplacebo"
+            // zip, so libmpv links the Metal-capable libplacebo. The `version`
+            // case selects the `metal-backend` branch.
+            return "https://github.com/simonchrz/libplacebo"
         case .libdav1d:
             return "https://github.com/mpvkit/libdav1d-build/releases/download/\(self.version)/libdav1d-all.zip"
         case .libdovi:
