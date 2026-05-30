@@ -80,11 +80,11 @@ enum Library: String, CaseIterable {
         case .lcms2:
             return "2.17.0"
         case .libplacebo:
-            // Our fork's branch (Metal backend). Used as the git clone ref by
-            // the from-source BuildPlacebo. NOT a semver — the real libplacebo
-            // version (7.365) comes from the built libplacebo.pc, which still
-            // satisfies mpv's `dependency('libplacebo', '>=7.360.1')`.
-            return "metal-backend"
+            // Immutable tag on the fork's metal-pr-series (= the upstream-PR
+            // branch). Pinned to a tag, not the live branch, so PR-review churn
+            // can't move the production build. NOT a semver — the real libplacebo
+            // version (7.365) comes from the built libplacebo.pc.
+            return "kuckuck-prod-1"
         case .libdovi:
             return "3.3.2"
         case .vulkan:
