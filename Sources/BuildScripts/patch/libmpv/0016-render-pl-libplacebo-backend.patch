@@ -9,10 +9,10 @@ index 02efefb..f64c418 100644
 +extern const struct render_backend_fns render_backend_pl;
 diff --git a/video/out/render_pl.c b/video/out/render_pl.c
 new file mode 100644
-index 0000000..ae0af7d
+index 0000000..ca75aca
 --- /dev/null
 +++ b/video/out/render_pl.c
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,348 @@
 +/*
 + * libmpv render-API backend driven by libplacebo (pl_renderer) instead of the
 + * mpv `ra` abstraction. This is the future-proofing path: mpv is deprecating
@@ -39,6 +39,7 @@ index 0000000..ae0af7d
 +#include <libplacebo/renderer.h>
 +#include <libplacebo/metal.h>
 +#include <libplacebo/swapchain.h>
++#include <libplacebo/utils/frame_queue.h>
 +
 +#define PL_LIBAV_IMPLEMENTATION 1
 +#include <libplacebo/utils/libav.h>
@@ -58,10 +59,65 @@ index 0000000..ae0af7d
 +    struct mp_rect src, dst;
 +    struct mp_osd_res osd;
 +
-+    // Persistent plane-texture storage reused across frames by
-+    // pl_map_avframe_ex (it uploads the decoded frame into these).
-+    pl_tex map_tex[4];
++    // Frame queue: handles display-time frame selection, deduplication and
++    // (when mpv delivers neighbouring frames) interpolation. Owns the per-frame
++    // plane textures and maps lazily via map_frame_pl.
++    pl_queue queue;
++    uint64_t last_id;        // highest frame_id pushed (skip already-queued)
++    bool want_reset;         // set by reset() (seek); drains the queue next render
 +};
++
++// Per-source-frame state carried through the pl_queue map/unmap/discard
++// callbacks. frame_data points at one of these.
++struct frame_ref {
++    struct priv *p;          // for the current source crop (p->src)
++    struct mp_image *mpi;    // +1 ref, freed on unmap/discard
++    AVFrame *av;             // alias of mpi's buffers, valid map..unmap
++};
++
++// pl_queue map: mp_image -> AVFrame -> pl_frame, uploading into the queue-owned
++// plane textures. Applies mpv's source crop (panscan/zoom). On failure the
++// queue neither retries nor calls discard, so free our state here.
++static bool map_frame_pl(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src,
++                         struct pl_frame *frame)
++{
++    struct frame_ref *fr = src->frame_data;
++    fr->av = mp_image_to_av_frame(fr->mpi);
++    if (!fr->av) {
++        talloc_free(fr->mpi);
++        talloc_free(fr);
++        return false;
++    }
++    if (!pl_map_avframe_ex(gpu, frame, &(struct pl_avframe_params) {
++            .frame = fr->av, .tex = tex }))
++    {
++        av_frame_free(&fr->av);
++        talloc_free(fr->mpi);
++        talloc_free(fr);
++        return false;
++    }
++    struct mp_rect s = fr->p->src;
++    frame->crop = (struct pl_rect2df) { .x0 = s.x0, .y0 = s.y0, .x1 = s.x1, .y1 = s.y1 };
++    return true;
++}
++
++static void unmap_frame_pl(pl_gpu gpu, struct pl_frame *frame,
++                           const struct pl_source_frame *src)
++{
++    struct frame_ref *fr = src->frame_data;
++    pl_unmap_avframe(gpu, frame);
++    if (fr->av)
++        av_frame_free(&fr->av);
++    talloc_free(fr->mpi);
++    talloc_free(fr);
++}
++
++static void discard_frame_pl(const struct pl_source_frame *src)
++{
++    struct frame_ref *fr = src->frame_data;
++    talloc_free(fr->mpi);
++    talloc_free(fr);
++}
 +
 +static int pl_init(struct render_backend *ctx, mpv_render_param *params)
 +{
@@ -105,6 +161,10 @@ index 0000000..ae0af7d
 +
 +    p->rr = pl_renderer_create(p->pllog, p->gpu);
 +    if (!p->rr)
++        return MPV_ERROR_GENERIC;
++
++    p->queue = pl_queue_create(p->gpu);
++    if (!p->queue)
 +        return MPV_ERROR_GENERIC;
 +
 +    ctx->driver_caps = VO_CAP_ROTATE90;
@@ -172,70 +232,98 @@ index 0000000..ae0af7d
 +    if (!target_tex)
 +        return MPV_ERROR_GENERIC;
 +
++    // Target colour space derived from the drawable's pixel format instead of
++    // hardcoded: an 8/10-bit unorm drawable is sRGB; a float drawable (set up
++    // by the host for EDR/HDR output) gets an HDR10 target so the renderer
++    // tone-maps into HDR rather than clipping to SDR.
++    bool hdr_target = target_tex->params.format &&
++                      target_tex->params.format->type == PL_FMT_FLOAT;
 +    struct pl_swapchain_frame sw_frame = {
 +        .fbo         = target_tex,
 +        .flipped     = false,
 +        .color_repr  = pl_color_repr_rgb,
-+        .color_space = pl_color_space_srgb,
++        .color_space = hdr_target ? pl_color_space_hdr10 : pl_color_space_srgb,
 +    };
 +    struct pl_frame target;
 +    pl_frame_from_swapchain(&target, &sw_frame);
 +
 +    // Aspect-correct placement: mpv computed the on-screen video rect (dst,
-+    // letterboxed within the drawable) and the source crop (src) in resize().
-+    // pl_frame_from_swapchain defaults target.crop to the whole drawable, which
-+    // would stretch the video to fill — override with mpv's dst rect so the
-+    // renderer letterboxes (the area outside the crop is cleared to black).
++    // letterboxed within the drawable) in resize(). pl_frame_from_swapchain
++    // defaults target.crop to the whole drawable, which would stretch the video
++    // to fill — override with mpv's dst rect so the renderer letterboxes (the
++    // area outside the crop is cleared to black). The source crop (src) is
++    // applied per-frame in map_frame_pl.
 +    target.crop = (struct pl_rect2df) {
 +        .x0 = p->dst.x0, .y0 = p->dst.y0,
 +        .x1 = p->dst.x1, .y1 = p->dst.y1,
 +    };
 +
-+    // 2. Map the decoded frame (mp_image -> AVFrame -> pl_frame). The plane
-+    //    textures are reused across calls via p->map_tex.
-+    struct pl_frame image;
-+    bool have_image = false;
-+    AVFrame *avframe = NULL;
-+    if (frame && frame->current) {
-+        avframe = mp_image_to_av_frame(frame->current);
-+        if (avframe) {
-+            have_image = pl_map_avframe_ex(p->gpu, &image, &(struct pl_avframe_params) {
-+                .frame = avframe,
-+                .tex   = p->map_tex,
-+            });
-+            // Apply mpv's source crop (panscan/zoom; usually the full frame).
-+            if (have_image) {
-+                image.crop = (struct pl_rect2df) {
-+                    .x0 = p->src.x0, .y0 = p->src.y0,
-+                    .x1 = p->src.x1, .y1 = p->src.y1,
-+                };
-+            }
-+        }
++    // 2. Feed the frame queue. mpv hands us the current frame plus any
++    //    neighbours it wants available for display-synced interpolation
++    //    (frame->frames[]); the queue dedups by frame_id, maps lazily and
++    //    evicts past frames. On seek mpv calls reset() -> want_reset, which we
++    //    drain here so the queue restarts cleanly at the new position.
++    if (p->want_reset) {
++        pl_queue_reset(p->queue);
++        p->last_id = 0;
++        p->want_reset = false;
++    }
++    for (int n = 0; frame && n < frame->num_frames; n++) {
++        uint64_t id = frame->frame_id + n;
++        if (id <= p->last_id)
++            continue;  // already queued in an earlier render call
++        struct mp_image *mpi = mp_image_new_ref(frame->frames[n]);
++        if (!mpi)
++            continue;
++        struct frame_ref *fr = talloc_zero(NULL, struct frame_ref);
++        fr->p   = p;
++        fr->mpi = mpi;
++        pl_queue_push(p->queue, &(struct pl_source_frame) {
++            .pts        = mpi->pts,
++            .duration   = frame->approx_duration,
++            .frame_data = fr,
++            .map        = map_frame_pl,
++            .unmap      = unmap_frame_pl,
++            .discard    = discard_frame_pl,
++        });
++        p->last_id = id;
 +    }
 +
-+    // 3. Render (image == NULL just clears/redraws the target).
-+    pl_render_image(p->rr, have_image ? &image : NULL, &target,
-+                    &pl_render_default_params);
++    // 3. Pull the frame mix for the current display time. vsync_duration drives
++    //    interpolation; with mpv's interpolation off it delivers a single frame
++    //    per render, so the mix holds one frame and nothing is blended.
++    struct pl_frame_mix mix = {0};
++    enum pl_queue_status st = PL_QUEUE_OK;
++    if (frame && frame->current) {
++        st = pl_queue_update(p->queue, &mix, pl_queue_params(
++            .pts            = frame->current->pts,
++            .radius         = pl_frame_mix_radius(&pl_render_default_params),
++            .vsync_duration = frame->ideal_frame_vsync_duration,
++        ));
++    }
 +
-+    // 4. Flush so the GPU work is submitted before the caller presents the
++    // 4. Render. An empty mix (e.g. right after a seek, before frames arrive)
++    //    clears the target; PL_QUEUE_MORE still yields the available frames.
++    if (st != PL_QUEUE_ERR)
++        pl_render_image_mix(p->rr, &mix, &target, &pl_render_default_params);
++
++    // 5. Flush so the GPU work is submitted before the caller presents the
 +    //    drawable. (The caller owns presentation of dr->texture.)
 +    pl_gpu_finish(p->gpu);
 +
-+    if (have_image)
-+        pl_unmap_avframe(p->gpu, &image);
-+    if (avframe)
-+        av_frame_free(&avframe);
 +    pl_tex_destroy(p->gpu, &target_tex);
 +
 +    (void) ctx;
 +    return 0;
 +}
 +
-+// mpv sets need_reset on seek/reconfig. pl_renderer keeps only frame-mixing
-+// history (interpolation), which we don't use yet — nothing to flush.
++// mpv sets need_reset on seek/reconfig. Defer the actual pl_queue_reset to the
++// next render (same render thread, just before the push loop) so we never touch
++// the queue concurrently and the new frames repopulate it in one place.
 +static void pl_reset(struct render_backend *ctx)
 +{
-+    (void) ctx;
++    struct priv *p = ctx->priv;
++    p->want_reset = true;
 +}
 +
 +// mpv sets need_update_external on first frame + when the VO's OSD/overlay
@@ -253,8 +341,9 @@ index 0000000..ae0af7d
 +    struct priv *p = ctx->priv;
 +    if (!p)
 +        return;
-+    for (int i = 0; i < 4; i++)
-+        pl_tex_destroy(p->gpu, &p->map_tex[i]);
++    // Destroys the queue first: it unmaps/discards every cached frame (freeing
++    // the AVFrames + mp_image refs) and the plane textures it owns.
++    pl_queue_destroy(&p->queue);
 +    pl_renderer_destroy(&p->rr);
 +    pl_metal_destroy(&p->metal);
 +    // p->pllog is a talloc child of p; freed with ctx->priv.
