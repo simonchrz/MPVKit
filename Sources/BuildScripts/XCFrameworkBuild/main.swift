@@ -80,7 +80,11 @@ enum Library: String, CaseIterable {
         case .lcms2:
             return "2.17.0"
         case .libplacebo:
-            return "7.360.1"
+            // Our fork's branch (Metal backend). Used as the git clone ref by
+            // the from-source BuildPlacebo. NOT a semver — the real libplacebo
+            // version (7.365) comes from the built libplacebo.pc, which still
+            // satisfies mpv's `dependency('libplacebo', '>=7.360.1')`.
+            return "metal-backend"
         case .libdovi:
             return "3.3.2"
         case .vulkan:
@@ -129,7 +133,11 @@ enum Library: String, CaseIterable {
         case .lcms2:
             return "https://github.com/mpvkit/lcms2-build/releases/download/\(self.version)/lcms2-all.zip"
         case .libplacebo:
-            return "https://github.com/mpvkit/libplacebo-build/releases/download/\(self.version)/libplacebo-all.zip"
+            // Build from our fork (Metal backend) instead of the prebuilt 7.360
+            // zip, so libmpv links the Metal-capable libplacebo. Local path
+            // clones the committed `metal-backend` branch; point this at a
+            // pushed remote for CI / other machines.
+            return "/Users/simon/src/libplacebo"
         case .libdav1d:
             return "https://github.com/mpvkit/libdav1d-build/releases/download/\(self.version)/libdav1d-all.zip"
         case .libdovi:
@@ -869,9 +877,31 @@ private class BuildLuaJIT: ZipBaseBuild {
 }
 
 
-private class BuildPlacebo: ZipBaseBuild {
+private class BuildPlacebo: BaseBuild {
     init() {
         super.init(library: .libplacebo)
+    }
+
+    // Build only what libmpv's vo_gpu_next + our Metal backend need. SPIR-V
+    // comes from the already-built libshaderc; SPIR-V -> MSL from the prebuilt
+    // spirv-cross (both discovered via the platform pkg-config path). Other
+    // GPU backends and optional deps are off to keep the static lib lean.
+    override func arguments(platform: PlatformType, arch: ArchType) -> [String] {
+        [
+            "-Dmetal=enabled",
+            "-Dvulkan=disabled", "-Dopengl=disabled", "-Dd3d11=disabled",
+            "-Dlcms=disabled", "-Ddovi=disabled", "-Dxxhash=disabled",
+            "-Dunwind=disabled", "-Ddemos=false", "-Dtests=false",
+        ]
+    }
+
+    // vulkan_stubs.c #includes <vulkan/vulkan.h> for ABI even when the Vulkan
+    // backend is disabled. Pull the headers from the already-built vulkan dep.
+    override func cFlags(platform: PlatformType, arch: ArchType) -> [String] {
+        var flags = super.cFlags(platform: platform, arch: arch)
+        let vkInclude = thinDir(library: .vulkan, platform: platform, arch: arch) + "include"
+        flags.append("-I\(vkInclude.path)")
+        return flags
     }
 }
 
