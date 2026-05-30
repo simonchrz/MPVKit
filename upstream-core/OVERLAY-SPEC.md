@@ -64,3 +64,15 @@ renderpass.m ~843-853, 1112) BLEIBT Kern — nur Telemetrie/Persistenz/Diagnosti
    wieder aktiv verifizieren (raw-TS-VOX-Auto-Launch).
 5. Offene Frage: MTLBinaryArchive (PSO-Disk-Cache via Apple-API) — Kern oder Overlay?
    Wahrscheinlich Kern-optional (mpv-generisch nützlich), aber prüfen ob app-gekoppelt.
+
+## STATUS-UPDATE (S3-Grind Ende)
+- ✅ **4/6 Kern-Dateien gestaged**: render_mtl.h, ra_metal.m, ra_metal_textures.m, **ra_metal_renderpass.m**.
+- ra_metal_renderpass.m: 1870→1434 Z. (435 Diagnostik raus: #if-DIAG-Readback 147z,
+  shader-dump-Helper 55z, rp-instr-Helper 75z, 2 rp_logf-Cluster, cache-key-log,
+  pso-stats/passgraph-Counter, sidecar-Append-Block). Brace-balanced, null dangling
+  file-lokale refs. **KEPT (cross-file, fürs init-Step):** metal_serialize_renderpass_params,
+  metal_deserialize_input, metal_warmup_replay_entries (+warmup_replays-Counter), unbenutzte extern-decls.
+- ⚠ **Compile-Verifikation BLOCKIERT** durch Build-Infra (FFmpeg/Simulator-Rebuild failt mit
+  „meson execute failed" VOR libmpv — renderpass.m wurde nie kompiliert, .o-Timestamp belegt).
+  Nicht mein Code. Vermutlich Simulator-Scratch durch abgebrochenen Build gewiped. Separat zu fixen.
+- **Offen:** ra_metal_init.m (warmup/sidecar/passgraph + cross-file-Verdrahtung) + ra_metal.h struct.
