@@ -242,8 +242,8 @@ let package = Package(
         .binaryTarget(
             name: "Libplacebo",
             // Our Metal-backend fork build (was the 7.360 prebuilt, no Metal).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.9/Libplacebo.xcframework.zip",
-            checksum: "e3cccc73cbcb3c1a5a309039a7d66de9760e3116ba17b83e3774561c3134c12a"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.10/Libplacebo.xcframework.zip",
+            checksum: "1b205ad8eec0f1197fedd09ee23a6c8860f4f5eb1427aed6c52e438eef2796bb"
         ),
 
         .binaryTarget(
@@ -269,8 +269,8 @@ let package = Package(
         ),
         .binaryTarget(
             name: "Libavfilter",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-master-n8.1-ios-metal.41/Libavfilter.xcframework.zip",
-            checksum: "fcd21db6f166ea35060f612c9908a7cf45f21e56540ba65510105680c80814f5"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.10/Libavfilter.xcframework.zip",
+            checksum: "241db72bc71889998a830ac4b3b385d27e665f28ff13814e4847bff3adc16a31"
         ),
         .binaryTarget(
             name: "Libavutil",
