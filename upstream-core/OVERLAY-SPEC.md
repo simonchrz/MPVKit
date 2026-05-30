@@ -92,3 +92,16 @@ Call blieb. Lektion: nach Helper-Removal IMMER alle Calls gegenchecken (Compiler
 ## NOCH OFFEN in renderpass.m (kein Build-Blocker, kompiliert):
 - passgraph-Ring-Population in renderpass_run (`m->pg_count`/`pg_is_compute`/`pg_target`) —
   Overlay, nutzt aber struct-Felder (existieren) → kompiliert. Raus mit init.m-passgraph-Step.
+
+## ✅✅ SEPARATION KOMPLETT + BEWIESEN (beide Richtungen)
+1. **Kern allein:** kompiliert + linkt als libmpv.a, nm-verifiziert NULL undefined Overlay-Symbole.
+2. **Kern + Overlay == Full:** `kuckuck-instrumentation-overlay.patch` (1330z, 5 Dateien) auf den
+   Kern angewendet reproduziert die Produktions-Dateien **byte-für-byte** (round-trip verifiziert).
+→ render-neutral ist trivial erfüllt (core+overlay = identischer Code).
+Die technische Feasibility-Frage ist damit vollständig beantwortet + bewiesen.
+
+## Rest (mechanik + prozess, kein technisches Risiko mehr)
+- Kosmetik: ra_metal.h unused struct-Felder, passgraph-ring dead-code in renderpass_run, orphan-Kommentare.
+- Kern in atomare mpv-Style-Commits splitten (skeleton→renderpass→textures→hwdec→opt).
+- Rebase auf frisches mpv-master.
+- Maintainer-Prozess (Monate).
