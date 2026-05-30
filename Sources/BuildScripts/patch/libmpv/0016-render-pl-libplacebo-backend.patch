@@ -9,10 +9,10 @@ index 02efefb..f64c418 100644
 +extern const struct render_backend_fns render_backend_pl;
 diff --git a/video/out/render_pl.c b/video/out/render_pl.c
 new file mode 100644
-index 0000000..924ee30
+index 0000000..ae0af7d
 --- /dev/null
 +++ b/video/out/render_pl.c
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,259 @@
 +/*
 + * libmpv render-API backend driven by libplacebo (pl_renderer) instead of the
 + * mpv `ra` abstraction. This is the future-proofing path: mpv is deprecating
@@ -181,6 +181,16 @@ index 0000000..924ee30
 +    struct pl_frame target;
 +    pl_frame_from_swapchain(&target, &sw_frame);
 +
++    // Aspect-correct placement: mpv computed the on-screen video rect (dst,
++    // letterboxed within the drawable) and the source crop (src) in resize().
++    // pl_frame_from_swapchain defaults target.crop to the whole drawable, which
++    // would stretch the video to fill — override with mpv's dst rect so the
++    // renderer letterboxes (the area outside the crop is cleared to black).
++    target.crop = (struct pl_rect2df) {
++        .x0 = p->dst.x0, .y0 = p->dst.y0,
++        .x1 = p->dst.x1, .y1 = p->dst.y1,
++    };
++
 +    // 2. Map the decoded frame (mp_image -> AVFrame -> pl_frame). The plane
 +    //    textures are reused across calls via p->map_tex.
 +    struct pl_frame image;
@@ -193,6 +203,13 @@ index 0000000..924ee30
 +                .frame = avframe,
 +                .tex   = p->map_tex,
 +            });
++            // Apply mpv's source crop (panscan/zoom; usually the full frame).
++            if (have_image) {
++                image.crop = (struct pl_rect2df) {
++                    .x0 = p->src.x0, .y0 = p->src.y0,
++                    .x1 = p->src.x1, .y1 = p->src.y1,
++                };
++            }
 +        }
 +    }
 +
@@ -214,6 +231,23 @@ index 0000000..924ee30
 +    return 0;
 +}
 +
++// mpv sets need_reset on seek/reconfig. pl_renderer keeps only frame-mixing
++// history (interpolation), which we don't use yet — nothing to flush.
++static void pl_reset(struct render_backend *ctx)
++{
++    (void) ctx;
++}
++
++// mpv sets need_update_external on first frame + when the VO's OSD/overlay
++// source changes. OSD/subtitle wiring is deferred (see header TODO), so this
++// is a no-op for now. Must be non-NULL: vo_libmpv.c calls it unconditionally
++// when need_update_external is set (true on the first render).
++static void pl_update_external(struct render_backend *ctx, struct vo *vo)
++{
++    (void) ctx;
++    (void) vo;
++}
++
 +static void pl_destroy(struct render_backend *ctx)
 +{
 +    struct priv *p = ctx->priv;
@@ -231,6 +265,8 @@ index 0000000..924ee30
 +    .check_format    = pl_check_format,
 +    .set_parameter   = pl_set_parameter,
 +    .reconfig        = pl_reconfig,
++    .reset           = pl_reset,
++    .update_external = pl_update_external,
 +    .resize          = pl_resize,
 +    .get_target_size = pl_get_target_size,
 +    .render          = pl_render,
