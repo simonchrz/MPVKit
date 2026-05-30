@@ -1077,9 +1077,6 @@ void metal_renderpass_run(struct ra *ra,
         have_uniform_block = true;
     }
 
-    if (have_uniform_block) {
-        metal_rp_log_hex("uniform_block", uniform_block, uniform_block_size);
-    }
 
     switch (pass->params.type) {
     case RA_RENDERPASS_TYPE_RASTER: {

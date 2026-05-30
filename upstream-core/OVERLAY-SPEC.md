@@ -76,3 +76,19 @@ renderpass.m ~843-853, 1112) BLEIBT Kern — nur Telemetrie/Persistenz/Diagnosti
   „meson execute failed" VOR libmpv — renderpass.m wurde nie kompiliert, .o-Timestamp belegt).
   Nicht mein Code. Vermutlich Simulator-Scratch durch abgebrochenen Build gewiped. Separat zu fixen.
 - **Offen:** ra_metal_init.m (warmup/sidecar/passgraph + cross-file-Verdrahtung) + ra_metal.h struct.
+
+## ✅ COMPILE-VERIFY-METHODE (umgeht kaputten Simulator-Build!)
+Der volle `make build platform=ios` failt am Simulator-meson-Setup. Aber für den
+Compile-Verify reicht der **device-arch ninja direkt**:
+```
+cp upstream-core/.../<file> dist/libmpv-master/video/out/metal/<file>
+cd dist/libmpv/ios/scratch/arm64
+ninja libmpv.a.p/video_out_metal_<file>.m.o   # nur das eine .o, rest cached
+```
+→ renderpass.m: **kompiliert sauber** (11 missing-prototype-warnings, harmlos, 0 errors).
+Letzter Fix war ein übersehener `metal_rp_log_hex`-Call (Z.1081) — Helper-Def war raus,
+Call blieb. Lektion: nach Helper-Removal IMMER alle Calls gegenchecken (Compiler findet sie).
+
+## NOCH OFFEN in renderpass.m (kein Build-Blocker, kompiliert):
+- passgraph-Ring-Population in renderpass_run (`m->pg_count`/`pg_is_compute`/`pg_target`) —
+  Overlay, nutzt aber struct-Felder (existieren) → kompiliert. Raus mit init.m-passgraph-Step.
