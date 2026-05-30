@@ -9,6 +9,18 @@ renderpass.m ~843-853, 1112) BLEIBT Kern — nur Telemetrie/Persistenz/Diagnosti
 - `include/mpv/render_mtl.h` — Kern (init_params + drawable). Overlay raus: pso_stats(_get), sidecar_flush, passgraph_stats(_get) (war Z.125-183).
 - `video/out/metal/ra_metal.m` — Kern (Prototypes + ra_fns_metal-vtable). Overlay raus: PSO/PG-Counter-Globals + _get(), sidecar save/kick/flush/clear, cache-key-log (war Z.19-191).
 
+## ⚠ NEUE BEFUNDE (S3-Grind) — renderpass.m ist VIEL schwerer als erst gemappt
+- **4. Diagnostik-Schicht entdeckt: `metal_rp_logf` (ios-metal.52 „Runtime-instrumentation")**
+  — Helper-Funktionen Z.104-170 (`metal_rp_log_file`, `metal_rp_logf`, `metal_rp_glsl_hash_buf`,
+  `metal_rp_vartype_name`) + **31 Call-Sites** über die ganze Datei verstreut.
+- Damit hat renderpass.m **~40 Entfernungs-Stellen** über 4 Layer (rp_logf + pso-stats +
+  cache-key-log + passgraph + sidecar). Das ist der dominante Extraktions-Aufwand.
+- **Lektion:** jeder Deep-Dive findet eine weitere Diagnostik-Schicht. Effort > erste Schätzung.
+
+## ✅ FERTIG (gestaged in upstream-core/)
+- render_mtl.h, ra_metal.m (S2) + **ra_metal_textures.m** (S3, 1035→889 Z., verifiziert
+  null dangling refs: readback-diag un-weaved, logf-helpers + should_dump raus).
+
 ## ra_metal_renderpass.m — entfernen
 - 86-91: extern-decls `mpv_metal_pso_lookups/hits/warmup_replays`, `mpv_metal_pg_total/raster/compute`
 - 94, 97: extern-decls `metal_kick_pso_sidecar_save`, `metal_log_cache_key`
