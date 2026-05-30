@@ -9,10 +9,10 @@ index 02efefb..f64c418 100644
 +extern const struct render_backend_fns render_backend_pl;
 diff --git a/video/out/render_pl.c b/video/out/render_pl.c
 new file mode 100644
-index 0000000..36491f5
+index 0000000..059389f
 --- /dev/null
 +++ b/video/out/render_pl.c
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,213 @@
 +/*
 + * libmpv render-API backend driven by libplacebo (pl_renderer) instead of the
 + * mpv `ra` abstraction. This is the future-proofing path: mpv is deprecating
@@ -33,10 +33,17 @@ index 0000000..36491f5
 +#include "common/common.h"
 +#include "sub/osd.h"
 +#include "video/mp_image.h"
++#include "video/fmt-conversion.h"
 +#include "placebo/utils.h"
 +
 +#include <libplacebo/renderer.h>
 +#include <libplacebo/metal.h>
++#include <libplacebo/swapchain.h>
++
++#define PL_LIBAV_IMPLEMENTATION 1
++#include <libplacebo/utils/libav.h>
++
++#include <libavutil/frame.h>
 +
 +#include "mpv/render.h"
 +#include "mpv/render_mtl.h"
@@ -50,6 +57,10 @@ index 0000000..36491f5
 +    struct mp_image_params img_params;
 +    struct mp_rect src, dst;
 +    struct mp_osd_res osd;
++
++    // Persistent plane-texture storage reused across frames by
++    // pl_map_avframe_ex (it uploads the decoded frame into these).
++    pl_tex map_tex[4];
 +};
 +
 +static int pl_init(struct render_backend *ctx, mpv_render_param *params)
@@ -92,10 +103,14 @@ index 0000000..36491f5
 +
 +static bool pl_check_format(struct render_backend *ctx, int imgfmt)
 +{
-+    // TODO(phase-2): probe via pl_test_pixfmt / mp_imgfmt -> pl_fmt mapping.
-+    // Skeleton: accept nothing yet so callers don't assume real support.
-+    (void) ctx; (void) imgfmt;
-+    return false;
++    struct priv *p = ctx->priv;
++    // A format is renderable if libplacebo's libav mapper can describe it.
++    // pl_test_pixfmt checks the underlying AVPixelFormat against the gpu's
++    // capabilities without needing an actual frame.
++    enum AVPixelFormat avfmt = imgfmt2pixfmt(imgfmt);
++    if (avfmt == AV_PIX_FMT_NONE)
++        return false;
++    return pl_test_pixfmt(p->gpu, avfmt);
 +}
 +
 +static int pl_set_parameter(struct render_backend *ctx, mpv_render_param param)
@@ -135,18 +150,58 @@ index 0000000..36491f5
 +static int pl_render(struct render_backend *ctx, mpv_render_param *params,
 +                     struct vo_frame *frame)
 +{
++    struct priv *p = ctx->priv;
++
 +    mpv_metal_drawable *dr =
 +        get_mpv_render_param(params, MPV_RENDER_PARAM_METAL_DRAWABLE, NULL);
 +    if (!dr || !dr->texture)
 +        return MPV_ERROR_INVALID_PARAMETER;
 +
-+    // TODO(phase-2): the real frame path —
-+    //   1. pl_metal_wrap_tex(p->metal, dr->texture)  -> target pl_tex
-+    //   2. mp_image_to_pl_frame(frame->current, ...)  (see placebo/utils.c)
-+    //   3. pl_render_image(p->rr, &image, &target, &pl_render_params)
-+    //   4. pl_gpu_finish / signal completion to the drawable
-+    (void) ctx; (void) frame;
-+    return MPV_ERROR_NOT_IMPLEMENTED;
++    // 1. Wrap the caller's destination texture as a libplacebo render target.
++    pl_tex target_tex = pl_metal_wrap_tex(p->metal, dr->texture);
++    if (!target_tex)
++        return MPV_ERROR_GENERIC;
++
++    struct pl_swapchain_frame sw_frame = {
++        .fbo         = target_tex,
++        .flipped     = false,
++        .color_repr  = pl_color_repr_rgb,
++        .color_space = pl_color_space_srgb,
++    };
++    struct pl_frame target;
++    pl_frame_from_swapchain(&target, &sw_frame);
++
++    // 2. Map the decoded frame (mp_image -> AVFrame -> pl_frame). The plane
++    //    textures are reused across calls via p->map_tex.
++    struct pl_frame image;
++    bool have_image = false;
++    AVFrame *avframe = NULL;
++    if (frame && frame->current) {
++        avframe = mp_image_to_av_frame(frame->current);
++        if (avframe) {
++            have_image = pl_map_avframe_ex(p->gpu, &image, &(struct pl_avframe_params) {
++                .frame = avframe,
++                .tex   = p->map_tex,
++            });
++        }
++    }
++
++    // 3. Render (image == NULL just clears/redraws the target).
++    pl_render_image(p->rr, have_image ? &image : NULL, &target,
++                    &pl_render_default_params);
++
++    // 4. Flush so the GPU work is submitted before the caller presents the
++    //    drawable. (The caller owns presentation of dr->texture.)
++    pl_gpu_finish(p->gpu);
++
++    if (have_image)
++        pl_unmap_avframe(p->gpu, &image);
++    if (avframe)
++        av_frame_free(&avframe);
++    pl_tex_destroy(p->gpu, &target_tex);
++
++    (void) ctx;
++    return 0;
 +}
 +
 +static void pl_destroy(struct render_backend *ctx)
@@ -154,6 +209,8 @@ index 0000000..36491f5
 +    struct priv *p = ctx->priv;
 +    if (!p)
 +        return;
++    for (int i = 0; i < 4; i++)
++        pl_tex_destroy(p->gpu, &p->map_tex[i]);
 +    pl_renderer_destroy(&p->rr);
 +    pl_metal_destroy(&p->metal);
 +    // p->pllog is a talloc child of p; freed with ctx->priv.
