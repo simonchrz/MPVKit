@@ -1,0 +1,200 @@
+diff --git a/video/out/libmpv.h b/video/out/libmpv.h
+index 02efefb..f64c418 100644
+--- a/video/out/libmpv.h
++++ b/video/out/libmpv.h
+@@ -81,3 +81,4 @@ struct render_backend_fns {
+ 
+ extern const struct render_backend_fns render_backend_gpu;
+ extern const struct render_backend_fns render_backend_sw;
++extern const struct render_backend_fns render_backend_pl;
+diff --git a/video/out/render_pl.c b/video/out/render_pl.c
+new file mode 100644
+index 0000000..36491f5
+--- /dev/null
++++ b/video/out/render_pl.c
+@@ -0,0 +1,156 @@
++/*
++ * libmpv render-API backend driven by libplacebo (pl_renderer) instead of the
++ * mpv `ra` abstraction. This is the future-proofing path: mpv is deprecating
++ * vo_gpu (and thus the `ra`-based render_backend_gpu) in favour of
++ * vo_gpu_next/libplacebo. render_backend_pl gives the embedded render API
++ * (used by the iOS app) a libplacebo path, mirroring render_backend_gpu but
++ * targeting pl_gpu + pl_renderer.
++ *
++ * SKELETON STAGE: init creates the pl_gpu (Metal) + pl_renderer and wires the
++ * render_backend_fns vtable; the frame path (mp_image -> pl_frame ->
++ * pl_render_image -> present) is stubbed and filled in a later phase.
++ *
++ * This file is part of mpv. License: GPL-2.0-or-later (same as mpv).
++ */
++
++#include "libmpv.h"
++
++#include "common/common.h"
++#include "sub/osd.h"
++#include "video/mp_image.h"
++#include "placebo/utils.h"
++
++#include <libplacebo/renderer.h>
++#include <libplacebo/metal.h>
++
++#include "mpv/render.h"
++#include "mpv/render_mtl.h"
++
++struct priv {
++    pl_log pllog;
++    pl_metal metal;          // owns the MTLDevice/queue wrapper
++    pl_gpu gpu;              // == metal->gpu
++    pl_renderer rr;
++
++    struct mp_image_params img_params;
++    struct mp_rect src, dst;
++    struct mp_osd_res osd;
++};
++
++static int pl_init(struct render_backend *ctx, mpv_render_param *params)
++{
++    ctx->priv = talloc_zero(NULL, struct priv);
++    struct priv *p = ctx->priv;
++
++    // Only the Metal render API is supported for now.
++    char *api = get_mpv_render_param(params, MPV_RENDER_PARAM_API_TYPE, NULL);
++    if (!api || strcmp(api, MPV_RENDER_API_TYPE_METAL) != 0)
++        return MPV_ERROR_NOT_IMPLEMENTED;
++
++    mpv_metal_init_params *init =
++        get_mpv_render_param(params, MPV_RENDER_PARAM_METAL_INIT_PARAMS, NULL);
++    if (!init || !init->device) {
++        MP_FATAL(ctx, "MPV_RENDER_PARAM_METAL_INIT_PARAMS.device is required.\n");
++        return MPV_ERROR_INVALID_PARAMETER;
++    }
++
++    p->pllog = mppl_log_create(p, ctx->log);
++    if (!p->pllog)
++        return MPV_ERROR_GENERIC;
++
++    p->metal = pl_metal_create(p->pllog, pl_metal_params(
++        .device = init->device,
++    ));
++    if (!p->metal) {
++        MP_FATAL(ctx, "Failed creating libplacebo Metal device.\n");
++        return MPV_ERROR_GENERIC;
++    }
++    p->gpu = p->metal->gpu;
++
++    p->rr = pl_renderer_create(p->pllog, p->gpu);
++    if (!p->rr)
++        return MPV_ERROR_GENERIC;
++
++    ctx->driver_caps = VO_CAP_ROTATE90;
++    return 0;
++}
++
++static bool pl_check_format(struct render_backend *ctx, int imgfmt)
++{
++    // TODO(phase-2): probe via pl_test_pixfmt / mp_imgfmt -> pl_fmt mapping.
++    // Skeleton: accept nothing yet so callers don't assume real support.
++    (void) ctx; (void) imgfmt;
++    return false;
++}
++
++static int pl_set_parameter(struct render_backend *ctx, mpv_render_param param)
++{
++    (void) ctx; (void) param;
++    return MPV_ERROR_NOT_IMPLEMENTED;
++}
++
++static void pl_reconfig(struct render_backend *ctx, struct mp_image_params *params)
++{
++    struct priv *p = ctx->priv;
++    p->img_params = *params;
++}
++
++static void pl_resize(struct render_backend *ctx, struct mp_rect *src,
++                      struct mp_rect *dst, struct mp_osd_res *osd)
++{
++    struct priv *p = ctx->priv;
++    p->src = *src;
++    p->dst = *dst;
++    p->osd = *osd;
++}
++
++static int pl_get_target_size(struct render_backend *ctx, mpv_render_param *params,
++                              int *out_w, int *out_h)
++{
++    mpv_metal_drawable *dr =
++        get_mpv_render_param(params, MPV_RENDER_PARAM_METAL_DRAWABLE, NULL);
++    if (!dr || !dr->texture)
++        return MPV_ERROR_INVALID_PARAMETER;
++    *out_w = dr->w;
++    *out_h = dr->h;
++    (void) ctx;
++    return 0;
++}
++
++static int pl_render(struct render_backend *ctx, mpv_render_param *params,
++                     struct vo_frame *frame)
++{
++    mpv_metal_drawable *dr =
++        get_mpv_render_param(params, MPV_RENDER_PARAM_METAL_DRAWABLE, NULL);
++    if (!dr || !dr->texture)
++        return MPV_ERROR_INVALID_PARAMETER;
++
++    // TODO(phase-2): the real frame path —
++    //   1. pl_metal_wrap_tex(p->metal, dr->texture)  -> target pl_tex
++    //   2. mp_image_to_pl_frame(frame->current, ...)  (see placebo/utils.c)
++    //   3. pl_render_image(p->rr, &image, &target, &pl_render_params)
++    //   4. pl_gpu_finish / signal completion to the drawable
++    (void) ctx; (void) frame;
++    return MPV_ERROR_NOT_IMPLEMENTED;
++}
++
++static void pl_destroy(struct render_backend *ctx)
++{
++    struct priv *p = ctx->priv;
++    if (!p)
++        return;
++    pl_renderer_destroy(&p->rr);
++    pl_metal_destroy(&p->metal);
++    // p->pllog is a talloc child of p; freed with ctx->priv.
++}
++
++const struct render_backend_fns render_backend_pl = {
++    .init            = pl_init,
++    .check_format    = pl_check_format,
++    .set_parameter   = pl_set_parameter,
++    .reconfig        = pl_reconfig,
++    .resize          = pl_resize,
++    .get_target_size = pl_get_target_size,
++    .render          = pl_render,
++    .destroy         = pl_destroy,
++};
+diff --git a/video/out/vo_libmpv.c b/video/out/vo_libmpv.c
+index a91016d..992214c 100644
+--- a/video/out/vo_libmpv.c
++++ b/video/out/vo_libmpv.c
+@@ -113,6 +113,12 @@ struct mpv_render_context {
+ 
+ const struct render_backend_fns *render_backends[] = {
+     &render_backend_gpu,
++#if HAVE_METAL
++    // libplacebo-driven path (future-proofing vs vo_gpu deprecation). Listed
++    // after render_backend_gpu so the proven ra_metal path keeps handling the
++    // Metal render API until render_backend_pl's frame path is complete.
++    &render_backend_pl,
++#endif
+     &render_backend_sw,
+     NULL
+ };
+diff --git a/meson.build b/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -1364,6 +1364,8 @@ if features['metal']
+         'video/out/metal/ra_metal_init.m',
+         'video/out/metal/ra_metal_textures.m',
+         'video/out/metal/ra_metal_renderpass.m',
++        # libplacebo-driven render-API backend (future-proofing vs vo_gpu)
++        'video/out/render_pl.c',
+     )
+     add_project_arguments('-DMPV_HAVE_METAL=1', language: ['c', 'cpp', 'objc'])
+ endif
