@@ -302,9 +302,9 @@ let package = Package(
 
         .binaryTarget(
             name: "Libmpv",
-            // Our build with the render_pl libplacebo backend (patch 0016).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.13/Libmpv.xcframework.zip",
-            checksum: "20749252990a38fcc10bb675ee600ab4d934760d8250beb6e21fadf02ae9641d"
+            // render_pl libplacebo backend (patch 0016); ra_metal removed (renderpl.14).
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.14/Libmpv.xcframework.zip",
+            checksum: "d990a7ad3db45e2527503645194a53b5ff77c10310f1fec5156356540660ac11"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
