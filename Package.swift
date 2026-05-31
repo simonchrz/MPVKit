@@ -242,8 +242,8 @@ let package = Package(
         .binaryTarget(
             name: "Libplacebo",
             // Our Metal-backend fork build (was the 7.360 prebuilt, no Metal).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.11/Libplacebo.xcframework.zip",
-            checksum: "3b4e5258058f98d3eab5c1ab9a609cb70a3a948edb2ad1dd537ad299defc99dc"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.12/Libplacebo.xcframework.zip",
+            checksum: "8180184988c21ac99754756afe33362f353ee42aa34b0bb5049cc9ed5655c797"
         ),
 
         .binaryTarget(
@@ -303,8 +303,8 @@ let package = Package(
         .binaryTarget(
             name: "Libmpv",
             // Our build with the render_pl libplacebo backend (patch 0016).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.8/Libmpv.xcframework.zip",
-            checksum: "fc142778e711123a2481058c92131e62f9d5f215e7a3ea672266bef4b8346e39"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.13/Libmpv.xcframework.zip",
+            checksum: "20749252990a38fcc10bb675ee600ab4d934760d8250beb6e21fadf02ae9641d"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
