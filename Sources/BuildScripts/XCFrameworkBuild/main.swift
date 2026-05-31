@@ -516,13 +516,10 @@ private class BuildMPV: CombineBaseBuild {
             array.append("-Dlua=luajit")  // macos show video stats need enable 
         } else {
             array.append("-Dvideotoolbox-gl=disabled")
-            // vt-pl bleibt disabled (= Vulkan-coupled, unser Metal-RA-Backend
-            // braucht keinen libplacebo-Vulkan-Pfad). Stattdessen ENABLEN
-            // wir unseren eigenen vt-metal-Pfad (Patch 0012) der CVMetal-
-            // TextureCache → MTLTexture zero-copy macht und direkt unser
-            // ra_metal-Backend via ra_metal_wrap_external_texture trifft.
+            // vt-pl + vt-metal beide disabled: ra_metal (inkl. vt-metal-
+            // hwdec, Patch 0012) entfernt; render_pl nutzt hwdec=videotoolbox-
+            // copy (FFmpeg -> RAM -> libplacebo), keinen Zero-Copy-Metal-hwdec.
             array.append("-Dvideotoolbox-pl=disabled")
-            array.append("-Dvideotoolbox-metal=enabled")
             array.append("-Dswift-build=disabled")
             array.append("-Daudiounit=enabled")
             array.append("-Davfoundation=disabled")

@@ -131,7 +131,7 @@ class BaseBuild {
                 if !fileName.hasSuffix(".patch") {
                     continue
                 }
-                try! Utility.launch(path: "/usr/bin/git", arguments: ["apply", "\((patch + fileName).path)"], currentDirectoryURL: directoryURL)
+                try! Utility.launch(path: "/usr/bin/git", arguments: ["apply", "--recount", "\((patch + fileName).path)"], currentDirectoryURL: directoryURL)
             }
         }
     }

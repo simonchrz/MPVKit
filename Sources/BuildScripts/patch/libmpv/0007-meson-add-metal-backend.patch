@@ -36,11 +36,8 @@ index 7efc2db..3d9075a 100644
 +if features['metal']
 +    dependencies += metal_dep
 +    sources += files(
-+        'video/out/metal/libmpv_metal.m',
-+        'video/out/metal/ra_metal.m',
-+        'video/out/metal/ra_metal_init.m',
-+        'video/out/metal/ra_metal_textures.m',
-+        'video/out/metal/ra_metal_renderpass.m',
++        # libplacebo-driven render-API backend (future-proofing vs vo_gpu)
++        'video/out/render_pl.c',
 +    )
 +    add_project_arguments('-DMPV_HAVE_METAL=1', language: ['c', 'cpp', 'objc'])
 +endif

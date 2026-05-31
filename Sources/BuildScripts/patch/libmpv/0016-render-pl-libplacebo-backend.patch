@@ -584,15 +584,3 @@ index a91016d..0abc636 100644
      &render_backend_gpu,
      &render_backend_sw,
      NULL
-diff --git a/meson.build b/meson.build
---- a/meson.build
-+++ b/meson.build
-@@ -1364,6 +1364,8 @@ if features['metal']
-         'video/out/metal/ra_metal_init.m',
-         'video/out/metal/ra_metal_textures.m',
-         'video/out/metal/ra_metal_renderpass.m',
-+        # libplacebo-driven render-API backend (future-proofing vs vo_gpu)
-+        'video/out/render_pl.c',
-     )
-     add_project_arguments('-DMPV_HAVE_METAL=1', language: ['c', 'cpp', 'objc'])
- endif
