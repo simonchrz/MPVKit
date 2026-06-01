@@ -84,7 +84,9 @@ enum Library: String, CaseIterable {
             // branch). Pinned to a tag, not the live branch, so PR-review churn
             // can't move the production build. NOT a semver — the real libplacebo
             // version (7.365) comes from the built libplacebo.pc.
-            return "kuckuck-prod-1"
+            // prod-2 adds the review-fest work on top of prod-1: LGPL headers,
+            // GPU timers + gpu_flush, packed formats (rgb10a2 + iOS bgr565).
+            return "kuckuck-prod-2"
         case .libdovi:
             return "3.3.2"
         case .vulkan:

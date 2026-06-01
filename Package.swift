@@ -241,9 +241,10 @@ let package = Package(
 
         .binaryTarget(
             name: "Libplacebo",
-            // Our Metal-backend fork build (was the 7.360 prebuilt, no Metal).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.12/Libplacebo.xcframework.zip",
-            checksum: "8180184988c21ac99754756afe33362f353ee42aa34b0bb5049cc9ed5655c797"
+            // Our Metal-backend fork build (kuckuck-prod-2: LGPL headers, GPU
+            // timers + gpu_flush, packed formats rgb10a2 + iOS bgr565).
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.15/Libplacebo.xcframework.zip",
+            checksum: "34b37891e65d4d688654600a33e59498dec37e308cad2aed097fa633267fe7dd"
         ),
 
         .binaryTarget(
@@ -303,8 +304,10 @@ let package = Package(
         .binaryTarget(
             name: "Libmpv",
             // render_pl libplacebo backend (patch 0016); ra_metal removed (renderpl.14).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.14/Libmpv.xcframework.zip",
-            checksum: "d990a7ad3db45e2527503645194a53b5ff77c10310f1fec5156356540660ac11"
+            // renderpl.15: links libplacebo prod-2 + TEMP env-gated bgr565 probe
+            // (MPV_PL_FMT_TEST) in render_pl — remove after on-device validation.
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.15/Libmpv.xcframework.zip",
+            checksum: "4770779224fdc2abe07365ec9adf917a3e6347fea8678e07abe5ec9244925599"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
