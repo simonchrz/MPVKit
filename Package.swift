@@ -304,10 +304,10 @@ let package = Package(
         .binaryTarget(
             name: "Libmpv",
             // render_pl libplacebo backend (patch 0016); ra_metal removed (renderpl.14).
-            // renderpl.15: links libplacebo prod-2 + TEMP env-gated bgr565 probe
-            // (MPV_PL_FMT_TEST) in render_pl — remove after on-device validation.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.15/Libmpv.xcframework.zip",
-            checksum: "4770779224fdc2abe07365ec9adf917a3e6347fea8678e07abe5ec9244925599"
+            // renderpl.16: links libplacebo prod-2 (renderpl.15), bgr565 device
+            // probe removed after on-device validation (PASS on A19).
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.16/Libmpv.xcframework.zip",
+            checksum: "aa7f60e4f7817d68e6ec3b20bab713af8858b0ac7b404e2c29c2b308fbcf6a0e"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
