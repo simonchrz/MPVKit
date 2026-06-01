@@ -724,7 +724,19 @@ private class BuildFFMPEG: BaseBuild {
                 }
             }
         }
-        
+
+        // FFmpegs configure prüft libplacebo (~Zeile 7358) VOR vulkan (~7739),
+        // aber libplacebos Probe `#include <libplacebo/vulkan.h>` zieht
+        // `vulkan/vulkan.h`. In unserem Cross-Build ist vulkan ein gebündelter
+        // Dep (kein System-Header) → das -I fehlt zur Probe-Zeit, configure
+        // failt mit "libplacebo not found". Vulkan-Include global via
+        // --extra-cflags reinziehen, dann ist es ab dem ersten Check da.
+        // (libplacebo.a hat pl_vulkan_create → der Link der Probe passt.)
+        let vulkanInclude = URL.currentDirectory + ["vulkan", platform.rawValue, "thin", arch.rawValue, "include"]
+        if FileManager.default.fileExists(atPath: vulkanInclude.path) {
+            arguments.append("--extra-cflags=-I\(vulkanInclude.path)")
+        }
+
         return arguments
     }
 
