@@ -86,7 +86,10 @@ enum Library: String, CaseIterable {
             // version (7.365) comes from the built libplacebo.pc.
             // prod-2 adds the review-fest work on top of prod-1: LGPL headers,
             // GPU timers + gpu_flush, packed formats (rgb10a2 + iOS bgr565).
-            return "kuckuck-prod-2"
+            // prod-3 rebases prod-2 onto newer upstream master (shader/vulkan/
+            // tone-mapping fixes) + glslang-meson/read-write-caps from MR !858;
+            // apiver unchanged (365). Shipped in renderpl.17/.18.
+            return "kuckuck-prod-3"
         case .libdovi:
             return "3.3.2"
         case .vulkan:

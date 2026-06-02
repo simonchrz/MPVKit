@@ -19,6 +19,18 @@ enum Build {
         if !FileManager.default.fileExists(atPath: path.path) {
             try? FileManager.default.createDirectory(at: path, withIntermediateDirectories: false, attributes: nil)
         }
+        // spirv-cross wird standalone von build_spirv_cross.sh gebaut (es gibt
+        // kein mpvkit/libspirv-cross-build-Release). Fehlt dist/libspirv-cross
+        // (z.B. nach `make clean`), findet libmpvs meson `spirv-cross-c-shared`
+        // NICHT → `metal`-Feature disabled → render_pl.c fällt raus → -19-Crash
+        // (alle Videos crashen). Daher hier idempotent nachbauen wenn es fehlt,
+        // BEVOR der Build BuildMPV erreicht. (Run aus dem Repo-Root, vor dem
+        // cwd-Wechsel nach dist/ unten.)
+        let spvcDir = URL.currentDirectory + ["dist", "libspirv-cross"]
+        if !FileManager.default.fileExists(atPath: spvcDir.path) {
+            print("[MPVKit] dist/libspirv-cross fehlt → baue spirv-cross (build_spirv_cross.sh) …")
+            Utility.shell("bash Sources/BuildScripts/build_spirv_cross.sh")
+        }
         try? Utility.removeFiles(extensions: [".swift"], currentDirectoryURL: URL.currentDirectory + ["dist", "release"])
         FileManager.default.changeCurrentDirectoryPath(path.path)
         BaseBuild.options = options

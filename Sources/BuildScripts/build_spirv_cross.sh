@@ -13,9 +13,12 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DIST="$ROOT/dist/libspirv-cross"
 
-# Source checkout
+# Source checkout. Validate CMakeLists.txt — a bare `[ -d ]` check passes for a
+# half-finished / interrupted clone (dir exists but empty), which then fails the
+# whole build at the cmake step. Re-clone if the checkout is missing OR broken.
 SRC=/tmp/SPIRV-Cross-src
-if [ ! -d "$SRC" ]; then
+if [ ! -f "$SRC/CMakeLists.txt" ]; then
+    rm -rf "$SRC"
     git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Cross.git "$SRC"
 fi
 

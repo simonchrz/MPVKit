@@ -241,10 +241,11 @@ let package = Package(
 
         .binaryTarget(
             name: "Libplacebo",
-            // Our Metal-backend fork build (kuckuck-prod-2: LGPL headers, GPU
-            // timers + gpu_flush, packed formats rgb10a2 + iOS bgr565).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.15/Libplacebo.xcframework.zip",
-            checksum: "34b37891e65d4d688654600a33e59498dec37e308cad2aed097fa633267fe7dd"
+            // Our Metal-backend fork build (kuckuck-prod-3: prod-2 + rebased onto
+            // newer upstream master — shader/vulkan/tone-mapping fixes + glslang-
+            // meson/read-write-caps from MR !858; apiver pl_log_create 365).
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.17/Libplacebo.xcframework.zip",
+            checksum: "6640177a72b756ab6824ac1175529dad3e2f96887e09019c40ae204de031825f"
         ),
 
         .binaryTarget(
@@ -270,8 +271,10 @@ let package = Package(
         ),
         .binaryTarget(
             name: "Libavfilter",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.10/Libavfilter.xcframework.zip",
-            checksum: "241db72bc71889998a830ac4b3b385d27e665f28ff13814e4847bff3adc16a31"
+            // prod-3-consistent rebuild (renderpl.17): vf_libplacebo against
+            // libplacebo apiver 365, matching the Libplacebo target above.
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.17/Libavfilter.xcframework.zip",
+            checksum: "aa80c24c8306ea33a40182ec2d607e995b59bfe01a51962f364a3a3044c123ed"
         ),
         .binaryTarget(
             name: "Libavutil",
@@ -304,10 +307,11 @@ let package = Package(
         .binaryTarget(
             name: "Libmpv",
             // render_pl libplacebo backend (patch 0016); ra_metal removed (renderpl.14).
-            // renderpl.16: links libplacebo prod-2 (renderpl.15), bgr565 device
-            // probe removed after on-device validation (PASS on A19).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.16/Libmpv.xcframework.zip",
-            checksum: "aa7f60e4f7817d68e6ec3b20bab713af8858b0ac7b404e2c29c2b308fbcf6a0e"
+            // renderpl.18: render_pl.c rebuilt WITH spirv-cross present (renderpl.17
+            // had dropped it — make clean deleted dist/libspirv-cross, disabling the
+            // meson metal feature). Pairs with prod-3 Libplacebo/Libavfilter above.
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.18/Libmpv.xcframework.zip",
+            checksum: "dbb13e6c343ff6ddcc8b8381d9cdd510fdf3b7cb373c067049b6fa6c21c60468"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
