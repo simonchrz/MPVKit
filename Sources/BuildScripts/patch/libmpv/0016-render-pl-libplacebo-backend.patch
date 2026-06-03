@@ -12,7 +12,7 @@ new file mode 100644
 index 0000000..0936d27
 --- /dev/null
 +++ b/video/out/render_pl.c
-@@ -0,0 +1,553 @@
+@@ -0,0 +1,594 @@
 +/*
 + * libmpv render-API backend driven by libplacebo (pl_renderer) instead of the
 + * mpv `ra` abstraction. This is the future-proofing path: mpv is deprecating
@@ -43,6 +43,7 @@ index 0000000..0936d27
 +#include <libplacebo/metal.h>
 +#include <libplacebo/swapchain.h>
 +#include <libplacebo/cache.h>
++#include <libplacebo/shaders/custom.h>
 +#include <libplacebo/utils/frame_queue.h>
 +
 +#include <stdio.h>
@@ -96,6 +97,13 @@ index 0000000..0936d27
 +    pl_queue queue;
 +    uint64_t last_id;        // highest frame_id pushed (skip already-queued)
 +    bool want_reset;         // set by reset() (seek); drains the queue next render
++
++    // Optionaler User-Shader (z.B. Anime4K) aus env KUCKUCK_GLSL_SHADER (Datei-
++    // pfad, ein konkatenierter mpv-User-Shader). NULL = kein Hook. rparams =
++    // pl_render_high_quality_params (+ optional der Hook), gemeinsam für Render
++    // und Queue-Radius genutzt.
++    const struct pl_hook *user_hook;
++    struct pl_render_params rparams;
 +};
 +
 +// Per-source-frame state carried through the pl_queue map/unmap/discard
@@ -231,6 +239,33 @@ index 0000000..0936d27
 +    p->rr = pl_renderer_create(p->pllog, p->gpu);
 +    if (!p->rr)
 +        return MPV_ERROR_GENERIC;
++
++    // High-Quality-Render-Params (Debanding + ewa_lanczos + Sigmoid). Optional ein
++    // User-Shader (Anime4K etc.) aus env KUCKUCK_GLSL_SHADER: eine Datei mit einem
++    // (ggf. konkatenierten) mpv-User-Shader → pl_hook → params.hooks. App schaltet
++    // das per env (Toggle + Animation-Gate); fehlt es, identisch zu renderpl.19.
++    p->rparams = pl_render_high_quality_params;
++    const char *shader_path = getenv("KUCKUCK_GLSL_SHADER");
++    if (shader_path && shader_path[0]) {
++        FILE *sf = fopen(shader_path, "rb");
++        if (sf) {
++            fseek(sf, 0, SEEK_END);
++            long ssz = ftell(sf);
++            fseek(sf, 0, SEEK_SET);
++            if (ssz > 0 && ssz < 8 * 1024 * 1024) {
++                char *sbuf = talloc_size(p, ssz + 1);
++                size_t srd = fread(sbuf, 1, ssz, sf);
++                sbuf[srd] = 0;
++                p->user_hook = pl_mpv_user_shader_parse(p->gpu, sbuf, srd);
++                talloc_free(sbuf);
++            }
++            fclose(sf);
++        }
++        if (p->user_hook) {
++            p->rparams.hooks = &p->user_hook;   // 1-Element-Array (Adresse des Pointers)
++            p->rparams.num_hooks = 1;
++        }
++    }
 +
 +    p->queue = pl_queue_create(p->gpu);
 +    if (!p->queue)
@@ -474,7 +509,11 @@ index 0000000..0936d27
 +    if (frame && frame->current) {
 +        st = pl_queue_update(p->queue, &mix, pl_queue_params(
 +            .pts            = frame->current->pts,
-+            .radius         = pl_frame_mix_radius(&pl_render_high_quality_params),
++            // Kuckuck: high-quality statt default render-params (Debanding +
++            // ewa_lanczos-Upscaler + Sigmoid) — Qualitäts-Win v.a. für SD->Retina
++            // (Live-TV/KiKA) und Cartoon-Gradienten. Radius MUSS zu den Render-
++            // params passen (Interpolations-Konsistenz).
++            .radius         = pl_frame_mix_radius(&p->rparams),
 +            .vsync_duration = frame->ideal_frame_vsync_duration,
 +        ));
 +    }
@@ -487,7 +526,7 @@ index 0000000..0936d27
 +    // 4. Render. An empty mix (e.g. right after a seek, before frames arrive)
 +    //    clears the target; PL_QUEUE_MORE still yields the available frames.
 +    if (st != PL_QUEUE_ERR)
-+        pl_render_image_mix(p->rr, &mix, &target, &pl_render_high_quality_params);
++        pl_render_image_mix(p->rr, &mix, &target, &p->rparams);
 +
 +    // 5. Flush so the GPU work is submitted before the caller presents the
 +    //    drawable. (The caller owns presentation of dr->texture.)
@@ -527,6 +566,8 @@ index 0000000..0936d27
 +    // the AVFrames + mp_image refs) and the plane textures it owns.
 +    pl_queue_destroy(&p->queue);
 +    pl_renderer_destroy(&p->rr);
++    if (p->user_hook)
++        pl_mpv_user_shader_destroy(&p->user_hook);
 +    // Flush the (now warm) shader cache back to disk, then detach it from the
 +    // gpu before the gpu itself is destroyed.
 +    if (p->cache) {
