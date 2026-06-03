@@ -307,12 +307,12 @@ let package = Package(
         .binaryTarget(
             name: "Libmpv",
             // render_pl libplacebo backend (patch 0016); ra_metal removed (renderpl.14).
-            // renderpl.21: high_quality params + User-Shader-Hook via env
-            // KUCKUCK_GLSL_SHADER, jetzt PRO FRAME neu gelesen (strcmp-Guard) →
-            // App wechselt den Upscaler pro Video (Cartoon→Anime4K, Realfilm→RAVU,
-            // HD→aus). Pairs mit prod-3 Libplacebo/Libavfilter (renderpl.17).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.21/Libmpv.xcframework.zip",
-            checksum: "49c4164580f7bff449cc6adbc07a303cf8f61506d22a0c65bd72fd3ac11779a5"
+            // renderpl.22: + GPU-Deinterlace (BWDIF) für raw-TS-Tuner-Live-TV
+            // via env KUCKUCK_DEINTERLACE + Error-Diffusion-Dithering (sierra-lite).
+            // (renderpl.21: User-Shader-Hot-Swap pro Video, KUCKUCK_GLSL_SHADER.)
+            // Pairs mit prod-3 Libplacebo/Libavfilter (renderpl.17).
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.22/Libmpv.xcframework.zip",
+            checksum: "a8bee141221388a3cdbd11afec16ae47bf1bb13c34d90cd8982f4673b4f32ba1"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
