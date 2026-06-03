@@ -307,11 +307,11 @@ let package = Package(
         .binaryTarget(
             name: "Libmpv",
             // render_pl libplacebo backend (patch 0016); ra_metal removed (renderpl.14).
-            // renderpl.18: render_pl.c rebuilt WITH spirv-cross present (renderpl.17
-            // had dropped it — make clean deleted dist/libspirv-cross, disabling the
-            // meson metal feature). Pairs with prod-3 Libplacebo/Libavfilter above.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.18/Libmpv.xcframework.zip",
-            checksum: "dbb13e6c343ff6ddcc8b8381d9cdd510fdf3b7cb373c067049b6fa6c21c60468"
+            // renderpl.19: render_pl.c nutzt pl_render_high_quality_params (Debanding
+            // + ewa_lanczos + Sigmoid) statt -default. Pairs mit prod-3 Libplacebo/
+            // Libavfilter (renderpl.17).
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.19/Libmpv.xcframework.zip",
+            checksum: "6f39e3733ea75e934da88c90f44193aabb48b33dac46774c86e0b1d7ca233a06"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
