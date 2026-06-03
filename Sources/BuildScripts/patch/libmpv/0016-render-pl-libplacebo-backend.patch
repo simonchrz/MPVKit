@@ -12,7 +12,7 @@ new file mode 100644
 index 0000000..0936d27
 --- /dev/null
 +++ b/video/out/render_pl.c
-@@ -0,0 +1,594 @@
+@@ -0,0 +1,625 @@
 +/*
 + * libmpv render-API backend driven by libplacebo (pl_renderer) instead of the
 + * mpv `ra` abstraction. This is the future-proofing path: mpv is deprecating
@@ -103,6 +103,7 @@ index 0000000..0936d27
 +    // pl_render_high_quality_params (+ optional der Hook), gemeinsam für Render
 +    // und Queue-Radius genutzt.
 +    const struct pl_hook *user_hook;
++    char *user_shader_path;  // zuletzt geladener KUCKUCK_GLSL_SHADER-Pfad (strcmp-Cache)
 +    struct pl_render_params rparams;
 +};
 +
@@ -168,6 +169,52 @@ index 0000000..0936d27
 +        return false;
 +    int n = snprintf(buf, size, "%s/Library/Caches/render_pl_msl.cache", home);
 +    return n > 0 && (size_t) n < size;
++}
++
++// Lädt/wechselt den optionalen User-Shader (Anime4K/RAVU) aus env
++// KUCKUCK_GLSL_SHADER. Aufgerufen in pl_init UND pro Frame in pl_render: die App
++// setzt das env pro Video (Content-Gate: Cartoon→Anime4K, Realfilm→RAVU, HD→aus)
++// und der Render-Thread hot-swapt den pl_hook, sobald sich der Pfad ändert.
++// strcmp-Guard → fopen/parse nur bei echtem Wechsel, nicht jeden Frame. Leeres/
++// fehlendes env = kein Hook (Upscaler aus). Braucht p->gpu (in pl_init gesetzt).
++static void pl_apply_user_shader(struct priv *p)
++{
++    const char *path = getenv("KUCKUCK_GLSL_SHADER");
++    if (!path)
++        path = "";
++    const char *cur = p->user_shader_path ? p->user_shader_path : "";
++    if (strcmp(path, cur) == 0)
++        return;  // unverändert → nichts tun (kein fopen pro Frame)
++
++    // Pfad gewechselt → alten Hook weg, neuen laden (oder keinen).
++    if (p->user_hook)
++        pl_mpv_user_shader_destroy(&p->user_hook);
++    p->rparams.hooks = NULL;
++    p->rparams.num_hooks = 0;
++    talloc_free(p->user_shader_path);
++    p->user_shader_path = talloc_strdup(p, path);
++
++    if (!path[0])
++        return;  // env geleert → Upscaler aus
++
++    FILE *sf = fopen(path, "rb");
++    if (!sf)
++        return;
++    fseek(sf, 0, SEEK_END);
++    long ssz = ftell(sf);
++    fseek(sf, 0, SEEK_SET);
++    if (ssz > 0 && ssz < 8 * 1024 * 1024) {
++        char *sbuf = talloc_size(p, ssz + 1);
++        size_t srd = fread(sbuf, 1, ssz, sf);
++        sbuf[srd] = 0;
++        p->user_hook = pl_mpv_user_shader_parse(p->gpu, sbuf, srd);
++        talloc_free(sbuf);
++    }
++    fclose(sf);
++    if (p->user_hook) {
++        p->rparams.hooks = &p->user_hook;   // 1-Element-Array (Adresse des Pointers)
++        p->rparams.num_hooks = 1;
++    }
 +}
 +
 +static int pl_init(struct render_backend *ctx, mpv_render_param *params)
@@ -245,27 +292,7 @@ index 0000000..0936d27
 +    // (ggf. konkatenierten) mpv-User-Shader → pl_hook → params.hooks. App schaltet
 +    // das per env (Toggle + Animation-Gate); fehlt es, identisch zu renderpl.19.
 +    p->rparams = pl_render_high_quality_params;
-+    const char *shader_path = getenv("KUCKUCK_GLSL_SHADER");
-+    if (shader_path && shader_path[0]) {
-+        FILE *sf = fopen(shader_path, "rb");
-+        if (sf) {
-+            fseek(sf, 0, SEEK_END);
-+            long ssz = ftell(sf);
-+            fseek(sf, 0, SEEK_SET);
-+            if (ssz > 0 && ssz < 8 * 1024 * 1024) {
-+                char *sbuf = talloc_size(p, ssz + 1);
-+                size_t srd = fread(sbuf, 1, ssz, sf);
-+                sbuf[srd] = 0;
-+                p->user_hook = pl_mpv_user_shader_parse(p->gpu, sbuf, srd);
-+                talloc_free(sbuf);
-+            }
-+            fclose(sf);
-+        }
-+        if (p->user_hook) {
-+            p->rparams.hooks = &p->user_hook;   // 1-Element-Array (Adresse des Pointers)
-+            p->rparams.num_hooks = 1;
-+        }
-+    }
++    pl_apply_user_shader(p);   // initialer Shader aus env (App-Gate); pl_render recheckt
 +
 +    p->queue = pl_queue_create(p->gpu);
 +    if (!p->queue)
@@ -433,6 +460,10 @@ index 0000000..0936d27
 +                     struct vo_frame *frame)
 +{
 +    struct priv *p = ctx->priv;
++
++    // Pro-Video Hot-Swap des User-Shaders (App setzt env pro Content-Gate).
++    // Billiger strcmp-Guard; lädt nur bei echtem Pfadwechsel neu.
++    pl_apply_user_shader(p);
 +
 +    mpv_metal_drawable *dr =
 +        get_mpv_render_param(params, MPV_RENDER_PARAM_METAL_DRAWABLE, NULL);
