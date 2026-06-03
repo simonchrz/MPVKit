@@ -307,11 +307,11 @@ let package = Package(
         .binaryTarget(
             name: "Libmpv",
             // render_pl libplacebo backend (patch 0016); ra_metal removed (renderpl.14).
-            // renderpl.19: render_pl.c nutzt pl_render_high_quality_params (Debanding
-            // + ewa_lanczos + Sigmoid) statt -default. Pairs mit prod-3 Libplacebo/
-            // Libavfilter (renderpl.17).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.19/Libmpv.xcframework.zip",
-            checksum: "6f39e3733ea75e934da88c90f44193aabb48b33dac46774c86e0b1d7ca233a06"
+            // renderpl.20: high_quality params (renderpl.19) + optionaler User-Shader-
+            // Hook via env KUCKUCK_GLSL_SHADER (Anime4K für Cartoons). Pairs mit prod-3
+            // Libplacebo/Libavfilter (renderpl.17).
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.20/Libmpv.xcframework.zip",
+            checksum: "760d15715a9bee84ccbb9bf8d0559910611297eb8f407db8441e912cf5b5f8dd"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
