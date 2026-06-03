@@ -474,7 +474,7 @@ index 0000000..0936d27
 +    if (frame && frame->current) {
 +        st = pl_queue_update(p->queue, &mix, pl_queue_params(
 +            .pts            = frame->current->pts,
-+            .radius         = pl_frame_mix_radius(&pl_render_default_params),
++            .radius         = pl_frame_mix_radius(&pl_render_high_quality_params),
 +            .vsync_duration = frame->ideal_frame_vsync_duration,
 +        ));
 +    }
@@ -487,7 +487,7 @@ index 0000000..0936d27
 +    // 4. Render. An empty mix (e.g. right after a seek, before frames arrive)
 +    //    clears the target; PL_QUEUE_MORE still yields the available frames.
 +    if (st != PL_QUEUE_ERR)
-+        pl_render_image_mix(p->rr, &mix, &target, &pl_render_default_params);
++        pl_render_image_mix(p->rr, &mix, &target, &pl_render_high_quality_params);
 +
 +    // 5. Flush so the GPU work is submitted before the caller presents the
 +    //    drawable. (The caller owns presentation of dr->texture.)
