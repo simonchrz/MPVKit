@@ -9,10 +9,10 @@ index 02efefb..f64c418 100644
 +extern const struct render_backend_fns render_backend_pl;
 diff --git a/video/out/render_pl.c b/video/out/render_pl.c
 new file mode 100644
-index 0000000..09305b9
+index 0000000..f0bde4d
 --- /dev/null
 +++ b/video/out/render_pl.c
-@@ -0,0 +1,717 @@
+@@ -0,0 +1,754 @@
 +/*
 + * libmpv render-API backend driven by libplacebo (pl_renderer) instead of the
 + * mpv `ra` abstraction. This is the future-proofing path: mpv is deprecating
@@ -50,6 +50,7 @@ index 0000000..09305b9
 +
 +#include <stdio.h>
 +#include <limits.h>
++#include <time.h>
 +
 +#define PL_LIBAV_IMPLEMENTATION 1
 +#include <libplacebo/utils/libav.h>
@@ -509,6 +510,38 @@ index 0000000..09305b9
 +    talloc_free(subs);
 +}
 +
++// H-Instrumentierung (temporär): misst die pl_gpu_finish-Dauer = wie lange der
++// Render-Thread pro Frame blockiert, bis die GPU fertig ist. Dumpt avg/max alle
++// 300 Frames nach Documents/gpu-finish.log — NUR wenn env KUCKUCK_GPU_PROFILE
++// gesetzt ist; sonst nackter pl_gpu_finish ohne jeden Overhead. Belegt objektiv,
++// ob der Cross-Queue-Barrier-Stall relevant genug für den H-Redesign ist.
++static void gpu_finish_profiled(struct priv *p)
++{
++    if (!getenv("KUCKUCK_GPU_PROFILE")) {
++        pl_gpu_finish(p->gpu);
++        return;
++    }
++    static uint64_t n, sum_ns, max_ns;
++    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++    pl_gpu_finish(p->gpu);
++    uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
++    sum_ns += dt; n++;
++    if (dt > max_ns) max_ns = dt;
++    if (n >= 300) {
++        const char *home = getenv("HOME");
++        char path[PATH_MAX];
++        if (home && snprintf(path, sizeof path, "%s/Documents/gpu-finish.log", home) < (int) sizeof path) {
++            FILE *f = fopen(path, "a");
++            if (f) {
++                fprintf(f, "gpu_finish avg=%.1fus max=%.1fus n=%llu\n",
++                        sum_ns / (double) n / 1000.0, max_ns / 1000.0, (unsigned long long) n);
++                fclose(f);
++            }
++        }
++        n = 0; sum_ns = 0; max_ns = 0;
++    }
++}
++
 +static int pl_render(struct render_backend *ctx, mpv_render_param *params,
 +                     struct vo_frame *frame)
 +{
@@ -651,9 +684,13 @@ index 0000000..09305b9
 +    if (st != PL_QUEUE_ERR)
 +        pl_render_image_mix(p->rr, &mix, &target, &p->rparams);
 +
-+    // 5. Flush so the GPU work is submitted before the caller presents the
-+    //    drawable. (The caller owns presentation of dr->texture.)
-+    pl_gpu_finish(p->gpu);
++    // 5. Block until the GPU work is COMPLETE before the caller presents the
++    //    drawable. Load-bearing: libplacebo renders on its own Metal queue, the
++    //    host presents via bare [drawable present] on its own path — this finish
++    //    is the only cross-queue barrier. (H-Backlog: flush statt finish bräuchte
++    //    MTLSharedEvent-Sync. gpu_finish_profiled misst die Stall-Dauer wenn
++    //    KUCKUCK_GPU_PROFILE gesetzt — sonst nackter finish, kein Overhead.)
++    gpu_finish_profiled(p);
 +
 +    pl_tex_destroy(p->gpu, &target_tex);
 +
