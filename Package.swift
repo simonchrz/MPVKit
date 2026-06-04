@@ -307,12 +307,14 @@ let package = Package(
         .binaryTarget(
             name: "Libmpv",
             // render_pl libplacebo backend (patch 0016); ra_metal removed (renderpl.14).
-            // renderpl.22: + GPU-Deinterlace (BWDIF) für raw-TS-Tuner-Live-TV
-            // via env KUCKUCK_DEINTERLACE + Error-Diffusion-Dithering (sierra-lite).
-            // (renderpl.21: User-Shader-Hot-Swap pro Video, KUCKUCK_GLSL_SHADER.)
+            // renderpl.23: + #3 Frame-Interpolation — vo_gpu_next-parity im Multi-
+            // Frame-pl_queue-Pfad (can_interpolate/pts_offset/Refill-Guard/PTS-Clamp/
+            // bedingte vsync_duration; fixt schwarzes Bild bei interpolation=yes).
+            // (renderpl.22: GPU-Deinterlace BWDIF für raw-TS via KUCKUCK_DEINTERLACE
+            // + Error-Diffusion-Dithering. renderpl.21: User-Shader-Hot-Swap pro Video.)
             // Pairs mit prod-3 Libplacebo/Libavfilter (renderpl.17).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.22/Libmpv.xcframework.zip",
-            checksum: "a8bee141221388a3cdbd11afec16ae47bf1bb13c34d90cd8982f4673b4f32ba1"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.23/Libmpv.xcframework.zip",
+            checksum: "b792b6affa80b94a75787d1fecbb8f9fa779d11dd98c7b75ddaf685cf8e57a43"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]

@@ -9,10 +9,10 @@ index 02efefb..f64c418 100644
 +extern const struct render_backend_fns render_backend_pl;
 diff --git a/video/out/render_pl.c b/video/out/render_pl.c
 new file mode 100644
-index 0000000..0936d27
+index 0000000..f2d692e
 --- /dev/null
 +++ b/video/out/render_pl.c
-@@ -0,0 +1,645 @@
+@@ -0,0 +1,676 @@
 +/*
 + * libmpv render-API backend driven by libplacebo (pl_renderer) instead of the
 + * mpv `ra` abstraction. This is the future-proofing path: mpv is deprecating
@@ -526,6 +526,30 @@ index 0000000..0936d27
 +    //    (frame->frames[]); the queue dedups by frame_id, maps lazily and
 +    //    evicts past frames. On seek mpv calls reset() -> want_reset, which we
 +    //    drain here so the queue restarts cleanly at the new position.
++    //
++    // Interpolation parity with vo_gpu_next (Kuckuck #3): only blend when mpv
++    // actually display-syncs a multi-frame window (interpolation=yes). For the
++    // single-frame path (interpolation=no -> num_frames==1) can_interpolate is
++    // false and pts_offset / vsync_duration / source duration are 0 — the queue
++    // holds exactly the current frame at its pts, nothing is blended (the path
++    // that was the only one tested before). Without this distinction a naive
++    // multi-frame mix renders black: the target display time is pts +
++    // ideal_frame_vsync, and querying the queue at the bare current->pts (no
++    // offset, no clamp) returns PL_QUEUE_MORE with no frames -> empty mix.
++    bool can_interpolate = frame && frame->current && frame->display_synced &&
++                           !frame->still && frame->num_frames > 1;
++    double pts_offset = can_interpolate ? frame->ideal_frame_vsync : 0;
++
++    // Queue-refill guard (vo_gpu_next): if the queue's front frame is already
++    // ahead of our target pts, the queue desynced (e.g. seek) — force a reset so
++    // it refills cleanly instead of returning an empty (black) mix. Skipped when
++    // a reset is already pending (mpv's reset() on seek sets want_reset first).
++    if (frame && frame->current && !p->want_reset) {
++        struct pl_source_frame vpts;
++        if (pl_queue_peek(p->queue, 0, &vpts) &&
++            frame->current->pts + MPMAX(0, pts_offset) < vpts.pts)
++            p->want_reset = true;
++    }
 +    if (p->want_reset) {
 +        pl_queue_reset(p->queue);
 +        p->last_id = 0;
@@ -543,7 +567,7 @@ index 0000000..0936d27
 +        fr->mpi = mpi;
 +        pl_queue_push(p->queue, &(struct pl_source_frame) {
 +            .pts        = mpi->pts,
-+            .duration   = frame->approx_duration,
++            .duration   = can_interpolate ? frame->approx_duration : 0,
 +            .frame_data = fr,
 +            .map        = map_frame_pl,
 +            .unmap      = unmap_frame_pl,
@@ -552,21 +576,28 @@ index 0000000..0936d27
 +        p->last_id = id;
 +    }
 +
-+    // 3. Pull the frame mix for the current display time. vsync_duration drives
-+    //    interpolation; with mpv's interpolation off it delivers a single frame
-+    //    per render, so the mix holds one frame and nothing is blended.
++    // 3. Pull the frame mix for the current display time. With interpolation the
++    //    target is pts + pts_offset and vsync_duration drives the blend; without
++    //    it both are 0 and the mix holds the single current frame.
 +    struct pl_frame_mix mix = {0};
 +    enum pl_queue_status st = PL_QUEUE_OK;
 +    if (frame && frame->current) {
-+        st = pl_queue_update(p->queue, &mix, pl_queue_params(
-+            .pts            = frame->current->pts,
++        struct pl_queue_params qparams = *pl_queue_params(
++            .pts                     = frame->current->pts + pts_offset,
 +            // Kuckuck: high-quality statt default render-params (Debanding +
-+            // ewa_lanczos-Upscaler + Sigmoid) — Qualitäts-Win v.a. für SD->Retina
-+            // (Live-TV/KiKA) und Cartoon-Gradienten. Radius MUSS zu den Render-
-+            // params passen (Interpolations-Konsistenz).
-+            .radius         = pl_frame_mix_radius(&p->rparams),
-+            .vsync_duration = frame->ideal_frame_vsync_duration,
-+        ));
++            // ewa_lanczos-Upscaler + Sigmoid). Radius MUSS zu den Render-params
++            // passen (Interpolations-Konsistenz).
++            .radius                  = pl_frame_mix_radius(&p->rparams),
++            .vsync_duration          = can_interpolate ? frame->ideal_frame_vsync_duration : 0,
++            .interpolation_threshold = 0.01,  // mpv-Default: nahe 1:1-Ratio nicht blenden
++        );
++        // We may be up to half a vsync before the current frame time. If the
++        // queue's first frame is ahead of the requested pts, start there —
++        // otherwise pl_queue returns MORE with an empty mix (black).
++        struct pl_source_frame first;
++        if (pl_queue_peek(p->queue, 0, &first) && qparams.pts < first.pts)
++            qparams.pts = first.pts;
++        st = pl_queue_update(p->queue, &mix, &qparams);
 +    }
 +
 +    // 3b. OSD + subtitles at the current display pts → pl_overlay on the
