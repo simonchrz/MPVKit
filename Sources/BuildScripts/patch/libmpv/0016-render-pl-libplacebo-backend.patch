@@ -9,10 +9,10 @@ index 02efefb..f64c418 100644
 +extern const struct render_backend_fns render_backend_pl;
 diff --git a/video/out/render_pl.c b/video/out/render_pl.c
 new file mode 100644
-index 0000000..f2d692e
+index 0000000..3505ab2
 --- /dev/null
 +++ b/video/out/render_pl.c
-@@ -0,0 +1,676 @@
+@@ -0,0 +1,714 @@
 +/*
 + * libmpv render-API backend driven by libplacebo (pl_renderer) instead of the
 + * mpv `ra` abstraction. This is the future-proofing path: mpv is deprecating
@@ -107,6 +107,7 @@ index 0000000..f2d692e
 +    const struct pl_hook *user_hook;
 +    char *user_shader_path;  // zuletzt geladener KUCKUCK_GLSL_SHADER-Pfad (strcmp-Cache)
 +    bool deint;              // GPU-Deinterlacing an (env KUCKUCK_DEINTERLACE=1, raw-TS Live-TV)
++    char *deband_mode;       // zuletzt angewandter KUCKUCK_DEBAND-Modus (strcmp-Cache)
 +    struct pl_render_params rparams;
 +};
 +
@@ -227,6 +228,41 @@ index 0000000..f2d692e
 +    }
 +}
 +
++// Per-Content-Debanding-Presets (G). Default (high_quality) = pl_deband_default_
++// params {1, 3.0, 16, 4.0}. mild = leichter (Realfilm: gelegentliche Verläufe ohne
++// Weichzeichnen/Grain), strong = mehr Iterationen + höhere Schwelle (SD-Cartoons:
++// harte Flächen-Verläufe). HDR → off (Header warnt: Grain verschiebt HDR-Helligkeit).
++static const struct pl_deband_params deband_mild = {
++    .iterations = 1, .threshold = 2.0f, .radius = 16.0f, .grain = 2.0f,
++};
++static const struct pl_deband_params deband_strong = {
++    .iterations = 2, .threshold = 4.0f, .radius = 16.0f, .grain = 4.0f,
++};
++
++// Debanding pro Content via env KUCKUCK_DEBAND: off|mild|strong; unset/anderes =
++// high_quality-Default. App-Gate setzt es pro Video. strcmp-Cache wie der Upscaler
++// (kein Reassign pro Frame). off spart den Deband-Compute-Pass ganz.
++static void pl_apply_deband(struct priv *p)
++{
++    const char *mode = getenv("KUCKUCK_DEBAND");
++    if (!mode)
++        mode = "";
++    const char *cur = p->deband_mode ? p->deband_mode : "";
++    if (strcmp(mode, cur) == 0)
++        return;
++    talloc_free(p->deband_mode);
++    p->deband_mode = talloc_strdup(p, mode);
++
++    if (strcmp(mode, "off") == 0)
++        p->rparams.deband_params = NULL;
++    else if (strcmp(mode, "mild") == 0)
++        p->rparams.deband_params = &deband_mild;
++    else if (strcmp(mode, "strong") == 0)
++        p->rparams.deband_params = &deband_strong;
++    else
++        p->rparams.deband_params = &pl_deband_default_params;  // unset/unbekannt
++}
++
 +static int pl_init(struct render_backend *ctx, mpv_render_param *params)
 +{
 +    // Opt-in gate. render_backend_pl is registered before render_backend_gpu
@@ -306,6 +342,7 @@ index 0000000..f2d692e
 +    // Banding in Verläufen (dunkle Cartoon-Szenen, SD→Retina). Billiger Compute-Pass.
 +    p->rparams.error_diffusion = &pl_error_diffusion_sierra_lite;
 +    pl_apply_user_shader(p);   // initialer Shader aus env (App-Gate); pl_render recheckt
++    pl_apply_deband(p);        // initiales Deband-Preset aus env (App-Gate)
 +
 +    p->queue = pl_queue_create(p->gpu);
 +    if (!p->queue)
@@ -474,9 +511,10 @@ index 0000000..f2d692e
 +{
 +    struct priv *p = ctx->priv;
 +
-+    // Pro-Video Hot-Swap des User-Shaders (App setzt env pro Content-Gate).
-+    // Billiger strcmp-Guard; lädt nur bei echtem Pfadwechsel neu.
++    // Pro-Video Hot-Swap des User-Shaders + Deband-Presets (App setzt env pro
++    // Content-Gate). Billiger strcmp-Guard; wechselt nur bei echtem Wechsel.
 +    pl_apply_user_shader(p);
++    pl_apply_deband(p);
 +
 +    // GPU-Deinterlacing (A): App setzt KUCKUCK_DEINTERLACE=1 für raw-TS-Tuner-
 +    // Live-TV (576i, oft NICHT als interlaced geflaggt → erzwungen statt am Flag).
