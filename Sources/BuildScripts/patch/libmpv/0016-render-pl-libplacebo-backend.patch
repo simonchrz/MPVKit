@@ -9,10 +9,10 @@ index 02efefb..f64c418 100644
 +extern const struct render_backend_fns render_backend_pl;
 diff --git a/video/out/render_pl.c b/video/out/render_pl.c
 new file mode 100644
-index 0000000..3505ab2
+index 0000000..09305b9
 --- /dev/null
 +++ b/video/out/render_pl.c
-@@ -0,0 +1,714 @@
+@@ -0,0 +1,717 @@
 +/*
 + * libmpv render-API backend driven by libplacebo (pl_renderer) instead of the
 + * mpv `ra` abstraction. This is the future-proofing path: mpv is deprecating
@@ -229,14 +229,17 @@ index 0000000..3505ab2
 +}
 +
 +// Per-Content-Debanding-Presets (G). Default (high_quality) = pl_deband_default_
-+// params {1, 3.0, 16, 4.0}. mild = leichter (Realfilm: gelegentliche Verläufe ohne
-+// Weichzeichnen/Grain), strong = mehr Iterationen + höhere Schwelle (SD-Cartoons:
-+// harte Flächen-Verläufe). HDR → off (Header warnt: Grain verschiebt HDR-Helligkeit).
++// params {1, 3.0, 16, 4.0}. mild = Realfilm, strong = mehr Iterationen für
++// SD-Cartoon-Verläufe. **Grain bewusst auf 1.0** (statt libplacebos 4.0): die
++// IQ-Harness-Messung (2026-06-04) zeigte, dass das strukturelle Debanding der
++// `threshold` folgt, das Grain aber nur Rauschen addiert (TV 252→441) — v.a. auf
++// flachen Cartoon-Flächen sichtbar. Niedriges Grain behält den Banding-Vorteil
++// ohne das Rausch-Manko. HDR → off (Header warnt: Grain verschiebt HDR-Helligkeit).
 +static const struct pl_deband_params deband_mild = {
-+    .iterations = 1, .threshold = 2.0f, .radius = 16.0f, .grain = 2.0f,
++    .iterations = 1, .threshold = 3.0f, .radius = 16.0f, .grain = 1.0f,
 +};
 +static const struct pl_deband_params deband_strong = {
-+    .iterations = 2, .threshold = 4.0f, .radius = 16.0f, .grain = 4.0f,
++    .iterations = 2, .threshold = 4.0f, .radius = 16.0f, .grain = 1.0f,
 +};
 +
 +// Debanding pro Content via env KUCKUCK_DEBAND: off|mild|strong; unset/anderes =

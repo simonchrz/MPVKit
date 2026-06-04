@@ -307,13 +307,14 @@ let package = Package(
         .binaryTarget(
             name: "Libmpv",
             // render_pl libplacebo backend (patch 0016); ra_metal removed (renderpl.14).
-            // renderpl.24: + G Deband-pro-Content — env KUCKUCK_DEBAND (off|mild|
-            // strong; unset=high_quality-Default), App-Gate setzt pro Video.
+            // renderpl.25: G Deband-pro-Content — env KUCKUCK_DEBAND (off|mild|strong;
+            // unset=high_quality-Default), App-Gate pro Video. Grain 1.0 (IQ-Harness:
+            // strukturelles Debanding folgt threshold, grain addierte nur Rauschen).
             // (renderpl.23: #3 Frame-Interpolation, vo_gpu_next-parity Multi-Frame-
             // pl_queue. .22: GPU-Deinterlace BWDIF + Error-Diffusion. .21: Shader-Swap.)
             // Pairs mit prod-3 Libplacebo/Libavfilter (renderpl.17).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.24/Libmpv.xcframework.zip",
-            checksum: "8af981ba1d200af2b317922b1c1ee9d84a63689002d5dffe16f07ea14eaf7c20"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.25/Libmpv.xcframework.zip",
+            checksum: "add59e9d46d0f8050deff6ac35b3f36ab431d0f1cfb88f71a950bef0b94b47cf"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
