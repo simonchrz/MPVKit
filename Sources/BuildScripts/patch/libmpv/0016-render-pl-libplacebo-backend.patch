@@ -9,10 +9,10 @@ index 02efefb..f64c418 100644
 +extern const struct render_backend_fns render_backend_pl;
 diff --git a/video/out/render_pl.c b/video/out/render_pl.c
 new file mode 100644
-index 0000000..61e44b8
+index 0000000..69754a2
 --- /dev/null
 +++ b/video/out/render_pl.c
-@@ -0,0 +1,772 @@
+@@ -0,0 +1,784 @@
 +/*
 + * libmpv render-API backend driven by libplacebo (pl_renderer) instead of the
 + * mpv `ra` abstraction. This is the future-proofing path: mpv is deprecating
@@ -576,6 +576,18 @@ index 0000000..61e44b8
 +        }  // "1"/"bwdif"/sonst → Default (BWDIF)
 +    }
 +    p->rparams.deinterlace_params = p->deint ? &p->deint_params : NULL;
++
++    // Resolution-Render-Gate: ab ≥1080p-Quelle den teuren POLAREN ewa_lanczossharp-
++    // Upscaler durch einen SEPARABLEN Lanczos ersetzen. 1080p→Retina ist ein
++    // moderater Upscale (~2,4×) → optisch nahezu identisch, aber der Polar-Scaler
++    // war render-gebunden (~50ms/Frame → HD-Sport fiel auf 25 statt 50fps). 720p/SD
++    // behalten den polaren HQ-Scaler (dort hält's 50fps). KUCKUCK_HD_LIGHT=0 → aus (A/B).
++    int src_h = (frame && frame->current) ? frame->current->h : 0;
++    const char *hl = getenv("KUCKUCK_HD_LIGHT");
++    if (!(hl && hl[0] == '0') && src_h >= 1080)
++        p->rparams.upscaler = &pl_filter_lanczos;
++    else
++        p->rparams.upscaler = pl_render_high_quality_params.upscaler;
 +
 +    mpv_metal_drawable *dr =
 +        get_mpv_render_param(params, MPV_RENDER_PARAM_METAL_DRAWABLE, NULL);
