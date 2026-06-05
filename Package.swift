@@ -313,8 +313,8 @@ let package = Package(
             // (renderpl.23: #3 Frame-Interpolation, vo_gpu_next-parity Multi-Frame-
             // pl_queue. .22: GPU-Deinterlace BWDIF + Error-Diffusion. .21: Shader-Swap.)
             // Pairs mit prod-3 Libplacebo/Libavfilter (renderpl.17).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.29/Libmpv.xcframework.zip",
-            checksum: "5d25e7a6419c8d4c96006aee9288a2208615375567631aadfa4f8ef34cff4f89"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.30/Libmpv.xcframework.zip",
+            checksum: "ea958c01ab752f50d3c4f1499b10d1812fd5e6ad90007ae09e3978c31b28d6b4"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
