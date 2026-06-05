@@ -9,10 +9,10 @@ index 02efefb..f64c418 100644
 +extern const struct render_backend_fns render_backend_pl;
 diff --git a/video/out/render_pl.c b/video/out/render_pl.c
 new file mode 100644
-index 0000000..69754a2
+index 0000000..42fad66
 --- /dev/null
 +++ b/video/out/render_pl.c
-@@ -0,0 +1,784 @@
+@@ -0,0 +1,794 @@
 +/*
 + * libmpv render-API backend driven by libplacebo (pl_renderer) instead of the
 + * mpv `ra` abstraction. This is the future-proofing path: mpv is deprecating
@@ -584,10 +584,20 @@ index 0000000..69754a2
 +    // behalten den polaren HQ-Scaler (dort hält's 50fps). KUCKUCK_HD_LIGHT=0 → aus (A/B).
 +    int src_h = (frame && frame->current) ? frame->current->h : 0;
 +    const char *hl = getenv("KUCKUCK_HD_LIGHT");
-+    if (!(hl && hl[0] == '0') && src_h >= 1080)
++    if (!(hl && hl[0] == '0') && src_h >= 1080) {
++        // HD: separabler Scaler + Deband-Pass weg → ~50fps statt 25.
 +        p->rparams.upscaler = &pl_filter_lanczos;
-+    else
++        p->rparams.deband_params = NULL;
++    } else {
++        // SD/720p: polarer HQ-Scaler. Deband authoritativ aus dem env neu bestimmen
++        // (pl_apply_deband-strcmp-Cache hat es nach einem HD-Frame evtl. nicht restored).
 +        p->rparams.upscaler = pl_render_high_quality_params.upscaler;
++        const char *dm = getenv("KUCKUCK_DEBAND");
++        if (dm && strcmp(dm, "off") == 0)         p->rparams.deband_params = NULL;
++        else if (dm && strcmp(dm, "mild") == 0)   p->rparams.deband_params = &deband_mild;
++        else if (dm && strcmp(dm, "strong") == 0) p->rparams.deband_params = &deband_strong;
++        else                                      p->rparams.deband_params = &pl_deband_default_params;
++    }
 +
 +    mpv_metal_drawable *dr =
 +        get_mpv_render_param(params, MPV_RENDER_PARAM_METAL_DRAWABLE, NULL);
