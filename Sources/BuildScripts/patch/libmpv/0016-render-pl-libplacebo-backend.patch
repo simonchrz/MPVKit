@@ -9,10 +9,10 @@ index 02efefb..f64c418 100644
 +extern const struct render_backend_fns render_backend_pl;
 diff --git a/video/out/render_pl.c b/video/out/render_pl.c
 new file mode 100644
-index 0000000..f0bde4d
+index 0000000..61e44b8
 --- /dev/null
 +++ b/video/out/render_pl.c
-@@ -0,0 +1,754 @@
+@@ -0,0 +1,772 @@
 +/*
 + * libmpv render-API backend driven by libplacebo (pl_renderer) instead of the
 + * mpv `ra` abstraction. This is the future-proofing path: mpv is deprecating
@@ -107,7 +107,9 @@ index 0000000..f0bde4d
 +    // und Queue-Radius genutzt.
 +    const struct pl_hook *user_hook;
 +    char *user_shader_path;  // zuletzt geladener KUCKUCK_GLSL_SHADER-Pfad (strcmp-Cache)
-+    bool deint;              // GPU-Deinterlacing an (env KUCKUCK_DEINTERLACE=1, raw-TS Live-TV)
++    bool deint;              // GPU-Deinterlacing an (env KUCKUCK_DEINTERLACE, raw-TS Live-TV)
++    char *deint_algo;        // zuletzt geparster Deinterlace-Algo (strcmp-Cache)
++    struct pl_deinterlace_params deint_params;  // lokale Kopie (algo/skip wählbar via env)
 +    char *deband_mode;       // zuletzt angewandter KUCKUCK_DEBAND-Modus (strcmp-Cache)
 +    struct pl_render_params rparams;
 +};
@@ -552,12 +554,28 @@ index 0000000..f0bde4d
 +    pl_apply_user_shader(p);
 +    pl_apply_deband(p);
 +
-+    // GPU-Deinterlacing (A): App setzt KUCKUCK_DEINTERLACE=1 für raw-TS-Tuner-
-+    // Live-TV (576i, oft NICHT als interlaced geflaggt → erzwungen statt am Flag).
-+    // pl_queue rendert dann pro Feld (BWDIF default). map_frame_pl markt das Feld.
++    // GPU-Deinterlacing (A): App setzt KUCKUCK_DEINTERLACE für raw-TS-Tuner-Live-TV
++    // (576i, oft NICHT als interlaced geflaggt → erzwungen statt am Flag). pl_queue
++    // rendert pro Feld. map_frame_pl markt das Feld. Wert wählt den Algorithmus:
++    //   "1"/"bwdif" = BWDIF (beste, schwerste) · "yadif" = YADIF · "yadif-fast" =
++    //   YADIF+skip_spatial_check (leichter) · "bob" = Zeilenverdopplung (am leichtesten).
++    // Ziel: schärfste Stufe finden, die stabil 50p hält (App-Picker schaltet live um).
 +    const char *di = getenv("KUCKUCK_DEINTERLACE");
-+    p->deint = di && di[0] == '1';
-+    p->rparams.deinterlace_params = p->deint ? &pl_deinterlace_default_params : NULL;
++    p->deint = di && di[0] != '\0' && strcmp(di, "0") != 0;
++    if (p->deint && (!p->deint_algo || strcmp(p->deint_algo, di) != 0)) {
++        talloc_free(p->deint_algo);
++        p->deint_algo = talloc_strdup(p, di);
++        p->deint_params = pl_deinterlace_default_params;  // BWDIF-Basis
++        if (strcmp(di, "yadif") == 0) {
++            p->deint_params.algo = PL_DEINTERLACE_YADIF;
++        } else if (strcmp(di, "yadif-fast") == 0) {
++            p->deint_params.algo = PL_DEINTERLACE_YADIF;
++            p->deint_params.skip_spatial_check = true;
++        } else if (strcmp(di, "bob") == 0) {
++            p->deint_params.algo = PL_DEINTERLACE_BOB;
++        }  // "1"/"bwdif"/sonst → Default (BWDIF)
++    }
++    p->rparams.deinterlace_params = p->deint ? &p->deint_params : NULL;
 +
 +    mpv_metal_drawable *dr =
 +        get_mpv_render_param(params, MPV_RENDER_PARAM_METAL_DRAWABLE, NULL);
