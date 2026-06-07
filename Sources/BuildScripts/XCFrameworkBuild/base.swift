@@ -742,7 +742,11 @@ class BaseBuild {
                 if FileManager.default.fileExists(atPath: tmpChecksum.path) {
                     try? FileManager.default.removeItem(at: tmpChecksum)
                 }
-                try! Utility.launch(path: "wget", arguments: ["-q", "-O", tmpChecksum.path, target.checksum], currentDirectoryURL: FileManager.default.temporaryDirectory)
+                // Retry-fest: GitHub rate-limited den Checksum-wget-Schwung (~10 Deps
+                // auf einmal) → Code 8. Backoff-Retry statt sofortigem `try!`-Fatal.
+                try! Utility.launch(path: "/bin/bash", arguments: ["-c",
+                    "for i in 1 2 3 4 5 6; do wget -q -O '\(tmpChecksum.path)' '\(target.checksum)' && exit 0; sleep $((i*5)); done; exit 8"],
+                    currentDirectoryURL: FileManager.default.temporaryDirectory)
                 let checksum = try String(contentsOf: tmpChecksum, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
                 dependencyTargetContent += """
                 

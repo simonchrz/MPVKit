@@ -89,7 +89,11 @@ enum Library: String, CaseIterable {
             // prod-3 rebases prod-2 onto newer upstream master (shader/vulkan/
             // tone-mapping fixes) + glslang-meson/read-write-caps from MR !858;
             // apiver unchanged (365). Shipped in renderpl.17/.18.
-            return "kuckuck-prod-3"
+            // prod-4 rebases prod-3 onto videolan/master + MR !861 (HDR-Peak-Fix,
+            // Issue #371: max_peak detection vor linearize) + MR !859 (film_grain
+            // skip-averaging); apiver unchanged. Shipped in renderpl.32 (mit dem
+            // libmpv-HDR-Target-Deckel-Fix gegen zu grelles HDR).
+            return "kuckuck-prod-4"
         case .libdovi:
             return "3.3.2"
         case .vulkan:

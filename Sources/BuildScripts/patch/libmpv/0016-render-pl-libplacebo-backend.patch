@@ -621,11 +621,27 @@ index 0000000..11d1abd
 +    // tone-maps into HDR rather than clipping to SDR.
 +    bool hdr_target = target_tex->params.format &&
 +                      target_tex->params.format->type == PL_FMT_FLOAT;
++    // HDR-Target an die ECHTE Display-Faehigkeit koppeln statt generisches HDR10.
++    // pl_color_space_hdr10 = BT.2020/PQ mit ~10000-nit-Peak -> bei iPhone-Content
++    // (1000-4000 nit) praktisch Passthrough: keine Highlight-Roll-off -> "grell"
++    // (gemessen via tools/iq-harness/hdr_probe). Der CAMetalLayer ist itur_2100_PQ
++    // (BT.2020/PQ) -> Primaries+Transfer BEIBEHALTEN (sonst Desaturierung wie bei
++    // frueheren target-prim/trc-Overrides), nur max_luma auf die reale EDR-Peak
++    // deckeln -> libplacebo rollt hellen Content sauber auf den Display-Peak ab
++    // (mit MR !861 frame-peak-adaptiv). KUCKUCK_HDR_TARGET=hdr10 stellt das alte
++    // (ungedeckelte) Verhalten wieder her; KUCKUCK_HDR_TARGET_NITS setzt den Peak.
++    struct pl_color_space hdr_csp = pl_color_space_hdr10;
++    {
++        const char *hmode = getenv("KUCKUCK_HDR_TARGET");
++        const char *hnits = getenv("KUCKUCK_HDR_TARGET_NITS");
++        if (!(hmode && strcmp(hmode, "hdr10") == 0))
++            hdr_csp.hdr.max_luma = hnits ? (float) atof(hnits) : 1000.0f;
++    }
 +    struct pl_swapchain_frame sw_frame = {
 +        .fbo         = target_tex,
 +        .flipped     = false,
 +        .color_repr  = pl_color_repr_rgb,
-+        .color_space = hdr_target ? pl_color_space_hdr10 : pl_color_space_srgb,
++        .color_space = hdr_target ? hdr_csp : pl_color_space_srgb,
 +    };
 +    struct pl_frame target;
 +    pl_frame_from_swapchain(&target, &sw_frame);

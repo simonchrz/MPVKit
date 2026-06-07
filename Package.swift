@@ -241,11 +241,12 @@ let package = Package(
 
         .binaryTarget(
             name: "Libplacebo",
-            // Our Metal-backend fork build (kuckuck-prod-3: prod-2 + rebased onto
-            // newer upstream master — shader/vulkan/tone-mapping fixes + glslang-
-            // meson/read-write-caps from MR !858; apiver pl_log_create 365).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.17/Libplacebo.xcframework.zip",
-            checksum: "6640177a72b756ab6824ac1175529dad3e2f96887e09019c40ae204de031825f"
+            // Our Metal-backend fork build (kuckuck-prod-4: prod-3 rebased auf
+            // videolan/master + MR !861 HDR-Peak-Fix + MR !859 film_grain; apiver
+            // 365 unverändert). Ausgeliefert in renderpl.32 (mit dem libmpv-HDR-
+            // Target-Fix). Siehe libplacebo-Fork Tag kuckuck-prod-4.
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.32/Libplacebo.xcframework.zip",
+            checksum: "91dd1c2e8fb79759bc4871c97442a5db302380a4c6b9f803b024d46c1a1eafc4"
         ),
 
         .binaryTarget(
@@ -313,8 +314,8 @@ let package = Package(
             // (renderpl.23: #3 Frame-Interpolation, vo_gpu_next-parity Multi-Frame-
             // pl_queue. .22: GPU-Deinterlace BWDIF + Error-Diffusion. .21: Shader-Swap.)
             // Pairs mit prod-3 Libplacebo/Libavfilter (renderpl.17).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.31/Libmpv.xcframework.zip",
-            checksum: "524c666cc06819815c6462ebaacba682b01218d64e2e7a60df76a23d5be81977"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.32/Libmpv.xcframework.zip",
+            checksum: "32067d5c11be08e175338ad3f97ddf19a4de02b0566d862796be2eaafc7fc19f"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
