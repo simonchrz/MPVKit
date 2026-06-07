@@ -54,7 +54,11 @@ enum Library: String, CaseIterable {
         case .libmpv:
             return "master"
         case .FFmpeg:
-            return "n8.1.1"
+            // master statt n8.1.1 (2026-06-07, renderpl.33): User testet gern die
+            // neuesten Commits. Gebaut+on-device-verifiziert von master-HEAD d1faab7
+            // (8.0.git). Patch 0001-vt-inline-retry appliet sauber. Ein Rebuild zieht
+            // neueren master → dann re-testen. Zurück auf Stable: "n8.1.1".
+            return "master"
         case .openssl:
             return "3.3.5"
         case .gnutls:

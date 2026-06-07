@@ -257,40 +257,40 @@ let package = Package(
 
         .binaryTarget(
             name: "Libavcodec",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-master-n8.1-ios-metal.41/Libavcodec.xcframework.zip",
-            checksum: "1b4e7efd7af632b3b0883bde0cd30267ce95481e980f9bee0aa0568669f7a338"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.33/Libavcodec.xcframework.zip",
+            checksum: "f8888e9c750f405f8fa2ea69bc591e2d4b4a042a745e642c7976911ad35e0e23"
         ),
         .binaryTarget(
             name: "Libavdevice",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-master-n8.1-ios-metal.41/Libavdevice.xcframework.zip",
-            checksum: "9bb6aef3ddeef2984965818310e8d6014253700010f993a28fae87a1622edccc"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.33/Libavdevice.xcframework.zip",
+            checksum: "8241cf1795038b062705e5544686738d2903b36bd117f2fed47e98fc2f5d145f"
         ),
         .binaryTarget(
             name: "Libavformat",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-master-n8.1-ios-metal.41/Libavformat.xcframework.zip",
-            checksum: "029777b439e03be32e77fa7d2c9fc3a0c40cbd89e28d79040d7c4c93084f1d40"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.33/Libavformat.xcframework.zip",
+            checksum: "ad92f5e2874c5ea40318865d6d24b73b91ab7b53b7ce4aaa200c51a6991524eb"
         ),
         .binaryTarget(
             name: "Libavfilter",
             // prod-3-consistent rebuild (renderpl.17): vf_libplacebo against
             // libplacebo apiver 365, matching the Libplacebo target above.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.17/Libavfilter.xcframework.zip",
-            checksum: "aa80c24c8306ea33a40182ec2d607e995b59bfe01a51962f364a3a3044c123ed"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.33/Libavfilter.xcframework.zip",
+            checksum: "b5207955db5a9364d90fce5925847a0beceb1fa56d03ab81395879c1b96da98b"
         ),
         .binaryTarget(
             name: "Libavutil",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-master-n8.1-ios-metal.41/Libavutil.xcframework.zip",
-            checksum: "37cdda3494171b194f94981e16a84da1ab5f3ef919df3fe18aecb11b31ce074f"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.33/Libavutil.xcframework.zip",
+            checksum: "87ebaef435b47557e6ae4f066dc0453b516d47e389f29a38207ef131276069ef"
         ),
         .binaryTarget(
             name: "Libswresample",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-master-n8.1-ios-metal.41/Libswresample.xcframework.zip",
-            checksum: "94b506c8fda9c134a8dfedcabb3b95fae36fbb07d119b88e4eb5d10cdf3ffd12"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.33/Libswresample.xcframework.zip",
+            checksum: "76a6e400cfe8dffd0adf5c38901bc792ab1543228e6f101bb190a78858dd3ed2"
         ),
         .binaryTarget(
             name: "Libswscale",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-master-n8.1-ios-metal.41/Libswscale.xcframework.zip",
-            checksum: "90174ff1e8075d17ab9042aaa9f2a6b5ceff17ec3cc0ad5fe0c32e85a45fdfb2"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.33/Libswscale.xcframework.zip",
+            checksum: "5149b3ffc6a036fd029bb46f493bf97e7a03afd724f913bc4491aed602eeda8a"
         ),
 
         .binaryTarget(
@@ -314,8 +314,8 @@ let package = Package(
             // (renderpl.23: #3 Frame-Interpolation, vo_gpu_next-parity Multi-Frame-
             // pl_queue. .22: GPU-Deinterlace BWDIF + Error-Diffusion. .21: Shader-Swap.)
             // Pairs mit prod-3 Libplacebo/Libavfilter (renderpl.17).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.32/Libmpv.xcframework.zip",
-            checksum: "32067d5c11be08e175338ad3f97ddf19a4de02b0566d862796be2eaafc7fc19f"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.33/Libmpv.xcframework.zip",
+            checksum: "b7df9136131407fe4e6cee54a8c846147127dbdb09b2f474044d1bdb8ca07c30"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
