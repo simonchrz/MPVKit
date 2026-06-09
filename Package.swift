@@ -245,8 +245,8 @@ let package = Package(
             // videolan/master + MR !861 HDR-Peak-Fix + MR !859 film_grain; apiver
             // 365 unverändert). Ausgeliefert in renderpl.32 (mit dem libmpv-HDR-
             // Target-Fix). Siehe libplacebo-Fork Tag kuckuck-prod-4.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.32/Libplacebo.xcframework.zip",
-            checksum: "91dd1c2e8fb79759bc4871c97442a5db302380a4c6b9f803b024d46c1a1eafc4"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.36/Libplacebo.xcframework.zip",
+            checksum: "5fb680bbadea62adc105991538d1f2b93bfe4f3b12597c24ee6897aaa5a583da"
         ),
 
         .binaryTarget(
@@ -314,13 +314,15 @@ let package = Package(
             // (renderpl.23: #3 Frame-Interpolation, vo_gpu_next-parity Multi-Frame-
             // pl_queue. .22: GPU-Deinterlace BWDIF + Error-Diffusion. .21: Shader-Swap.)
             // Pairs mit prod-3 Libplacebo/Libavfilter (renderpl.17).
+            // renderpl.36: No-finish-Modus — env KUCKUCK_NO_FINISH (flush statt finish;
+            // Host presentet via CB auf geteilter Queue) + Host-Queue-Durchreichung.
             // renderpl.35: VT-Super-Resolution-Hook — env KUCKUCK_VT_SR, App-Bridge
             // kuckuck_vt_upscale (Apple-ML-SD-Upscaler, IOSurface zero-copy ins pl_frame).
             // renderpl.34: SDR-Helligkeits-Fix — Peak-Detection nur für HDR (CAS/ArtCNN-
             // User-Shader hoben lokale Peaks → prod-4/MR!861-Roll-off dimmte SDR „einen
             // Tick zu dunkel"). VT-Frame-Interp-Code wieder entfernt (verworfen).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.35/Libmpv.xcframework.zip",
-            checksum: "91af170134bc5f6d65e5afe9c5fd092be862525b70100cc20d5abae101a6811f"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.36/Libmpv.xcframework.zip",
+            checksum: "f28c4399f7a9a90e219939498a083551d0c6a359cce148090b773962ff31e8e9"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
