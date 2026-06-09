@@ -12,7 +12,7 @@ new file mode 100644
 index 0000000..11d1abd
 --- /dev/null
 +++ b/video/out/render_pl.c
-@@ -0,0 +1,917 @@
+@@ -0,0 +1,932 @@
 +/*
 + * libmpv render-API backend driven by libplacebo (pl_renderer) instead of the
 + * mpv `ra` abstraction. This is the future-proofing path: mpv is deprecating
@@ -397,6 +397,10 @@ index 0000000..11d1abd
 +
 +    p->metal = pl_metal_create(p->pllog, pl_metal_params(
 +        .device = init->device,
++        // Host-Queue teilen (wenn angeboten): Submissions des Hosts (PiP-Blit,
++        // Present-CB) ordnen sich automatisch hinter unser Frame-CB — die
++        // Voraussetzung für den No-finish-Pfad (s. pl_render Schritt 5).
++        .queue  = init->command_queue,
 +    ));
 +    if (!p->metal) {
 +        MP_FATAL(ctx, "Failed creating libplacebo Metal device.\n");
@@ -847,13 +851,24 @@ index 0000000..11d1abd
 +    if (st != PL_QUEUE_ERR)
 +        pl_render_image_mix(p->rr, &mix, &target, &p->rparams);
 +
-+    // 5. Block until the GPU work is COMPLETE before the caller presents the
-+    //    drawable. Load-bearing: libplacebo renders on its own Metal queue, the
-+    //    host presents via bare [drawable present] on its own path — this finish
-+    //    is the only cross-queue barrier. (H-Backlog: flush statt finish bräuchte
-+    //    MTLSharedEvent-Sync. gpu_finish_profiled misst die Stall-Dauer wenn
-+    //    KUCKUCK_GPU_PROFILE gesetzt — sonst nackter finish, kein Overhead.)
-+    gpu_finish_profiled(p);
++    // 5. Synchronisation zum Host-Present — zwei Modi:
++    //    Default: pl_gpu_finish blockt bis die GPU fertig ist, der Host darf
++    //    danach bare [drawable present] rufen (einzige Barriere, wenn der Host
++    //    eine EIGENE Queue nutzt oder CPU-seitig presentet).
++    //    KUCKUCK_NO_FINISH=1 (App-gated): nur Frame-CB committen (pl_gpu_flush),
++    //    KEIN Warten. Voraussetzungen (beide App-seitig erfüllt): (a) der Host
++    //    teilt seine MTLCommandQueue via init_params.command_queue, (b) der Host
++    //    presentet über einen CB auf DERSELBEN Queue (nicht CPU-seitig
++    //    drawable.present) — die Queue-FIFO ordnet Present + PiP-Blit hinter
++    //    unser Frame-CB, ohne CPU-Wait. Der Render-Thread spart die volle
++    //    GPU-Frame-Zeit (~8-13ms gemessen). gpu_finish_profiled misst die
++    //    Stall-Dauer im finish-Modus, wenn KUCKUCK_GPU_PROFILE gesetzt ist.
++    const char *nofin = getenv("KUCKUCK_NO_FINISH");
++    if (nofin && strcmp(nofin, "1") == 0) {
++        pl_gpu_flush(p->gpu);
++    } else {
++        gpu_finish_profiled(p);
++    }
 +
 +    pl_tex_destroy(p->gpu, &target_tex);
 +
