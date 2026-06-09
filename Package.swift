@@ -314,8 +314,11 @@ let package = Package(
             // (renderpl.23: #3 Frame-Interpolation, vo_gpu_next-parity Multi-Frame-
             // pl_queue. .22: GPU-Deinterlace BWDIF + Error-Diffusion. .21: Shader-Swap.)
             // Pairs mit prod-3 Libplacebo/Libavfilter (renderpl.17).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.33/Libmpv.xcframework.zip",
-            checksum: "b7df9136131407fe4e6cee54a8c846147127dbdb09b2f474044d1bdb8ca07c30"
+            // renderpl.34: SDR-Helligkeits-Fix — Peak-Detection nur für HDR (CAS/ArtCNN-
+            // User-Shader hoben lokale Peaks → prod-4/MR!861-Roll-off dimmte SDR „einen
+            // Tick zu dunkel"). VT-Frame-Interp-Code wieder entfernt (verworfen).
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.34/Libmpv.xcframework.zip",
+            checksum: "0074737e2ecce428995aacc64f9df16445a13b6a0e9e13ac094645b43064fe77"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]

@@ -12,7 +12,7 @@ new file mode 100644
 index 0000000..11d1abd
 --- /dev/null
 +++ b/video/out/render_pl.c
-@@ -0,0 +1,800 @@
+@@ -0,0 +1,806 @@
 +/*
 + * libmpv render-API backend driven by libplacebo (pl_renderer) instead of the
 + * mpv `ra` abstraction. This is the future-proofing path: mpv is deprecating
@@ -621,6 +621,12 @@ index 0000000..11d1abd
 +    // tone-maps into HDR rather than clipping to SDR.
 +    bool hdr_target = target_tex->params.format &&
 +                      target_tex->params.format->type == PL_FMT_FLOAT;
++    // Peak-Detection NUR fuer HDR. SDR braucht sie nicht — und mit prod-4 (MR!861,
++    // max-peak-Detection-Umbau) verschiebt sie bei aktivem User-Shader die Belichtung:
++    // CAS/ArtCNN heben lokale Spitzen -> hoeher gemessener Peak -> Roll-off dimmt das
++    // ganze SDR-Bild einen Tick zu dunkel (ohne Shader unauffaellig). Nur HDR behaelt
++    // die (dort gewollte + MR!861-korrekte) Peak-Detection.
++    p->rparams.peak_detect_params = hdr_target ? &pl_peak_detect_high_quality_params : NULL;
 +    // HDR-Target an die ECHTE Display-Faehigkeit koppeln statt generisches HDR10.
 +    // pl_color_space_hdr10 = BT.2020/PQ mit ~10000-nit-Peak -> bei iPhone-Content
 +    // (1000-4000 nit) praktisch Passthrough: keine Highlight-Roll-off -> "grell"
