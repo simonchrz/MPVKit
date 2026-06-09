@@ -12,7 +12,7 @@ new file mode 100644
 index 0000000..11d1abd
 --- /dev/null
 +++ b/video/out/render_pl.c
-@@ -0,0 +1,806 @@
+@@ -0,0 +1,917 @@
 +/*
 + * libmpv render-API backend driven by libplacebo (pl_renderer) instead of the
 + * mpv `ra` abstraction. This is the future-proofing path: mpv is deprecating
@@ -120,7 +120,92 @@ index 0000000..11d1abd
 +    struct priv *p;          // for the current source crop (p->src)
 +    struct mp_image *mpi;    // +1 ref, freed on unmap/discard
 +    AVFrame *av;             // alias of mpi's buffers, valid map..unmap
++    void *vt_pixbuf;         // VT-SR: +1-retained CVPixelBufferRef (dst), bis unmap
++    pl_tex vt_tex[2];        // VT-SR: gewrappte IOSurface-Planes (luma/chroma)
 +};
++
++// ---- VT-Super-Resolution (Apple ML-Upscaler via App-Bridge) ----------------
++// App-seitig implementiert (Kuckuck VTSuperResBridge.swift, @_cdecl); libmpv
++// referenziert die Symbole nur — sie lösen beim statischen App-Link auf.
++// upscale: 0 = Erfolg (out_pixbuf = +1-retained CVPixelBufferRef, out_iosurface
++// geborgt daraus, out_w/h = Ziel-Dimensionen); <0 = aus/nicht bereit/Fehler →
++// Normalpfad. release: gibt das CVPixelBuffer aus upscale wieder frei.
++extern int  kuckuck_vt_upscale(const uint8_t *y, int y_stride,
++                               const uint8_t *u, int u_stride,
++                               const uint8_t *v, int v_stride,
++                               int w, int h,
++                               void **out_pixbuf, void **out_iosurface,
++                               int *out_w, int *out_h);
++extern void kuckuck_vt_release(void *pixbuf);
++
++// Versucht den VT-SR-Pfad: SD-Frame (NV12/420P, 8-bit) via Apple-Super-
++// Resolution 2x hochskalieren, Ergebnis-IOSurface-Planes direkt als pl_frame
++// wrappen (kein GPU-Upload des Originals, keine CPU-Kopie des Ergebnisses).
++// Läuft 1x pro Quellframe (pl_queue-map, nicht pro vsync). Nur wenn die App es
++// via env KUCKUCK_VT_SR=1 freigibt (Content-Gate analog User-Shader; App setzt
++// es nur für SDR-SD-Realfilm). false = Normalpfad (pl_map_avframe_ex).
++static bool vt_sr_try_map(pl_gpu gpu, struct frame_ref *fr, struct pl_frame *frame)
++{
++    const char *env = getenv("KUCKUCK_VT_SR");
++    if (!env || strcmp(env, "1") != 0)
++        return false;
++    struct mp_image *mpi = fr->mpi;
++    if (fr->p->deint)
++        return false;            // GPU-Deint braucht Felder — nicht kombinierbar
++    bool nv12 = mpi->imgfmt == IMGFMT_NV12;
++    if (!nv12 && mpi->imgfmt != IMGFMT_420P)
++        return false;
++    int w = mpi->w, h = mpi->h;
++    if (w < 96 || h < 96 || w > 1280 || h > 1280)
++        return false;            // VT-SR-Input-Limits (A19: 96..1280)
++
++    void *pixbuf = NULL, *iosurf = NULL;
++    int ow = 0, oh = 0;
++    if (kuckuck_vt_upscale(mpi->planes[0], (int) mpi->stride[0],
++                           mpi->planes[1], (int) mpi->stride[1],
++                           nv12 ? NULL : mpi->planes[2],
++                           nv12 ? 0 : (int) mpi->stride[2],
++                           w, h, &pixbuf, &iosurf, &ow, &oh) != 0)
++        return false;
++
++    pl_fmt fmt_l = pl_find_named_fmt(gpu, "r8");
++    pl_fmt fmt_c = pl_find_named_fmt(gpu, "rg8");
++    pl_tex luma   = fmt_l ? pl_metal_wrap_iosurface(fr->p->metal, iosurf, 0, ow, oh, fmt_l) : NULL;
++    pl_tex chroma = fmt_c ? pl_metal_wrap_iosurface(fr->p->metal, iosurf, 1, ow / 2, oh / 2, fmt_c) : NULL;
++    if (!luma || !chroma) {
++        pl_tex_destroy(gpu, &luma);
++        pl_tex_destroy(gpu, &chroma);
++        kuckuck_vt_release(pixbuf);
++        return false;
++    }
++
++    *frame = (struct pl_frame) {
++        .num_planes = 2,
++        .planes = {
++            { .texture = luma, .components = 1,
++              .component_mapping = { PL_CHANNEL_Y, PL_CHANNEL_NONE,
++                                     PL_CHANNEL_NONE, PL_CHANNEL_NONE } },
++            { .texture = chroma, .components = 2,
++              .component_mapping = { PL_CHANNEL_CB, PL_CHANNEL_CR,
++                                     PL_CHANNEL_NONE, PL_CHANNEL_NONE } },
++        },
++        .repr = mpi->params.repr,
++        .color = mpi->params.color,
++    };
++    // Der Scaler liefert immer 8-bit 4:2:0, unabhängig von der Quell-Codierung.
++    frame->repr.bits = (struct pl_bit_encoding) { .sample_depth = 8, .color_depth = 8 };
++    pl_frame_set_chroma_location(frame, mpi->params.chroma_location);
++
++    // Quell-Crop (panscan/zoom) mit dem Upscale-Faktor mitskalieren.
++    double fx = (double) ow / w, fy = (double) oh / h;
++    struct mp_rect s = fr->p->src;
++    frame->crop = (struct pl_rect2df) { .x0 = s.x0 * fx, .y0 = s.y0 * fy,
++                                        .x1 = s.x1 * fx, .y1 = s.y1 * fy };
++    fr->vt_pixbuf = pixbuf;
++    fr->vt_tex[0] = luma;
++    fr->vt_tex[1] = chroma;
++    return true;
++}
 +
 +// pl_queue map: mp_image -> AVFrame -> pl_frame, uploading into the queue-owned
 +// plane textures. Applies mpv's source crop (panscan/zoom). On failure the
@@ -129,6 +214,8 @@ index 0000000..11d1abd
 +                         struct pl_frame *frame)
 +{
 +    struct frame_ref *fr = src->frame_data;
++    if (vt_sr_try_map(gpu, fr, frame))
++        return true;
 +    fr->av = mp_image_to_av_frame(fr->mpi);
 +    if (!fr->av) {
 +        talloc_free(fr->mpi);
@@ -159,7 +246,15 @@ index 0000000..11d1abd
 +                           const struct pl_source_frame *src)
 +{
 +    struct frame_ref *fr = src->frame_data;
-+    pl_unmap_avframe(gpu, frame);
++    if (fr->vt_pixbuf) {
++        // VT-SR-Pfad: gewrappte IOSurface-Texturen zerstören + dst-Buffer
++        // an die App-Bridge zurückgeben (Pool-Recycling erst ab hier erlaubt).
++        pl_tex_destroy(gpu, &fr->vt_tex[0]);
++        pl_tex_destroy(gpu, &fr->vt_tex[1]);
++        kuckuck_vt_release(fr->vt_pixbuf);
++    } else {
++        pl_unmap_avframe(gpu, frame);
++    }
 +    if (fr->av)
 +        av_frame_free(&fr->av);
 +    talloc_free(fr->mpi);
