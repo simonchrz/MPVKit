@@ -12,7 +12,7 @@ new file mode 100644
 index 0000000..11d1abd
 --- /dev/null
 +++ b/video/out/render_pl.c
-@@ -0,0 +1,932 @@
+@@ -0,0 +1,1053 @@
 +/*
 + * libmpv render-API backend driven by libplacebo (pl_renderer) instead of the
 + * mpv `ra` abstraction. This is the future-proofing path: mpv is deprecating
@@ -36,8 +36,12 @@ index 0000000..11d1abd
 +#include "sub/draw_bmp.h"
 +#include "video/mp_image.h"
 +#include "video/fmt-conversion.h"
++#include "video/hwdec.h"
 +#include "vo.h"
 +#include "placebo/utils.h"
++
++#include <libavutil/hwcontext.h>
++#include <CoreVideo/CoreVideo.h>
 +
 +#include <libplacebo/renderer.h>
 +#include <libplacebo/metal.h>
@@ -112,6 +116,12 @@ index 0000000..11d1abd
 +    struct pl_deinterlace_params deint_params;  // lokale Kopie (algo/skip wählbar via env)
 +    char *deband_mode;       // zuletzt angewandter KUCKUCK_DEBAND-Modus (strcmp-Cache)
 +    struct pl_render_params rparams;
++
++    // Zero-Copy-hwdec (J): VT-Device für vd_lavc (hwdec=videotoolbox ohne
++    // -copy). Die Frames (IMGFMT_VIDEOTOOLBOX) wrappen wir in map_frame_pl
++    // via IOSurface direkt als pl_frame — keine CPU-Kopie, kein Upload.
++    struct mp_hwdec_ctx vt_hwdev;
++    bool vt_hwdev_added;
 +};
 +
 +// Per-source-frame state carried through the pl_queue map/unmap/discard
@@ -137,6 +147,83 @@ index 0000000..11d1abd
 +                               void **out_pixbuf, void **out_iosurface,
 +                               int *out_w, int *out_h);
 +extern void kuckuck_vt_release(void *pixbuf);
++
++// Zero-Copy-hwdec (J): IMGFMT_VIDEOTOOLBOX-Frames (hwdec=videotoolbox ohne
++// -copy) tragen den CVPixelBuffer des Decoders in planes[3]. Dessen IOSurface-
++// Planes wrappen wir direkt als pl_frame — keine CPU-Kopie, kein GPU-Upload.
++// NV12 (8-bit → r8/rg8) + P010 (10-bit MSB-aligned → r16/rg16, bit_shift 6,
++// wie libplacebos eigene Vulkan-Zuordnung). Lebensdauer: fr->mpi hält den
++// AVFrame/CVPixelBuffer bis unmap; die Command-Buffer retainen Textur +
++// IOSurface (Use-Count) bis zum GPU-Abschluss, der Decoder-Pool recycelt
++// in-use-Surfaces nicht.
++static bool vt_wrap_map(pl_gpu gpu, struct frame_ref *fr, struct pl_frame *frame)
++{
++    struct mp_image *mpi = fr->mpi;
++    if (mpi->imgfmt != IMGFMT_VIDEOTOOLBOX)
++        return false;
++    CVPixelBufferRef pbuf = (CVPixelBufferRef) mpi->planes[3];
++    IOSurfaceRef surf = pbuf ? CVPixelBufferGetIOSurface(pbuf) : NULL;
++    if (!surf)
++        return false;
++
++    OSType pf = CVPixelBufferGetPixelFormatType(pbuf);
++    const char *lname, *cname;
++    struct pl_bit_encoding bits;
++    switch (pf) {
++    case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
++    case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
++        lname = "r8"; cname = "rg8";
++        bits = (struct pl_bit_encoding) { .sample_depth = 8, .color_depth = 8 };
++        break;
++    case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange:
++    case kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
++        lname = "r16"; cname = "rg16";
++        bits = (struct pl_bit_encoding) { .sample_depth = 16, .color_depth = 10,
++                                          .bit_shift = 6 };
++        break;
++    default:
++        return false;   // unbekanntes CV-Pixelformat → Normalpfad (Download)
++    }
++
++    int w  = (int) CVPixelBufferGetWidthOfPlane(pbuf, 0);
++    int h  = (int) CVPixelBufferGetHeightOfPlane(pbuf, 0);
++    int cw = (int) CVPixelBufferGetWidthOfPlane(pbuf, 1);
++    int ch = (int) CVPixelBufferGetHeightOfPlane(pbuf, 1);
++    pl_fmt fl = pl_find_named_fmt(gpu, lname);
++    pl_fmt fc = pl_find_named_fmt(gpu, cname);
++    pl_tex luma   = fl ? pl_metal_wrap_iosurface(fr->p->metal, surf, 0, w, h, fl) : NULL;
++    pl_tex chroma = fc ? pl_metal_wrap_iosurface(fr->p->metal, surf, 1, cw, ch, fc) : NULL;
++    if (!luma || !chroma) {
++        pl_tex_destroy(gpu, &luma);
++        pl_tex_destroy(gpu, &chroma);
++        return false;
++    }
++
++    *frame = (struct pl_frame) {
++        .num_planes = 2,
++        .planes = {
++            { .texture = luma, .components = 1,
++              .component_mapping = { PL_CHANNEL_Y, PL_CHANNEL_NONE,
++                                     PL_CHANNEL_NONE, PL_CHANNEL_NONE } },
++            { .texture = chroma, .components = 2,
++              .component_mapping = { PL_CHANNEL_CB, PL_CHANNEL_CR,
++                                     PL_CHANNEL_NONE, PL_CHANNEL_NONE } },
++        },
++        .repr = mpi->params.repr,
++        .color = mpi->params.color,
++    };
++    frame->repr.bits = bits;
++    pl_frame_set_chroma_location(frame, mpi->params.chroma_location);
++
++    struct mp_rect s = fr->p->src;
++    frame->crop = (struct pl_rect2df) { .x0 = s.x0, .y0 = s.y0,
++                                        .x1 = s.x1, .y1 = s.y1 };
++    // vt_pixbuf bleibt NULL: der Buffer gehört dem Decoder (via mpi/AVFrame),
++    // unmap zerstört nur die gewrappten Texturen.
++    fr->vt_tex[0] = luma;
++    fr->vt_tex[1] = chroma;
++    return true;
++}
 +
 +// Versucht den VT-SR-Pfad: SD-Frame (NV12/420P, 8-bit) via Apple-Super-
 +// Resolution 2x hochskalieren, Ergebnis-IOSurface-Planes direkt als pl_frame
@@ -214,6 +301,8 @@ index 0000000..11d1abd
 +                         struct pl_frame *frame)
 +{
 +    struct frame_ref *fr = src->frame_data;
++    if (vt_wrap_map(gpu, fr, frame))
++        return true;
 +    if (vt_sr_try_map(gpu, fr, frame))
 +        return true;
 +    fr->av = mp_image_to_av_frame(fr->mpi);
@@ -246,12 +335,15 @@ index 0000000..11d1abd
 +                           const struct pl_source_frame *src)
 +{
 +    struct frame_ref *fr = src->frame_data;
-+    if (fr->vt_pixbuf) {
-+        // VT-SR-Pfad: gewrappte IOSurface-Texturen zerstören + dst-Buffer
-+        // an die App-Bridge zurückgeben (Pool-Recycling erst ab hier erlaubt).
++    if (fr->vt_tex[0]) {
++        // IOSurface-Wrap-Pfade (Zero-Copy-hwdec / VT-SR): gewrappte Texturen
++        // zerstören; beim VT-SR-Pfad zusätzlich den dst-Buffer an die App-
++        // Bridge zurückgeben (Pool-Recycling erst ab hier erlaubt). Beim
++        // Zero-Copy-Pfad gehört der Buffer dem Decoder (via mpi, unten).
 +        pl_tex_destroy(gpu, &fr->vt_tex[0]);
 +        pl_tex_destroy(gpu, &fr->vt_tex[1]);
-+        kuckuck_vt_release(fr->vt_pixbuf);
++        if (fr->vt_pixbuf)
++            kuckuck_vt_release(fr->vt_pixbuf);
 +    } else {
 +        pl_unmap_avframe(gpu, frame);
 +    }
@@ -450,6 +542,24 @@ index 0000000..11d1abd
 +    pl_apply_deband(p);        // initiales Deband-Preset aus env (App-Gate)
 +
 +    p->queue = pl_queue_create(p->gpu);
++
++    // Zero-Copy-hwdec (J): VT-Device registrieren, damit vd_lavc
++    // hwdec=videotoolbox (ohne -copy) wählen kann. Ohne diesen Eintrag fiel
++    // plain videotoolbox historisch auf „Could not create device" → SW-Decode
++    // (mit den desaturierten Farben). Die IMGFMT_VIDEOTOOLBOX-Frames wrappt
++    // map_frame_pl/vt_wrap_map direkt (IOSurface → pl_tex, keine Kopie).
++    ctx->hwdec_devs = hwdec_devices_create();
++    AVBufferRef *vt_ref = NULL;
++    if (av_hwdevice_ctx_create(&vt_ref, AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
++                               NULL, NULL, 0) >= 0) {
++        p->vt_hwdev = (struct mp_hwdec_ctx) {
++            .driver_name   = "videotoolbox",
++            .av_device_ref = vt_ref,
++            .hw_imgfmt     = IMGFMT_VIDEOTOOLBOX,
++        };
++        hwdec_devices_add(ctx->hwdec_devs, &p->vt_hwdev);
++        p->vt_hwdev_added = true;
++    }
 +    if (!p->queue)
 +        return MPV_ERROR_GENERIC;
 +
@@ -460,6 +570,10 @@ index 0000000..11d1abd
 +static bool pl_check_format(struct render_backend *ctx, int imgfmt)
 +{
 +    struct priv *p = ctx->priv;
++    // Zero-Copy-hwdec: VT-Frames wrappen wir selbst (vt_wrap_map) —
++    // pl_test_pixfmt kennt das hw-Format auf dem Metal-Backend nicht.
++    if (imgfmt == IMGFMT_VIDEOTOOLBOX)
++        return p->vt_hwdev_added;
 +    // A format is renderable if libplacebo's libav mapper can describe it.
 +    // pl_test_pixfmt checks the underlying AVPixelFormat against the gpu's
 +    // capabilities without needing an actual frame.
@@ -900,6 +1014,13 @@ index 0000000..11d1abd
 +    struct priv *p = ctx->priv;
 +    if (!p)
 +        return;
++    // Zero-Copy-hwdec: Device deregistrieren + freigeben, Liste zerstören.
++    if (p->vt_hwdev_added) {
++        hwdec_devices_remove(ctx->hwdec_devs, &p->vt_hwdev);
++        av_buffer_unref(&p->vt_hwdev.av_device_ref);
++    }
++    hwdec_devices_destroy(ctx->hwdec_devs);
++    ctx->hwdec_devs = NULL;
 +    // Destroys the queue first: it unmaps/discards every cached frame (freeing
 +    // the AVFrames + mp_image refs) and the plane textures it owns.
 +    pl_queue_destroy(&p->queue);
