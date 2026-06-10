@@ -9,10 +9,10 @@ index 02efefb..f64c418 100644
 +extern const struct render_backend_fns render_backend_pl;
 diff --git a/video/out/render_pl.c b/video/out/render_pl.c
 new file mode 100644
-index 0000000..11d1abd
+index 0000000..d513855
 --- /dev/null
 +++ b/video/out/render_pl.c
-@@ -0,0 +1,1158 @@
+@@ -0,0 +1,1181 @@
 +/*
 + * libmpv render-API backend driven by libplacebo (pl_renderer) instead of the
 + * mpv `ra` abstraction. This is the future-proofing path: mpv is deprecating
@@ -157,6 +157,13 @@ index 0000000..11d1abd
 +extern int  kuckuck_vt_interp_sr(void *prev_src, void *cur_src, float phase,
 +                                 void **out_pixbuf, void **out_iosurface,
 +                                 int *out_w, int *out_h);
++// Zero-Copy-Variante: Decoder-CVPixelBuffer (hwdec=videotoolbox, planes[3])
++// direkt an die Bridge — Direct-Pass bei session-kompatiblen Dims, sonst
++// croppt/kopiert sie selbst (gelockter Buffer). Kontrakt wie upscale, aber
++// ohne src-Borrow (Motion-Interp läuft nur auf dem CPU-Tuner-Pfad).
++extern int  kuckuck_vt_upscale_pixbuf(void *cv_pixbuf,
++                                      void **out_pixbuf, void **out_iosurface,
++                                      int *out_w, int *out_h);
 +
 +// Zero-Copy-hwdec (J): IMGFMT_VIDEOTOOLBOX-Frames (hwdec=videotoolbox ohne
 +// -copy) tragen den CVPixelBuffer des Decoders in planes[3]. Dessen IOSurface-
@@ -249,22 +256,35 @@ index 0000000..11d1abd
 +    struct mp_image *mpi = fr->mpi;
 +    if (fr->p->deint)
 +        return false;            // GPU-Deint braucht Felder — nicht kombinierbar
-+    bool nv12 = mpi->imgfmt == IMGFMT_NV12;
-+    if (!nv12 && mpi->imgfmt != IMGFMT_420P)
-+        return false;
 +    int w = mpi->w, h = mpi->h;
 +    if (w < 96 || h < 96 || w > 1280 || h > 1280)
 +        return false;            // VT-SR-Input-Limits (A19: 96..1280)
 +
 +    void *pixbuf = NULL, *iosurf = NULL, *src_pixbuf = NULL;
 +    int ow = 0, oh = 0;
-+    if (kuckuck_vt_upscale(mpi->planes[0], (int) mpi->stride[0],
-+                           mpi->planes[1], (int) mpi->stride[1],
-+                           nv12 ? NULL : mpi->planes[2],
-+                           nv12 ? 0 : (int) mpi->stride[2],
-+                           w, h, &pixbuf, &iosurf, &ow, &oh,
-+                           &src_pixbuf) != 0)
-+        return false;
++    if (mpi->imgfmt == IMGFMT_VIDEOTOOLBOX) {
++        // Zero-Copy-hwdec: Decoder-CVPixelBuffer direkt an die Bridge.
++        // Nur 8-bit NV12 — P010/HDR ist kein SR-Kandidat (vt_wrap_map
++        // übernimmt nach unserem false).
++        CVPixelBufferRef pbuf = (CVPixelBufferRef) mpi->planes[3];
++        OSType pf = pbuf ? CVPixelBufferGetPixelFormatType(pbuf) : 0;
++        if (pf != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange &&
++            pf != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
++            return false;
++        if (kuckuck_vt_upscale_pixbuf(pbuf, &pixbuf, &iosurf, &ow, &oh) != 0)
++            return false;
++    } else {
++        bool nv12 = mpi->imgfmt == IMGFMT_NV12;
++        if (!nv12 && mpi->imgfmt != IMGFMT_420P)
++            return false;
++        if (kuckuck_vt_upscale(mpi->planes[0], (int) mpi->stride[0],
++                               mpi->planes[1], (int) mpi->stride[1],
++                               nv12 ? NULL : mpi->planes[2],
++                               nv12 ? 0 : (int) mpi->stride[2],
++                               w, h, &pixbuf, &iosurf, &ow, &oh,
++                               &src_pixbuf) != 0)
++            return false;
++    }
 +
 +    pl_fmt fmt_l = pl_find_named_fmt(gpu, "r8");
 +    pl_fmt fmt_c = pl_find_named_fmt(gpu, "rg8");
@@ -319,9 +339,12 @@ index 0000000..11d1abd
 +                         struct pl_frame *frame)
 +{
 +    struct frame_ref *fr = src->frame_data;
-+    if (vt_wrap_map(gpu, fr, frame))
-+        return true;
++    // Reihenfolge: vt_sr ZUERST — vt_wrap_map nimmt sonst jeden VT-Frame
++    // (Zero-Copy-Render ohne SR). vt_sr_try_map returnt für Nicht-Kandidaten
++    // (env aus, HD, 10-bit, Session lädt noch) false → vt_wrap als Fallback.
 +    if (vt_sr_try_map(gpu, fr, frame))
++        return true;
++    if (vt_wrap_map(gpu, fr, frame))
 +        return true;
 +    fr->av = mp_image_to_av_frame(fr->mpi);
 +    if (!fr->av) {
