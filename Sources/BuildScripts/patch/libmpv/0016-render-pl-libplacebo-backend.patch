@@ -12,7 +12,7 @@ new file mode 100644
 index 0000000..11d1abd
 --- /dev/null
 +++ b/video/out/render_pl.c
-@@ -0,0 +1,1053 @@
+@@ -0,0 +1,1158 @@
 +/*
 + * libmpv render-API backend driven by libplacebo (pl_renderer) instead of the
 + * mpv `ra` abstraction. This is the future-proofing path: mpv is deprecating
@@ -126,11 +126,15 @@ index 0000000..11d1abd
 +
 +// Per-source-frame state carried through the pl_queue map/unmap/discard
 +// callbacks. frame_data points at one of these.
++#define KUCKUCK_FR_MAGIC 0x4B564653u  // 'KVFS' — validiert pl_frame.user_data
++
 +struct frame_ref {
++    uint32_t magic;          // KUCKUCK_FR_MAGIC (user_data-Validierung im Mix)
 +    struct priv *p;          // for the current source crop (p->src)
 +    struct mp_image *mpi;    // +1 ref, freed on unmap/discard
 +    AVFrame *av;             // alias of mpi's buffers, valid map..unmap
 +    void *vt_pixbuf;         // VT-SR: +1-retained CVPixelBufferRef (dst), bis unmap
++    void *vt_src_pixbuf;     // VT-SR: +1-retained QUELL-Buffer (Motion-Interp)
 +    pl_tex vt_tex[2];        // VT-SR: gewrappte IOSurface-Planes (luma/chroma)
 +};
 +
@@ -145,8 +149,14 @@ index 0000000..11d1abd
 +                               const uint8_t *v, int v_stride,
 +                               int w, int h,
 +                               void **out_pixbuf, void **out_iosurface,
-+                               int *out_w, int *out_h);
++                               int *out_w, int *out_h,
++                               void **out_src_pixbuf);
 +extern void kuckuck_vt_release(void *pixbuf);
++// Motion-Interp (50→60): Zwischenbild bei `phase` zwischen den zwei von
++// upscale geborgten Quell-Buffern, anschließend 2x-SR. Kontrakt wie upscale.
++extern int  kuckuck_vt_interp_sr(void *prev_src, void *cur_src, float phase,
++                                 void **out_pixbuf, void **out_iosurface,
++                                 int *out_w, int *out_h);
 +
 +// Zero-Copy-hwdec (J): IMGFMT_VIDEOTOOLBOX-Frames (hwdec=videotoolbox ohne
 +// -copy) tragen den CVPixelBuffer des Decoders in planes[3]. Dessen IOSurface-
@@ -246,13 +256,14 @@ index 0000000..11d1abd
 +    if (w < 96 || h < 96 || w > 1280 || h > 1280)
 +        return false;            // VT-SR-Input-Limits (A19: 96..1280)
 +
-+    void *pixbuf = NULL, *iosurf = NULL;
++    void *pixbuf = NULL, *iosurf = NULL, *src_pixbuf = NULL;
 +    int ow = 0, oh = 0;
 +    if (kuckuck_vt_upscale(mpi->planes[0], (int) mpi->stride[0],
 +                           mpi->planes[1], (int) mpi->stride[1],
 +                           nv12 ? NULL : mpi->planes[2],
 +                           nv12 ? 0 : (int) mpi->stride[2],
-+                           w, h, &pixbuf, &iosurf, &ow, &oh) != 0)
++                           w, h, &pixbuf, &iosurf, &ow, &oh,
++                           &src_pixbuf) != 0)
 +        return false;
 +
 +    pl_fmt fmt_l = pl_find_named_fmt(gpu, "r8");
@@ -263,6 +274,8 @@ index 0000000..11d1abd
 +        pl_tex_destroy(gpu, &luma);
 +        pl_tex_destroy(gpu, &chroma);
 +        kuckuck_vt_release(pixbuf);
++        if (src_pixbuf)
++            kuckuck_vt_release(src_pixbuf);
 +        return false;
 +    }
 +
@@ -289,8 +302,13 @@ index 0000000..11d1abd
 +    frame->crop = (struct pl_rect2df) { .x0 = s.x0 * fx, .y0 = s.y0 * fy,
 +                                        .x1 = s.x1 * fx, .y1 = s.y1 * fy };
 +    fr->vt_pixbuf = pixbuf;
++    fr->vt_src_pixbuf = src_pixbuf;
 +    fr->vt_tex[0] = luma;
 +    fr->vt_tex[1] = chroma;
++    // user_data -> frame_ref: der Motion-Interp-Branch im Mix findet darueber
++    // die Quell-Buffer beider Nachbar-Frames (Magic validiert gegen Frames aus
++    // pl_map_avframe, deren user_data pl-intern belegt ist).
++    frame->user_data = fr;
 +    return true;
 +}
 +
@@ -344,6 +362,8 @@ index 0000000..11d1abd
 +        pl_tex_destroy(gpu, &fr->vt_tex[1]);
 +        if (fr->vt_pixbuf)
 +            kuckuck_vt_release(fr->vt_pixbuf);
++        if (fr->vt_src_pixbuf)
++            kuckuck_vt_release(fr->vt_src_pixbuf);
 +    } else {
 +        pl_unmap_avframe(gpu, frame);
 +    }
@@ -918,6 +938,7 @@ index 0000000..11d1abd
 +        if (!mpi)
 +            continue;
 +        struct frame_ref *fr = talloc_zero(NULL, struct frame_ref);
++        fr->magic = KUCKUCK_FR_MAGIC;
 +        fr->p   = p;
 +        fr->mpi = mpi;
 +        pl_queue_push(p->queue, &(struct pl_source_frame) {
@@ -960,9 +981,93 @@ index 0000000..11d1abd
 +    double osd_pts = (frame && frame->current) ? frame->current->pts : 0;
 +    update_osd(p, &target, osd_pts);
 +
-+    // 4. Render. An empty mix (e.g. right after a seek, before frames arrive)
-+    //    clears the target; PL_QUEUE_MORE still yields the available frames.
-+    if (st != PL_QUEUE_ERR)
++    // 4. Render.
++    //    Motion-Interp (env KUCKUCK_VT_INTERP, App-gated auf Tuner-Realfilm
++    //    ~50fps): liegt die Display-Zeit zwischen zwei VT-SR-Quellframes
++    //    (Phase 0.12..0.88), synthetisiert die App-Bridge das Zwischenbild
++    //    (optical flow @Quell-Res, dann 2x-SR) und wir rendern DAS statt des
++    //    Mixes — eliminiert den inhärenten 50-auf-60-Judder. Jeder Fehlschlag
++    //    fällt lautlos auf den normalen Mix-Render zurück.
++    bool did_interp = false;
++    const char *ienv = getenv("KUCKUCK_VT_INTERP");
++    if (ienv && strcmp(ienv, "1") == 0 && st == PL_QUEUE_OK && mix.num_frames >= 2) {
++        static int mi_calls, mi_synth, mi_nomix;
++        static int mi_nofr, mi_nosrc, mi_phase, mi_bridge;
++        mi_calls++;
++        int prev_i = -1, next_i = -1;
++        for (int i = 0; i < mix.num_frames; i++) {
++            float ts = mix.timestamps[i];
++            if (ts <= 0 && (prev_i < 0 || ts > mix.timestamps[prev_i]))
++                prev_i = i;
++            if (ts > 0 && (next_i < 0 || ts < mix.timestamps[next_i]))
++                next_i = i;
++        }
++        if (prev_i >= 0 && next_i >= 0) {
++            struct frame_ref *fp = mix.frames[prev_i]->user_data;
++            struct frame_ref *fn = mix.frames[next_i]->user_data;
++            float span = mix.timestamps[next_i] - mix.timestamps[prev_i];
++            float phase = span > 0 ? -mix.timestamps[prev_i] / span : 0;
++            bool fr_ok = fp && fn && fp->magic == KUCKUCK_FR_MAGIC &&
++                         fn->magic == KUCKUCK_FR_MAGIC;
++            bool src_ok = fr_ok && fp->vt_src_pixbuf && fn->vt_src_pixbuf;
++            // Enges Fenster: nur das Worst-Case-Frame (Phase ~0.5 = halber
++            // Frame daneben) synthetisieren. Die ±1/6-Phasen zeigen kaum
++            // sichtbaren Versatz, aber jede Synthese riskiert Optical-Flow-
++            // Wabern (statisches Logo über bewegtem Hintergrund) — Vollglättung
++            // (0.12..0.88, 83% synth) waberte sichtbar.
++            bool ph_ok = phase > 0.38f && phase < 0.62f;
++            if (!fr_ok) mi_nofr++;
++            else if (!src_ok) mi_nosrc++;
++            else if (!ph_ok) mi_phase++;
++            if (fr_ok && src_ok && ph_ok)
++            {
++                void *pixbuf = NULL, *iosurf = NULL;
++                int ow = 0, oh = 0;
++                int irc = kuckuck_vt_interp_sr(fp->vt_src_pixbuf, fn->vt_src_pixbuf,
++                                               phase, &pixbuf, &iosurf, &ow, &oh);
++                if (irc != 0)
++                    mi_bridge++;
++                if (irc == 0)
++                {
++                    pl_fmt fmt_l = pl_find_named_fmt(p->gpu, "r8");
++                    pl_fmt fmt_c = pl_find_named_fmt(p->gpu, "rg8");
++                    pl_tex luma   = fmt_l ? pl_metal_wrap_iosurface(p->metal, iosurf, 0, ow, oh, fmt_l) : NULL;
++                    pl_tex chroma = fmt_c ? pl_metal_wrap_iosurface(p->metal, iosurf, 1, ow / 2, oh / 2, fmt_c) : NULL;
++                    if (luma && chroma) {
++                        // Frame-Setup vom "next"-Nachbarn übernehmen (gleiche
++                        // Dims/Crop/Repr — nur die Texturen sind das Synth-Bild).
++                        struct pl_frame synth = *mix.frames[next_i];
++                        synth.planes[0].texture = luma;
++                        synth.planes[1].texture = chroma;
++                        synth.num_overlays = 0;   // OSD hängt am Target
++                        pl_render_image(p->rr, &synth, &target, &p->rparams);
++                        did_interp = true;
++                        mi_synth++;
++                    }
++                    pl_tex_destroy(p->gpu, &luma);
++                    pl_tex_destroy(p->gpu, &chroma);
++                    kuckuck_vt_release(pixbuf);
++                }
++            }
++        } else {
++            mi_nomix++;
++        }
++        if (mi_calls % 300 == 0) {
++            const char *home2 = getenv("HOME");
++            char path2[PATH_MAX];
++            if (home2 && snprintf(path2, sizeof path2, "%s/Documents/vt-mi.log", home2) < (int) sizeof path2) {
++                FILE *f2 = fopen(path2, "a");
++                if (f2) {
++                    fprintf(f2, "[vt-mi] calls=%d synth=%d nomix=%d nofr=%d nosrc=%d phase=%d bridge=%d mixN=%d\n",
++                            mi_calls, mi_synth, mi_nomix, mi_nofr, mi_nosrc, mi_phase, mi_bridge, mix.num_frames);
++                    fclose(f2);
++                }
++            }
++        }
++    }
++    // An empty mix (e.g. right after a seek, before frames arrive)
++    // clears the target; PL_QUEUE_MORE still yields the available frames.
++    if (!did_interp && st != PL_QUEUE_ERR)
 +        pl_render_image_mix(p->rr, &mix, &target, &p->rparams);
 +
 +    // 5. Synchronisation zum Host-Present — zwei Modi:
@@ -1067,7 +1172,7 @@ index 0000000..11d1abd
 +    .destroy         = pl_destroy,
 +};
 diff --git a/video/out/vo_libmpv.c b/video/out/vo_libmpv.c
-index a91016d..0abc636 100644
+index a91016d..9084c85 100644
 --- a/video/out/vo_libmpv.c
 +++ b/video/out/vo_libmpv.c
 @@ -112,6 +112,13 @@ struct mpv_render_context {
@@ -1084,3 +1189,16 @@ index a91016d..0abc636 100644
      &render_backend_gpu,
      &render_backend_sw,
      NULL
+@@ -736,6 +743,12 @@ static int preinit(struct vo *vo)
+     mp_mutex_unlock(&ctx->lock);
+ 
+     vo->hwdec_devs = ctx->hwdec_devs;
++    // Kuckuck: Multi-Frame-Fenster für display-synced Interpolation anfordern
++    // (vo_gpu_next-Parität). Ohne diesen Call bleibt vo->in->req_frames auf 1
++    // → frame->num_frames == 1 → can_interpolate in render_pl nie wahr (weder
++    // pl_queue-Oversample-Mix noch der VT-Zwischenbild-Branch sehen Nachbarn).
++    // 3 = aktueller Frame + je ein Nachbar in beide Richtungen.
++    vo_set_queue_params(vo, 0, 3);
+     control(vo, VOCTRL_PREINIT, NULL);
+ 
+     return 0;
