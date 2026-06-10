@@ -314,6 +314,10 @@ let package = Package(
             // (renderpl.23: #3 Frame-Interpolation, vo_gpu_next-parity Multi-Frame-
             // pl_queue. .22: GPU-Deinterlace BWDIF + Error-Diffusion. .21: Shader-Swap.)
             // Pairs mit prod-3 Libplacebo/Libavfilter (renderpl.17).
+            // renderpl.39: VT-SR auf Zero-Copy-hwdec — vt_sr_try_map nimmt
+            // IMGFMT_VIDEOTOOLBOX (Decoder-CVPixelBuffer → kuckuck_vt_upscale_pixbuf,
+            // Direct-Pass/Crop in der Bridge), map-Reorder vt_sr VOR vt_wrap. ABI:
+            // neues extern kuckuck_vt_upscale_pixbuf — braucht App mit dem @_cdecl.
             // renderpl.38: Motion-Interp 50→60 (VT-Zwischenbilder, Default AN, enges
             // Phasenfenster) + vo_set_queue_params(3) (Multi-Frame-Mixe). ABI:
             // kuckuck_vt_upscale 13 Args — braucht App >=7714e4b.
@@ -326,8 +330,8 @@ let package = Package(
             // renderpl.34: SDR-Helligkeits-Fix — Peak-Detection nur für HDR (CAS/ArtCNN-
             // User-Shader hoben lokale Peaks → prod-4/MR!861-Roll-off dimmte SDR „einen
             // Tick zu dunkel"). VT-Frame-Interp-Code wieder entfernt (verworfen).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.38/Libmpv.xcframework.zip",
-            checksum: "0ddcdff68ade24cac29dce87c140d78e4cd850de6ce60f84a75110cd88b724ef"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.39/Libmpv.xcframework.zip",
+            checksum: "c7864411eb76de09422827fee3d3e27c8dc51799c12f4bace4659569cf272544"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
