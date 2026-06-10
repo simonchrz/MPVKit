@@ -314,6 +314,8 @@ let package = Package(
             // (renderpl.23: #3 Frame-Interpolation, vo_gpu_next-parity Multi-Frame-
             // pl_queue. .22: GPU-Deinterlace BWDIF + Error-Diffusion. .21: Shader-Swap.)
             // Pairs mit prod-3 Libplacebo/Libavfilter (renderpl.17).
+            // renderpl.37: Zero-Copy-hwdec — VT-Device registriert (plain videotoolbox
+            // funktioniert), Decoder-CVPixelBuffer via IOSurface direkt als pl_frame.
             // renderpl.36: No-finish-Modus — env KUCKUCK_NO_FINISH (flush statt finish;
             // Host presentet via CB auf geteilter Queue) + Host-Queue-Durchreichung.
             // renderpl.35: VT-Super-Resolution-Hook — env KUCKUCK_VT_SR, App-Bridge
@@ -321,8 +323,8 @@ let package = Package(
             // renderpl.34: SDR-Helligkeits-Fix — Peak-Detection nur für HDR (CAS/ArtCNN-
             // User-Shader hoben lokale Peaks → prod-4/MR!861-Roll-off dimmte SDR „einen
             // Tick zu dunkel"). VT-Frame-Interp-Code wieder entfernt (verworfen).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.36/Libmpv.xcframework.zip",
-            checksum: "f28c4399f7a9a90e219939498a083551d0c6a359cce148090b773962ff31e8e9"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.37/Libmpv.xcframework.zip",
+            checksum: "1f99978d9a91c34a475ff3a6d339596f2076831f5b93abb3371ddfb2cd8d9eb4"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
