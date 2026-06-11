@@ -1,0 +1,57 @@
+diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
+index ff6a22a..daaa878 100644
+--- a/video/decode/vd_lavc.c
++++ b/video/decode/vd_lavc.c
+@@ -240,6 +240,7 @@ typedef struct lavc_ctx {
+ 
+     bool hwdec_request_reinit;
+     int hwdec_fail_count;
++    int hwdec_recover_count; // bounded same-hwdec reinit attempts before SW fallback
+ 
+     struct mp_image_pool *hwdec_swpool;
+ 
+@@ -932,6 +933,7 @@ static void uninit_avctx(struct mp_filter *vd)
+ 
+     ctx->hwdec_failed = false;
+     ctx->hwdec_fail_count = 0;
++    ctx->hwdec_recover_count = 0;
+     ctx->max_delay_queue = 0;
+     ctx->hw_probing = false;
+     ctx->hwdec = (struct hwdec_info){0};
+@@ -1288,6 +1290,7 @@ static int decode_frame(struct mp_filter *vd)
+     }
+ 
+     ctx->hwdec_fail_count = 0;
++    ctx->hwdec_recover_count = 0;
+ 
+     mpi->pts = mp_pts_from_av(ctx->pic->pts, &ctx->codec_timebase);
+     mpi->dts = mp_pts_from_av(ctx->pic->pkt_dts, &ctx->codec_timebase);
+@@ -1312,6 +1315,28 @@ static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
+         ctx->sent_packets = NULL;
+         ctx->num_sent_packets = 0;
+ 
++        // Kuckuck: a hwdec session can die *recoverably* — iOS invalidates the
++        // VideoToolbox session when the app backgrounds, a macOS GPU reset, etc.
++        // The decode then fails for the handful of in-flight frames at once,
++        // tripping the software-fallback threshold even though the hwdec would
++        // work again immediately. Before permanently descending the hwdec list
++        // to software (desaturated SW decode that only a full reload recovers),
++        // re-init the SAME hwdec once: reinit() rebuilds the decode session in
++        // place and sets wait_for_keyframe to guard against an immediate
++        // re-fallback. hwdec_recover_count is reset on the next good frame, so
++        // every distinct session-loss event gets one fresh attempt, while a
++        // genuinely broken hwdec still descends to software on the next failure.
++        if (ctx->use_hwdec && ctx->hwdec_recover_count < 1) {
++            ctx->hwdec_recover_count += 1;
++            MP_WARN(vd, "Hardware decoding failed; re-initializing hwdec before "
++                        "software fallback (recovery attempt %d).\n",
++                        ctx->hwdec_recover_count);
++            reinit(vd);
++            ctx->requeue_packets = pkts;
++            ctx->num_requeue_packets = num_pkts;
++            return 0; // retry on the freshly re-inited decoder
++        }
++
+         /*
+          * We repeatedly force_fallback until we get an avctx, because there are
+          * certain hwdecs that are really full decoders, and so if these fail,

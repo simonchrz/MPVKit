@@ -57,9 +57,10 @@ enum Library: String, CaseIterable {
             // master statt n8.1.1 (2026-06-07, renderpl.33): User testet gern die
             // neuesten Commits. Rebase 2026-06-11 (renderpl.42) auf master-HEAD
             // 625ab01 (vorher d1faab7); 103 Commits, Gros swscale-uops-Refactor,
-            // keine VideoToolbox-/HDR-Änderung. Patch 0001-vt-inline-retry appliet
-            // sauber. Ein Rebuild zieht neueren master → dann re-testen. Zurück auf
-            // Stable: "n8.1.1".
+            // keine VideoToolbox-/HDR-Änderung. KEINE FFmpeg-Patches mehr (renderpl.43:
+            // 0001-vt-inline-retry entfernt → VT-Recovery wandert nach libmpv vd_lavc
+            // Patch 0017). Ein Rebuild zieht neueren master → dann re-testen. Zurück
+            // auf Stable: "n8.1.1".
             return "master"
         case .openssl:
             return "3.3.5"

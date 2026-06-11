@@ -260,8 +260,11 @@ let package = Package(
 
         .binaryTarget(
             name: "Libavcodec",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.42/Libavcodec.xcframework.zip",
-            checksum: "e01c8327e9555b31224059de45a1d30c30f938f20190a2467e6856c8a57ae736"
+            // renderpl.43: identisch .42 (FFmpeg 625ab01) MINUS dem FFmpeg-Patch
+            // 0001-vt-inline-retry — die VT-Session-Recovery wandert von hier in
+            // libmpv (vd_lavc-Patch 0017, s. Libmpv unten). Sonst kein Source-Δ.
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.43/Libavcodec.xcframework.zip",
+            checksum: "1ea1d0a5a23dfbb56ed1d6136e0ed6f8b8d997e46071759021fb3cef814bdaf5"
         ),
         .binaryTarget(
             name: "Libavdevice",
@@ -341,8 +344,14 @@ let package = Package(
             // renderpl.34: SDR-Helligkeits-Fix — Peak-Detection nur für HDR (CAS/ArtCNN-
             // User-Shader hoben lokale Peaks → prod-4/MR!861-Roll-off dimmte SDR „einen
             // Tick zu dunkel"). VT-Frame-Interp-Code wieder entfernt (verworfen).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.42/Libmpv.xcframework.zip",
-            checksum: "8addb588a5c37bc725cbb961efe01dea7f5c1cd6b3a3c090c6443eafe0f52ed3"
+            // renderpl.43: neuer Patch 0017 (vd_lavc) — VT-Background-Death-Recovery
+            // an die richtige Stelle verlagert (war FFmpeg 0001-vt-inline-retry, jetzt
+            // raus): bei hwdec-Decode-Fehler EINEN bounded reinit() des gleichen hwdec
+            // vor dem SW-Abstieg (recover_count, Reset auf gutem Frame; wait_for_keyframe
+            // schützt vor sofortigem Re-Fallback). Generisch (auch macOS-GPU-Reset).
+            // ABI weiter identisch .39. ⚠️ Background-Recovery on-device noch zu re-verifizieren.
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.43/Libmpv.xcframework.zip",
+            checksum: "b485f5087dace43a36abdf30f3852161d8d20f2a6f7700b0822557d718e89ec4"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
