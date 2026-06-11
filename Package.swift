@@ -277,8 +277,11 @@ let package = Package(
             name: "Libavfilter",
             // prod-3-consistent rebuild (renderpl.17): vf_libplacebo against
             // libplacebo apiver 365, matching the Libplacebo target above.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.33/Libavfilter.xcframework.zip",
-            checksum: "b5207955db5a9364d90fce5925847a0beceb1fa56d03ab81395879c1b96da98b"
+            // renderpl.41: + dynaudnorm/speechnorm (Audio-Politur Hebel #4 —
+            // Kuckuck.audioNormalize failte still mit -4, Filter fehlte in der
+            // Whitelist). Source/Configure identisch renderpl.33 (d1faab7).
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.41/Libavfilter.xcframework.zip",
+            checksum: "dc127b1926cc9601c946712eec5b32a804efc319e7928024a4cdd272c4b26066"
         ),
         .binaryTarget(
             name: "Libavutil",

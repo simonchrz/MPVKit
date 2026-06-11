@@ -860,6 +860,11 @@ private class BuildFFMPEG: BaseBuild {
         "--disable-filters",
         "--enable-filter=aformat", "--enable-filter=amix", "--enable-filter=anull", "--enable-filter=aresample",
         "--enable-filter=areverse", "--enable-filter=asetrate", "--enable-filter=atempo", "--enable-filter=atrim",
+        // Audio-Politur (2026-06-11): dynaudnorm = Loudness-Leveling (App-Toggle
+        // Kuckuck.audioNormalize setzte af=dynaudnorm seit je — scheiterte still
+        // mit -4, weil der Filter hier fehlte). speechnorm = Sprach-/Dialog-
+        // Normalisierung als zweite Option fürs A/B.
+        "--enable-filter=dynaudnorm", "--enable-filter=speechnorm",
         "--enable-filter=bwdif", "--enable-filter=delogo",
         "--enable-filter=equalizer", "--enable-filter=estdif",
         "--enable-filter=firequalizer", "--enable-filter=format", "--enable-filter=fps",
