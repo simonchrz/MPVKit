@@ -245,8 +245,11 @@ let package = Package(
             // videolan/master + MR !861 HDR-Peak-Fix + MR !859 film_grain; apiver
             // 365 unverändert). Ausgeliefert in renderpl.32 (mit dem libmpv-HDR-
             // Target-Fix). Siehe libplacebo-Fork Tag kuckuck-prod-4.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.36/Libplacebo.xcframework.zip",
-            checksum: "5fb680bbadea62adc105991538d1f2b93bfe4f3b12597c24ee6897aaa5a583da"
+            // renderpl.40 = kuckuck-prod-6: prod-5 hatte die Picks VERLOREN
+            // (von metal-pr-series getaggt) → !861 upstream-final (2d0979fb)
+            // + !859-Re-Pick wiederhergestellt. apiver 365 unverändert.
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.40/Libplacebo.xcframework.zip",
+            checksum: "91a5c712ffddedb124a63bc720dbabf3bcfd7907ea8bac4a54ebd76b38b9850f"
         ),
 
         .binaryTarget(

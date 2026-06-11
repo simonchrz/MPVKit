@@ -97,7 +97,12 @@ enum Library: String, CaseIterable {
             // Issue #371: max_peak detection vor linearize) + MR !859 (film_grain
             // skip-averaging); apiver unchanged. Shipped in renderpl.32 (mit dem
             // libmpv-HDR-Target-Deckel-Fix gegen zu grelles HDR).
-            return "kuckuck-prod-5"
+            // ⚠️ prod-5 wurde von metal-pr-series (OHNE die Picks!) getaggt —
+            // !861/!859 fehlten in renderpl.36 (Builds 58–62). prod-6 = prod-5
+            // + upstream-FINAL von !861 (2d0979fb, gemerged 2026-06-10, ersetzt
+            // unsere v1) + !859-Re-Pick. Lehre: Tags von prod-N schneiden, nie
+            // von metal-pr-series direkt.
+            return "kuckuck-prod-6"
         case .libdovi:
             return "3.3.2"
         case .vulkan:
