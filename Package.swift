@@ -260,18 +260,18 @@ let package = Package(
 
         .binaryTarget(
             name: "Libavcodec",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.33/Libavcodec.xcframework.zip",
-            checksum: "f8888e9c750f405f8fa2ea69bc591e2d4b4a042a745e642c7976911ad35e0e23"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.42/Libavcodec.xcframework.zip",
+            checksum: "e01c8327e9555b31224059de45a1d30c30f938f20190a2467e6856c8a57ae736"
         ),
         .binaryTarget(
             name: "Libavdevice",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.33/Libavdevice.xcframework.zip",
-            checksum: "8241cf1795038b062705e5544686738d2903b36bd117f2fed47e98fc2f5d145f"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.42/Libavdevice.xcframework.zip",
+            checksum: "50eb6502c16577f448d5aab86fa585a030c7e0006fbd8cdf8f2f0c958732995f"
         ),
         .binaryTarget(
             name: "Libavformat",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.33/Libavformat.xcframework.zip",
-            checksum: "ad92f5e2874c5ea40318865d6d24b73b91ab7b53b7ce4aaa200c51a6991524eb"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.42/Libavformat.xcframework.zip",
+            checksum: "efd5efe0c4dcb06be570a0cc2b05aad8739395d2cdfac62223ac9c18769029f4"
         ),
         .binaryTarget(
             name: "Libavfilter",
@@ -279,24 +279,26 @@ let package = Package(
             // libplacebo apiver 365, matching the Libplacebo target above.
             // renderpl.41: + dynaudnorm/speechnorm (Audio-Politur Hebel #4 —
             // Kuckuck.audioNormalize failte still mit -4, Filter fehlte in der
-            // Whitelist). Source/Configure identisch renderpl.33 (d1faab7).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.41/Libavfilter.xcframework.zip",
-            checksum: "dc127b1926cc9601c946712eec5b32a804efc319e7928024a4cdd272c4b26066"
+            // Whitelist).
+            // renderpl.42: FFmpeg-Rebase d1faab7 → master 625ab01 (2026-06-11);
+            // dynaudnorm/speechnorm/bwdif in der Whitelist bestätigt (Build-Log).
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.42/Libavfilter.xcframework.zip",
+            checksum: "281fb84f6ceb26d17144367de3c21fc05abf28402781e8db10d2dec6a7f0f127"
         ),
         .binaryTarget(
             name: "Libavutil",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.33/Libavutil.xcframework.zip",
-            checksum: "87ebaef435b47557e6ae4f066dc0453b516d47e389f29a38207ef131276069ef"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.42/Libavutil.xcframework.zip",
+            checksum: "419e33127e3dd854e23fa02badb5f791af29752692ed1b67ccf565187f82c7d4"
         ),
         .binaryTarget(
             name: "Libswresample",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.33/Libswresample.xcframework.zip",
-            checksum: "76a6e400cfe8dffd0adf5c38901bc792ab1543228e6f101bb190a78858dd3ed2"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.42/Libswresample.xcframework.zip",
+            checksum: "b1d929959cf1c090c8d4545a1588f104e4f2b2e893557e5c3343ada49226fd7b"
         ),
         .binaryTarget(
             name: "Libswscale",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.33/Libswscale.xcframework.zip",
-            checksum: "5149b3ffc6a036fd029bb46f493bf97e7a03afd724f913bc4491aed602eeda8a"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.42/Libswscale.xcframework.zip",
+            checksum: "20780bebad7355953c982bd10cb0f3e8f285e119ad39e56f13ccd7aa2ef97a51"
         ),
 
         .binaryTarget(
@@ -324,6 +326,9 @@ let package = Package(
             // IMGFMT_VIDEOTOOLBOX (Decoder-CVPixelBuffer → kuckuck_vt_upscale_pixbuf,
             // Direct-Pass/Crop in der Bridge), map-Reorder vt_sr VOR vt_wrap. ABI:
             // neues extern kuckuck_vt_upscale_pixbuf — braucht App mit dem @_cdecl.
+            // renderpl.42: mpv-Rebase 6444c05 → master 304426c (2026-06-09; u.a.
+            // T.35-OOB-Read-Fix demux/packet) + FFmpeg-Rebase auf 625ab01. Patches
+            // 0006-0016 unverändert re-appliet → ABI identisch .39 (kein App-Bump).
             // renderpl.38: Motion-Interp 50→60 (VT-Zwischenbilder, Default AN, enges
             // Phasenfenster) + vo_set_queue_params(3) (Multi-Frame-Mixe). ABI:
             // kuckuck_vt_upscale 13 Args — braucht App >=7714e4b.
@@ -336,8 +341,8 @@ let package = Package(
             // renderpl.34: SDR-Helligkeits-Fix — Peak-Detection nur für HDR (CAS/ArtCNN-
             // User-Shader hoben lokale Peaks → prod-4/MR!861-Roll-off dimmte SDR „einen
             // Tick zu dunkel"). VT-Frame-Interp-Code wieder entfernt (verworfen).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.39/Libmpv.xcframework.zip",
-            checksum: "c7864411eb76de09422827fee3d3e27c8dc51799c12f4bace4659569cf272544"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.42/Libmpv.xcframework.zip",
+            checksum: "8addb588a5c37bc725cbb961efe01dea7f5c1cd6b3a3c090c6443eafe0f52ed3"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]

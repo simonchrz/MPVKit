@@ -55,9 +55,11 @@ enum Library: String, CaseIterable {
             return "master"
         case .FFmpeg:
             // master statt n8.1.1 (2026-06-07, renderpl.33): User testet gern die
-            // neuesten Commits. Gebaut+on-device-verifiziert von master-HEAD d1faab7
-            // (8.0.git). Patch 0001-vt-inline-retry appliet sauber. Ein Rebuild zieht
-            // neueren master → dann re-testen. Zurück auf Stable: "n8.1.1".
+            // neuesten Commits. Rebase 2026-06-11 (renderpl.42) auf master-HEAD
+            // 625ab01 (vorher d1faab7); 103 Commits, Gros swscale-uops-Refactor,
+            // keine VideoToolbox-/HDR-Änderung. Patch 0001-vt-inline-retry appliet
+            // sauber. Ein Rebuild zieht neueren master → dann re-testen. Zurück auf
+            // Stable: "n8.1.1".
             return "master"
         case .openssl:
             return "3.3.5"
