@@ -350,8 +350,13 @@ let package = Package(
             // vor dem SW-Abstieg (recover_count, Reset auf gutem Frame; wait_for_keyframe
             // schützt vor sofortigem Re-Fallback). Generisch (auch macOS-GPU-Reset).
             // ABI weiter identisch .39. ⚠️ Background-Recovery on-device noch zu re-verifizieren.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.43/Libmpv.xcframework.zip",
-            checksum: "b485f5087dace43a36abdf30f3852161d8d20f2a6f7700b0822557d718e89ec4"
+            // renderpl.44: BUGFIX Patch 0017 — hwdec_recover_count-Reset aus
+            // uninit_avctx entfernt (reinit() ruft uninit → Reset → Endlos-reinit-
+            // Loop wenn hwdec den Stream nie kann = interlaced raw-TS-Tuner: VOX/
+            // RTL/… starteten nicht, nie SW-Fallback). Reset jetzt nur auf
+            // erfolgreichem Decode. renderpl.43 ist tuner-kaputt → nicht nutzen.
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.44/Libmpv.xcframework.zip",
+            checksum: "f05575faea143b6393cf0d2ebbe79b968a6fa19e95b895ca0c4df5e929e310c4"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]

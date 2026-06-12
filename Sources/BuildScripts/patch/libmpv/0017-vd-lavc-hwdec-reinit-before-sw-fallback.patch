@@ -1,5 +1,5 @@
 diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
-index ff6a22a..daaa878 100644
+index ff6a22a..a0c3aec 100644
 --- a/video/decode/vd_lavc.c
 +++ b/video/decode/vd_lavc.c
 @@ -240,6 +240,7 @@ typedef struct lavc_ctx {
@@ -10,15 +10,19 @@ index ff6a22a..daaa878 100644
  
      struct mp_image_pool *hwdec_swpool;
  
-@@ -932,6 +933,7 @@ static void uninit_avctx(struct mp_filter *vd)
+@@ -932,6 +933,11 @@ static void uninit_avctx(struct mp_filter *vd)
  
      ctx->hwdec_failed = false;
      ctx->hwdec_fail_count = 0;
-+    ctx->hwdec_recover_count = 0;
++    // hwdec_recover_count hier NICHT zurücksetzen — reinit() ruft uninit_avctx,
++    // sonst wird der reinit-Begrenzer bei jedem reinit genullt → Endlosschleife
++    // wenn hwdec den Stream prinzipiell nicht kann (z.B. interlaced raw-TS-Tuner:
++    // VT failt immer → reinit-loop, nie SW-Fallback). Reset nur auf erfolgreichem
++    // Decode (decode_frame) → nach SW-Fallback decodet SW erfolgreich → reset.
      ctx->max_delay_queue = 0;
      ctx->hw_probing = false;
      ctx->hwdec = (struct hwdec_info){0};
-@@ -1288,6 +1290,7 @@ static int decode_frame(struct mp_filter *vd)
+@@ -1288,6 +1294,7 @@ static int decode_frame(struct mp_filter *vd)
      }
  
      ctx->hwdec_fail_count = 0;
@@ -26,7 +30,7 @@ index ff6a22a..daaa878 100644
  
      mpi->pts = mp_pts_from_av(ctx->pic->pts, &ctx->codec_timebase);
      mpi->dts = mp_pts_from_av(ctx->pic->pkt_dts, &ctx->codec_timebase);
-@@ -1312,6 +1315,28 @@ static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
+@@ -1312,6 +1319,28 @@ static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
          ctx->sent_packets = NULL;
          ctx->num_sent_packets = 0;
  
