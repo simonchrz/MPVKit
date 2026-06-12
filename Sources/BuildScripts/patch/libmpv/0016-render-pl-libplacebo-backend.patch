@@ -9,10 +9,10 @@ index 02efefb..f64c418 100644
 +extern const struct render_backend_fns render_backend_pl;
 diff --git a/video/out/render_pl.c b/video/out/render_pl.c
 new file mode 100644
-index 0000000..d513855
+index 0000000..ea9b030
 --- /dev/null
 +++ b/video/out/render_pl.c
-@@ -0,0 +1,1181 @@
+@@ -0,0 +1,1199 @@
 +/*
 + * libmpv render-API backend driven by libplacebo (pl_renderer) instead of the
 + * mpv `ra` abstraction. This is the future-proofing path: mpv is deprecating
@@ -115,6 +115,7 @@ index 0000000..d513855
 +    char *deint_algo;        // zuletzt geparster Deinterlace-Algo (strcmp-Cache)
 +    struct pl_deinterlace_params deint_params;  // lokale Kopie (algo/skip wählbar via env)
 +    char *deband_mode;       // zuletzt angewandter KUCKUCK_DEBAND-Modus (strcmp-Cache)
++    struct pl_color_adjustment color_adj;  // Helligkeits-Nudge (env KUCKUCK_SDR_GAMMA)
 +    struct pl_render_params rparams;
 +
 +    // Zero-Copy-hwdec (J): VT-Device für vd_lavc (hwdec=videotoolbox ohne
@@ -883,6 +884,23 @@ index 0000000..d513855
 +    // ganze SDR-Bild einen Tick zu dunkel (ohne Shader unauffaellig). Nur HDR behaelt
 +    // die (dort gewollte + MR!861-korrekte) Peak-Detection.
 +    p->rparams.peak_detect_params = hdr_target ? &pl_peak_detect_high_quality_params : NULL;
++    // Helligkeits-Nudge: SDR-Broadcast (bt.1886, Gamma 2.4) wirkt auf dem Handy
++    // (~sRGB 2.2-Erwartung) einen Tick zu dunkel — colorimetrisch korrekt, aber
++    // gefühlt flau. Die App setzt KUCKUCK_SDR_GAMMA NUR für SDR-Live-TV (Tuner +
++    // Mediathek-Live); YouTube/HDR/VOD bleiben ungesetzt = neutral. libplacebos
++    // gamma wirkt als x^(1/gamma) → gamma>1 hebt die Mitteltöne (kein Schwarz-Lift
++    // wie brightness). Nur bei HDR-Target ignorieren (HDR hat den Effekt nicht).
++    {
++        const char *sg = (!hdr_target) ? getenv("KUCKUCK_SDR_GAMMA") : NULL;
++        float gamma = sg ? (float) atof(sg) : 1.0f;
++        if (gamma > 1.001f || gamma < 0.999f) {
++            p->color_adj = pl_color_adjustment_neutral;
++            p->color_adj.gamma = gamma;
++            p->rparams.color_adjustment = &p->color_adj;
++        } else {
++            p->rparams.color_adjustment = NULL;  // neutral
++        }
++    }
 +    // HDR-Target an die ECHTE Display-Faehigkeit koppeln statt generisches HDR10.
 +    // pl_color_space_hdr10 = BT.2020/PQ mit ~10000-nit-Peak -> bei iPhone-Content
 +    // (1000-4000 nit) praktisch Passthrough: keine Highlight-Roll-off -> "grell"

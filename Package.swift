@@ -355,8 +355,15 @@ let package = Package(
             // Loop wenn hwdec den Stream nie kann = interlaced raw-TS-Tuner: VOX/
             // RTL/… starteten nicht, nie SW-Fallback). Reset jetzt nur auf
             // erfolgreichem Decode. renderpl.43 ist tuner-kaputt → nicht nutzen.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.44/Libmpv.xcframework.zip",
-            checksum: "f05575faea143b6393cf0d2ebbe79b968a6fa19e95b895ca0c4df5e929e310c4"
+            // renderpl.45: + env KUCKUCK_SDR_GAMMA (render_pl Patch 0016) —
+            // libplacebo color_adjustment.gamma als Helligkeits-Nudge. gamma>1 hebt
+            // die Mitteltöne (x^(1/gamma), kein Schwarz-Lift). NUR wenn das env gesetzt
+            // ist + kein HDR-Target; sonst neutral. App setzt es ausschließlich für
+            // SDR-Live-TV (Tuner + Mediathek-Live) — bt.1886-Broadcast wirkt auf dem
+            // Handy (~sRGB-Erwartung) sonst einen Tick zu dunkel. Sonst identisch .44.
+            // ABI unverändert (.39). Nur ios-arm64-Slice neu, Simulator unverändert.
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.45/Libmpv.xcframework.zip",
+            checksum: "ad959943f48189c123156a4f9798af17436ca21d4a8b15c7d51140dffff0af1d"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
