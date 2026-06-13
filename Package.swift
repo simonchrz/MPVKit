@@ -282,17 +282,17 @@ let package = Package(
         .binaryTarget(
             name: "Libngtcp2",
             url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.42-h3/Libngtcp2.xcframework.zip",
-            checksum: "a69d2fc4b40a11c686430c7fd57169481e62ae3f9c812687968164c08b4e345c"
+            checksum: "d7fdd03870d05587a7eef225730a5b626654dc1bf85ae412b78e4a57b6d12baf"
         ),
         .binaryTarget(
             name: "Libnghttp3",
             url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.42-h3/Libnghttp3.xcframework.zip",
-            checksum: "df4c6db61243285ca07b44d1f98512b7dd38fbd7f02c8bc462e7a4d235e15b3b"
+            checksum: "f6ccabaf74d9b07dd3552786bfcc39123aaf242e379e171b821aa1e5731aebde"
         ),
         .binaryTarget(
             name: "Libngtcp2_crypto_gnutls",
             url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.42-h3/Libngtcp2_crypto_gnutls.xcframework.zip",
-            checksum: "605e5bc3178adb98da8ce9d2b334bcc59b42caea9beb7b7225997be7581cbf9f"
+            checksum: "01cedde8e4e50c718565cd751da1fd9dae4edd47c3038b8238a217024fbf27e9"
         ),
         .binaryTarget(
             name: "Libavfilter",
