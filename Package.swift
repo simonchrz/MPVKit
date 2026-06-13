@@ -34,7 +34,8 @@ let package = Package(
                 "Libavcodec", "Libavdevice", "Libavfilter", "Libavformat", "Libavutil", "Libswresample", "Libswscale",
                 "Libssl", "Libcrypto", "Libass", "Libfreetype", "Libfribidi", "Libharfbuzz",
                 "MoltenVK", "Libshaderc_combined", "lcms2", "Libplacebo", "Libdovi", "Libunibreak",
-                "gmp", "nettle", "hogweed", "gnutls", "Libdav1d", "Libuavs3d"
+                "gmp", "nettle", "hogweed", "gnutls", "Libdav1d", "Libuavs3d",
+                "Libngtcp2", "Libnghttp3", "Libngtcp2_crypto_gnutls"   // HTTP/3 (http3://)
             ],
             path: "Sources/_FFmpeg",
             linkerSettings: [
@@ -71,7 +72,8 @@ let package = Package(
                 "Libavcodec-GPL", "Libavdevice-GPL", "Libavfilter-GPL", "Libavformat-GPL", "Libavutil-GPL", "Libswresample-GPL", "Libswscale-GPL",
                 "Libssl", "Libcrypto", "Libass", "Libfreetype", "Libfribidi", "Libharfbuzz",
                 "MoltenVK", "Libshaderc_combined", "lcms2", "Libplacebo", "Libdovi", "Libunibreak",
-                "Libsmbclient", "gmp", "nettle", "hogweed", "gnutls", "Libdav1d", "Libuavs3d"
+                "Libsmbclient", "gmp", "nettle", "hogweed", "gnutls", "Libdav1d", "Libuavs3d",
+                "Libngtcp2", "Libnghttp3", "Libngtcp2_crypto_gnutls"   // HTTP/3 (http3://)
             ],
             path: "Sources/_FFmpeg-GPL",
             linkerSettings: [
@@ -273,8 +275,24 @@ let package = Package(
         ),
         .binaryTarget(
             name: "Libavformat",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.42/Libavformat.xcframework.zip",
-            checksum: "efd5efe0c4dcb06be570a0cc2b05aad8739395d2cdfac62223ac9c18769029f4"
+            // renderpl.42 base + HTTP/3 (ff_http3_protocol). Other libav* stay on their pins (same 625ab01 ffmpeg).
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.42-h3/Libavformat.xcframework.zip",
+            checksum: "6c01b156651a4b5abfe9e5fc0183536fbe453ff230910672dbe2304df25887be"
+        ),
+        .binaryTarget(
+            name: "Libngtcp2",
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.42-h3/Libngtcp2.xcframework.zip",
+            checksum: "a69d2fc4b40a11c686430c7fd57169481e62ae3f9c812687968164c08b4e345c"
+        ),
+        .binaryTarget(
+            name: "Libnghttp3",
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.42-h3/Libnghttp3.xcframework.zip",
+            checksum: "df4c6db61243285ca07b44d1f98512b7dd38fbd7f02c8bc462e7a4d235e15b3b"
+        ),
+        .binaryTarget(
+            name: "Libngtcp2_crypto_gnutls",
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.42-h3/Libngtcp2_crypto_gnutls.xcframework.zip",
+            checksum: "605e5bc3178adb98da8ce9d2b334bcc59b42caea9beb7b7225997be7581cbf9f"
         ),
         .binaryTarget(
             name: "Libavfilter",

@@ -49,6 +49,11 @@ enum Library: String, CaseIterable {
     /// companion mpvkit/libspirv-cross-build repo exists). Only present so
     /// PlatformType.pkgConfigPath() includes the install dir.
     case libspirv_cross = "libspirv-cross"
+    /// HTTP/3 (QUIC) for the http3:// URL protocol. Prebuilt static .a from
+    /// tv-h3-ios (GnuTLS crypto backend, ABI-matched to our gnutls 3.8.11),
+    /// staged into dist/<lib>/ios/thin/arm64. Like libspirv_cross: enum-only for
+    /// pkgConfigPath + cFlags/ldFlags wiring; NOT built by the main sequence.
+    case libngtcp2, libnghttp3, libngtcp2_crypto_gnutls
     var version: String {
         switch self {
         case .libmpv:
@@ -122,6 +127,8 @@ enum Library: String, CaseIterable {
             return "1.2.1-xcode"
         case .libspirv_cross:
             return "main"  // built from source via build_spirv_cross.sh
+        case .libngtcp2, .libnghttp3, .libngtcp2_crypto_gnutls:
+            return "1.24.0-DEV"  // prebuilt (tv-h3-ios), no download
         }
     }
 
@@ -176,6 +183,8 @@ enum Library: String, CaseIterable {
             return "https://github.com/mpvkit/libuavs3d-build/releases/download/\(self.version)/libuavs3d-all.zip"
         case .libspirv_cross:
             return ""  // built from source, no download URL
+        case .libngtcp2, .libnghttp3, .libngtcp2_crypto_gnutls:
+            return ""  // prebuilt static .a (tv-h3-ios), no download URL
         }
     }
 
@@ -400,6 +409,8 @@ enum Library: String, CaseIterable {
             ]
         case .libspirv_cross:
             return []  // built from source, not surfaced as a SwiftPM target
+        case .libngtcp2, .libnghttp3, .libngtcp2_crypto_gnutls:
+            return []  // linked into FFmpeg; final-link xcframeworks added separately
         }
     }
 }
@@ -587,10 +598,15 @@ private class BuildFFMPEG: BaseBuild {
     }
 
     override func flagsDependencelibrarys() -> [Library] {
+        // QUIC libs (http3): -I/-L/-l for ngtcp2/nghttp3 + the gnutls crypto helper.
+        // crypto_gnutls is NOT in dependencyLibrary (no --enable-* flag exists for
+        // it); it only needs to be on the link path — configure's gnutls branch
+        // appends -lngtcp2_crypto_gnutls itself.
+        let h3 = [Library.libngtcp2, .libnghttp3, .libngtcp2_crypto_gnutls]
         if BaseBuild.options.enableGPL {
-            return [.gmp, .nettle, .gnutls, .libsmbclient]
+            return [.gmp, .nettle, .gnutls, .libsmbclient] + h3
         } else {
-            return [.gmp, .nettle, .gnutls]
+            return [.gmp, .nettle, .gnutls] + h3
         }
     }
 
@@ -725,7 +741,7 @@ private class BuildFFMPEG: BaseBuild {
         //        if platform == .isimulator || platform == .tvsimulator {
         //            arguments.append("--assert-level=1")
         //        }
-        var dependencyLibrary = [Library.gmp, .gnutls, .libfreetype, .libharfbuzz, .libfribidi, .libass, .vulkan, .libshaderc, .lcms2, .libplacebo, .libdav1d, .libuavs3d]
+        var dependencyLibrary = [Library.gmp, .gnutls, .libfreetype, .libharfbuzz, .libfribidi, .libass, .vulkan, .libshaderc, .lcms2, .libplacebo, .libdav1d, .libuavs3d, .libngtcp2, .libnghttp3]
         if BaseBuild.options.enableGPL {
             dependencyLibrary += [.libsmbclient]
         }
@@ -778,6 +794,7 @@ private class BuildFFMPEG: BaseBuild {
         "--disable-bzlib", "--disable-gray", "--disable-iconv", "--disable-linux-perf",
         "--disable-shared", "--disable-small", "--disable-symver", "--disable-xlib",
         "--enable-cross-compile", "--enable-libxml2", "--enable-nonfree",
+        "--enable-protocol=http3",   // QUIC/HTTP3 (deps libngtcp2+libnghttp3, gnutls crypto)
         "--enable-optimizations", "--enable-pic", "--enable-runtime-cpudetect", "--enable-static", "--enable-thumb", "--enable-version3",
         "--pkg-config-flags=--static",
         // Documentation options:
