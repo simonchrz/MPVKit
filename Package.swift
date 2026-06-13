@@ -276,8 +276,8 @@ let package = Package(
         .binaryTarget(
             name: "Libavformat",
             // renderpl.42 base + HTTP/3 (ff_http3_protocol). Other libav* stay on their pins (same 625ab01 ffmpeg).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.42-h3.2/Libavformat.xcframework.zip",
-            checksum: "dba65463985bfc7036f047904e851bbfeed6596a0e40026e619c6cfc6149f865"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.42-h3.3/Libavformat.xcframework.zip",
+            checksum: "bc53e8c903a37f2e56dca34c361cca236736d6f63779377c9bf390f1ee7502c5"
         ),
         .binaryTarget(
             name: "Libngtcp2",

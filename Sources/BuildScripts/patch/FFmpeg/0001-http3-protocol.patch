@@ -65,10 +65,10 @@ index 0db0c7c2a981b..72fc4fec78612 100644
  OBJS-$(CONFIG_LIBZMQ_PROTOCOL)           += libzmq.o
 diff --git a/libavformat/http3.c b/libavformat/http3.c
 new file mode 100644
-index 0000000000000..aa254e11dc20b
+index 0000000000000..3e036824115bd
 --- /dev/null
 +++ b/libavformat/http3.c
-@@ -0,0 +1,1343 @@
+@@ -0,0 +1,1354 @@
 +/*
 + * HTTP/3 (QUIC) protocol for FFmpeg.
 + *
@@ -875,6 +875,13 @@ index 0000000000000..aa254e11dc20b
 +    uint64_t now;
 +    int pr, d;
 +
++    /* Honor the ffmpeg interrupt callback (e.g. mpv player teardown) so a
++       blocking read returns promptly with AVERROR_EXIT instead of hanging the
++       demux thread in poll() until the timeout -- which would deadlock the
++       caller's pthread_join on shutdown. h is NULL for the keep-alive reaper. */
++    if (h && ff_check_interrupt(&h->interrupt_callback))
++        return AVERROR_EXIT;
++
 +    if (h3_write(h, hc) < 0)
 +        return AVERROR_EXTERNAL;
 +
@@ -885,6 +892,10 @@ index 0000000000000..aa254e11dc20b
 +        if (d < timeout_ms)
 +            timeout_ms = d;
 +    }
++    /* cap the wait so an interrupt arriving mid-poll is noticed within ~250ms
++       (callers loop on h3_pump until their own deadline) */
++    if (timeout_ms > 250)
++        timeout_ms = 250;
 +
 +    pr = poll(&pfd, 1, timeout_ms);
 +    if (pr < 0)
