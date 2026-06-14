@@ -103,10 +103,10 @@ index 0db0c7c..72fc4fe 100644
  OBJS-$(CONFIG_LIBZMQ_PROTOCOL)           += libzmq.o
 diff --git a/libavformat/http3.c b/libavformat/http3.c
 new file mode 100644
-index 0000000..a98e237
+index 0000000..9f7939c
 --- /dev/null
 +++ b/libavformat/http3.c
-@@ -0,0 +1,1658 @@
+@@ -0,0 +1,1848 @@
 +/*
 + * HTTP/3 (QUIC) protocol for FFmpeg.
 + *
@@ -152,6 +152,7 @@ index 0000000..a98e237
 +#include <sys/socket.h>
 +#include <time.h>
 +#include <unistd.h>
++#include <errno.h>
 +
 +#include "config.h"
 +
@@ -966,6 +967,47 @@ index 0000000..a98e237
 +    return 0;
 +}
 +
++/* QUIC connection migration: rebind to a FRESH local UDP socket (new local
++   addr/port, same server) and tell ngtcp2 to migrate. The connection is keyed
++   by Connection IDs, so it survives the 4-tuple change; ngtcp2 path-validates
++   the new path after the immediate switch. Backend-agnostic (ngtcp2 only).
++   On any failure the old socket/path is kept intact (connection continues). */
++static int h3_migrate(URLContext *h, H3Conn *hc)
++{
++    struct sockaddr_storage nlocal;
++    socklen_t nlocallen = sizeof(nlocal);
++    ngtcp2_path path;
++    int nfd, rv;
++
++    if (!hc->conn || !ngtcp2_conn_get_handshake_completed(hc->conn))
++        return AVERROR(EINVAL);
++    nfd = socket(hc->remote_addr.ss_family, SOCK_DGRAM, 0);
++    if (nfd < 0)
++        return AVERROR(EIO);
++    if (connect(nfd, (struct sockaddr *)&hc->remote_addr, hc->remote_addrlen) != 0 ||
++        getsockname(nfd, (struct sockaddr *)&nlocal, &nlocallen) != 0) {
++        close(nfd);
++        return AVERROR(EIO);
++    }
++    path.local.addr     = (struct sockaddr *)&nlocal;
++    path.local.addrlen  = nlocallen;
++    path.remote.addr    = (struct sockaddr *)&hc->remote_addr;
++    path.remote.addrlen = hc->remote_addrlen;
++    path.user_data      = NULL;
++    rv = ngtcp2_conn_initiate_immediate_migration(hc->conn, &path, h3_timestamp());
++    if (rv != 0) {
++        av_log(h, AV_LOG_WARNING, "http3: migration rejected: %s\n", ngtcp2_strerror(rv));
++        close(nfd);                       /* keep the old path */
++        return AVERROR_EXTERNAL;
++    }
++    close(hc->fd);                        /* switch to the new local path */
++    hc->fd = nfd;
++    memcpy(&hc->local_addr, &nlocal, nlocallen);
++    hc->local_addrlen = nlocallen;
++    av_log(h, AV_LOG_VERBOSE, "http3: migrated to a new local path\n");
++    return 0;
++}
++
 +static int h3_init_quic(URLContext *h, H3Conn *hc)
 +{
 +    ngtcp2_settings settings;
@@ -1122,8 +1164,15 @@ index 0000000..a98e237
 +            nghttp3_conn_add_write_offset(hc->h3conn, stream_id, ndatalen);
 +        if (nwrite == 0)
 +            return 0;
-+        if (send(hc->fd, buf, nwrite, 0) < 0)
++        if (send(hc->fd, buf, nwrite, 0) < 0) {
++            /* local address gone (interface down / IP change): try to migrate
++               to a fresh local path and resend once before giving up. */
++            if ((errno == EADDRNOTAVAIL || errno == ENETUNREACH ||
++                 errno == ENETDOWN || errno == EHOSTUNREACH) &&
++                h3_migrate(h, hc) == 0 && send(hc->fd, buf, nwrite, 0) >= 0)
++                continue;
 +            return AVERROR(EIO);
++        }
 +    }
 +}
 +
@@ -1284,6 +1333,126 @@ index 0000000..a98e237
 +    if ((ret = h3_handshake(h, hc, timeout_us)) < 0)          return ret;
 +    if ((ret = h3_setup_http3(h, hc)) < 0)                    return ret;
 +    return 0;
++}
++
++/* connect a fresh UDP socket to a SPECIFIC resolved address (vs the
++   getaddrinfo loop in h3_connect_udp) */
++static int h3_connect_addr(H3Conn *hc, const struct addrinfo *ai)
++{
++    int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
++    if (fd < 0)
++        return AVERROR(EIO);
++    if (connect(fd, ai->ai_addr, ai->ai_addrlen) != 0) {
++        close(fd);
++        return AVERROR(EIO);
++    }
++    memcpy(&hc->remote_addr, ai->ai_addr, ai->ai_addrlen);
++    hc->remote_addrlen = ai->ai_addrlen;
++    hc->local_addrlen  = sizeof(hc->local_addr);
++    getsockname(fd, (struct sockaddr *)&hc->local_addr, &hc->local_addrlen);
++    hc->fd = fd;
++    return 0;
++}
++
++/* Happy Eyeballs v2 (RFC 8305) for QUIC: race handshakes over the resolved
++   addresses (families interleaved v6/v4), starting the next attempt after a
++   250 ms head start, and keep the first connection whose handshake completes.
++   Avoids a 15 s stall + failure when the preferred family is broken. Returns a
++   handshaked + h3-setup winner (cur=c, host/port set) or NULL. 1-RTT only. */
++#define H3_HE_MAX       4
++#define H3_HE_DELAY_US  250000
++
++static H3Conn *h3_dial_race(URLContext *h, HTTP3Context *c, const char *host,
++                            int port, int64_t timeout_us)
++{
++    struct addrinfo hints = { 0 }, *res = NULL, *ai;
++    const struct addrinfo *order[H3_HE_MAX];
++    H3Conn *cand[H3_HE_MAX] = { 0 }, *winner = NULL;
++    char portstr[12];
++    int norder = 0, started = 0, i, want6 = 1;
++    int64_t deadline = av_gettime_relative() + timeout_us;
++    int64_t next_attempt = av_gettime_relative();
++
++    snprintf(portstr, sizeof(portstr), "%d", port);
++    hints.ai_family   = AF_UNSPEC;
++    hints.ai_socktype = SOCK_DGRAM;
++    if (getaddrinfo(host, portstr, &hints, &res) != 0)
++        return NULL;
++    /* interleave families: v6, v4, v6, v4, ... up to H3_HE_MAX */
++    while (norder < H3_HE_MAX) {
++        int fam = want6 ? AF_INET6 : AF_INET, found = 0, remaining = 0;
++        for (ai = res; ai; ai = ai->ai_next) {
++            int used = 0;
++            for (i = 0; i < norder; i++) if (order[i] == ai) used = 1;
++            if (used) continue;
++            remaining = 1;
++            if (ai->ai_family == fam) { order[norder++] = ai; found = 1; break; }
++        }
++        want6 = !want6;
++        if (!found && !remaining) break;   /* nothing of either family left */
++    }
++    if (!norder) { freeaddrinfo(res); return NULL; }
++
++    while (!winner && av_gettime_relative() < deadline) {
++        struct pollfd pfd[H3_HE_MAX];
++        int idx[H3_HE_MAX], nfd = 0, wait_ms = 250;
++
++        if (started < norder && av_gettime_relative() >= next_attempt) {
++            H3Conn *hc = h3conn_alloc();
++            if (hc) {
++                hc->cur = c;
++                av_strlcpy(hc->host, host, sizeof(hc->host));
++                hc->port = port;
++                if (h3_connect_addr(hc, order[started]) == 0 &&
++                    h3_init_tls(h, hc, host) == 0 &&
++                    h3_init_quic(h, hc) == 0)
++                    cand[started] = hc;
++                else
++                    h3conn_free(hc);
++            }
++            started++;
++            next_attempt = av_gettime_relative() + H3_HE_DELAY_US;
++        }
++
++        for (i = 0; i < started && !winner; i++) {
++            if (!cand[i]) continue;
++            if (h3_write(h, cand[i]) < 0) { h3conn_free(cand[i]); cand[i] = NULL; continue; }
++            if (ngtcp2_conn_get_handshake_completed(cand[i]->conn)) { winner = cand[i]; break; }
++            pfd[nfd].fd = cand[i]->fd; pfd[nfd].events = POLLIN; idx[nfd] = i; nfd++;
++        }
++        if (winner) break;
++        if (!nfd && started >= norder) break;    /* every attempt died */
++
++        if (started < norder) {
++            int d = (int)((next_attempt - av_gettime_relative()) / 1000);
++            if (d >= 0 && d < wait_ms) wait_ms = d;
++        }
++        if (wait_ms < 0) wait_ms = 0;
++        if (poll(pfd, nfd, wait_ms) > 0) {
++            for (i = 0; i < nfd; i++) {
++                H3Conn *hc = cand[idx[i]];
++                if (hc && (pfd[i].revents & POLLIN)) {
++                    if (h3_read_socket(h, hc) < 0) { h3conn_free(hc); cand[idx[i]] = NULL; continue; }
++                    if (ngtcp2_conn_get_handshake_completed(hc->conn)) { winner = hc; break; }
++                }
++            }
++        }
++        for (i = 0; i < started && !winner; i++) {
++            if (cand[i] && ngtcp2_conn_get_expiry(cand[i]->conn) <= h3_timestamp() &&
++                ngtcp2_conn_handle_expiry(cand[i]->conn, h3_timestamp()) != 0) {
++                h3conn_free(cand[i]); cand[i] = NULL;
++            }
++        }
++    }
++    freeaddrinfo(res);
++    for (i = 0; i < started; i++)
++        if (cand[i] && cand[i] != winner) h3conn_free(cand[i]);
++    if (winner) {
++        if (h3_setup_http3(h, winner) < 0) { h3conn_free(winner); return NULL; }
++        av_log(h, AV_LOG_VERBOSE, "http3: happy-eyeballs winner = %s\n",
++               winner->remote_addr.ss_family == AF_INET6 ? "IPv6" : "IPv4");
++    }
++    return winner;
 +}
 +
 +/* ---- pool ---- */
@@ -1613,21 +1782,42 @@ index 0000000..a98e237
 +            }
 +        }
 +        if (!c->hc) {
-+            c->hc = h3conn_alloc();
-+            if (!c->hc) { ret = AVERROR(ENOMEM); goto fail; }
-+            c->hc->cur = c;
-+            av_strlcpy(c->hc->host, host, sizeof(c->hc->host));
-+            c->hc->port = port;
 +#if CONFIG_GNUTLS
-+            /* 0-RTT: if a ticket+tp is cached for this host, dial with early
-+               data (h3_dial then submits the request before handshake). */
-+            if (h3_zrtt_get(host, port,
-+                            &c->hc->zrtt_session, &c->hc->zrtt_session_len,
-+                            &c->hc->zrtt_tp, &c->hc->zrtt_tp_len))
-+                c->hc->zrtt = 1;
++            uint8_t *zs = NULL, *zt = NULL; size_t zsl = 0, ztl = 0;
++            int have_ticket = h3_zrtt_get(host, port, &zs, &zsl, &zt, &ztl);
++#else
++            int have_ticket = 0;
 +#endif
-+            if ((ret = h3_dial(h, c->hc, portstr, c->open_timeout_us)) < 0)
-+                goto fail;
++            if (have_ticket) {
++                /* 0-RTT cold dial: single connection to the preferred address,
++                   request sent as early data (no Happy-Eyeballs race). */
++                c->hc = h3conn_alloc();
++                if (!c->hc) {
++#if CONFIG_GNUTLS
++                    av_free(zs); av_free(zt);
++#endif
++                    ret = AVERROR(ENOMEM); goto fail;
++                }
++                c->hc->cur = c;
++                av_strlcpy(c->hc->host, host, sizeof(c->hc->host));
++                c->hc->port = port;
++#if CONFIG_GNUTLS
++                c->hc->zrtt = 1;
++                c->hc->zrtt_session = zs; c->hc->zrtt_session_len = zsl;
++                c->hc->zrtt_tp = zt;      c->hc->zrtt_tp_len = ztl;
++#endif
++                if ((ret = h3_dial(h, c->hc, portstr, c->open_timeout_us)) < 0) {
++                    /* 0-RTT dial failed (e.g. preferred family down): drop it
++                       and fall back to a Happy-Eyeballs race over all families. */
++                    h3conn_free(c->hc); c->hc = NULL; c->stream_id = -1;
++                    c->hc = h3_dial_race(h, c, host, port, c->open_timeout_us);
++                    if (!c->hc) { ret = AVERROR(EIO); goto fail; }
++                }
++            } else {
++                /* no ticket: Happy-Eyeballs race v6/v4 to a working path */
++                c->hc = h3_dial_race(h, c, host, port, c->open_timeout_us);
++                if (!c->hc) { ret = AVERROR(EIO); goto fail; }
++            }
 +        }
 +
 +        /* 1-RTT + pooled paths submit here; the 0-RTT dial already did. */
