@@ -103,10 +103,10 @@ index 0db0c7c..72fc4fe 100644
  OBJS-$(CONFIG_LIBZMQ_PROTOCOL)           += libzmq.o
 diff --git a/libavformat/http3.c b/libavformat/http3.c
 new file mode 100644
-index 0000000..2739baa
+index 0000000..a98e237
 --- /dev/null
 +++ b/libavformat/http3.c
-@@ -0,0 +1,1558 @@
+@@ -0,0 +1,1658 @@
 +/*
 + * HTTP/3 (QUIC) protocol for FFmpeg.
 + *
@@ -305,12 +305,11 @@ index 0000000..2739baa
 +    e->host[0] = 0; e->port = 0;
 +}
 +
-+/* Store (copy) the freshest ticket+tp for host:port, replacing any prior
-+   entry for the same host:port, else taking a free slot, else evicting
-+   slot 0 (FIFO). */
-+static void h3_zrtt_put(const char *host, int port,
-+                        const uint8_t *session, size_t session_len,
-+                        const uint8_t *tp, size_t tp_len)
++/* Store (copy) the freshest ticket+tp for host:port in memory, replacing any
++   prior entry for the same host:port, else a free slot, else evicting slot 0. */
++static void h3_zrtt_store_mem(const char *host, int port,
++                              const uint8_t *session, size_t session_len,
++                              const uint8_t *tp, size_t tp_len)
 +{
 +    int i, slot = -1;
 +    uint8_t *sc = av_memdup(session, session_len);
@@ -338,8 +337,105 @@ index 0000000..2739baa
 +    ff_mutex_unlock(&h3_zrtt_mutex);
 +}
 +
++/* ---- on-disk persistence (0-RTT survives process restarts) ----
++   Opt-in via env KUCKUCK_H3_0RTT_DIR (a writable dir). One file per host:port,
++   device-local format (same arch reads its own writes). A stale ticket just
++   triggers the 1-RTT reject-fallback, so the only freshness guard is a coarse
++   max-age. Replay-safe: only idempotent GETs are ever sent as early data. */
++#define H3_0RTT_MAGIC   0x48335254u   /* 'H3RT' */
++#define H3_0RTT_VERSION 1u
++#define H3_0RTT_TTL_SEC (12 * 3600)
++#define H3_0RTT_MAXBLOB (64 * 1024)
++
++/* build "<dir>/h3-0rtt-<sanitized-host>_<port>.bin"; 0 ok, <0 if no dir/too long */
++static int h3_0rtt_path(char *out, size_t outsz, const char *host, int port)
++{
++    const char *dir = getenv("KUCKUCK_H3_0RTT_DIR");
++    char safe[256]; size_t i;
++    if (!dir || !*dir)
++        return -1;
++    for (i = 0; host[i] && i < sizeof(safe) - 1; i++) {
++        char c = host[i];
++        safe[i] = ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
++                   (c >= '0' && c <= '9') || c == '.' || c == '-') ? c : '_';
++    }
++    safe[i] = 0;
++    if (snprintf(out, outsz, "%s/h3-0rtt-%s_%d.bin", dir, safe, port) >= (int)outsz)
++        return -1;
++    return 0;
++}
++
++static void h3_zrtt_persist(const char *host, int port,
++                            const uint8_t *session, size_t session_len,
++                            const uint8_t *tp, size_t tp_len)
++{
++    char path[2048], tmp[2080];
++    FILE *f;
++    uint32_t magic = H3_0RTT_MAGIC, ver = H3_0RTT_VERSION;
++    uint64_t now = (uint64_t)time(NULL);
++    uint32_t hlen = (uint32_t)strlen(host), p = (uint32_t)port;
++    uint32_t sl = (uint32_t)session_len, tl = (uint32_t)tp_len;
++    if (h3_0rtt_path(path, sizeof(path), host, port) < 0)
++        return;
++    if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp))
++        return;
++    if (!(f = fopen(tmp, "wb")))
++        return;
++    fwrite(&magic,4,1,f); fwrite(&ver,4,1,f); fwrite(&now,8,1,f);
++    fwrite(&hlen,4,1,f);  fwrite(host,1,hlen,f); fwrite(&p,4,1,f);
++    fwrite(&sl,4,1,f);    fwrite(session,1,session_len,f);
++    fwrite(&tl,4,1,f);    fwrite(tp,1,tp_len,f);
++    if (fclose(f) == 0) { if (rename(tmp, path) != 0) remove(tmp); }
++    else                  remove(tmp);
++}
++
++/* read+verify the persisted ticket for host:port; malloc copies; 1 on hit */
++static int h3_zrtt_load(const char *host, int port,
++                        uint8_t **session, size_t *session_len,
++                        uint8_t **tp, size_t *tp_len)
++{
++    char path[2048], fhost[1024];
++    FILE *f;
++    uint32_t magic=0, ver=0, hlen=0, fport=0, sl=0, tl=0;
++    uint64_t saved=0;
++    uint8_t *sc=NULL, *tc=NULL;
++    int ok = 0;
++    if (h3_0rtt_path(path, sizeof(path), host, port) < 0)
++        return 0;
++    if (!(f = fopen(path, "rb")))
++        return 0;
++    if (fread(&magic,4,1,f)!=1 || magic!=H3_0RTT_MAGIC)   goto out;
++    if (fread(&ver,4,1,f)!=1   || ver!=H3_0RTT_VERSION)   goto out;
++    if (fread(&saved,8,1,f)!=1 ||
++        (uint64_t)time(NULL) > saved + H3_0RTT_TTL_SEC)   goto out; /* stale */
++    if (fread(&hlen,4,1,f)!=1  || hlen>=sizeof(fhost))    goto out;
++    if (fread(fhost,1,hlen,f)!=hlen)                      goto out;
++    fhost[hlen]=0;
++    if (fread(&fport,4,1,f)!=1 || (int)fport!=port || strcmp(fhost,host)) goto out;
++    if (fread(&sl,4,1,f)!=1    || !sl || sl>H3_0RTT_MAXBLOB) goto out;
++    if (!(sc=av_malloc(sl))    || fread(sc,1,sl,f)!=sl)   goto out;
++    if (fread(&tl,4,1,f)!=1    || !tl || tl>H3_0RTT_MAXBLOB) goto out;
++    if (!(tc=av_malloc(tl))    || fread(tc,1,tl,f)!=tl)   goto out;
++    *session=sc; *session_len=sl; *tp=tc; *tp_len=tl;
++    sc=tc=NULL; ok=1;
++out:
++    fclose(f);
++    av_free(sc); av_free(tc);
++    return ok;
++}
++
++/* memory + (opt-in) disk */
++static void h3_zrtt_put(const char *host, int port,
++                        const uint8_t *session, size_t session_len,
++                        const uint8_t *tp, size_t tp_len)
++{
++    h3_zrtt_store_mem(host, port, session, session_len, tp, tp_len);
++    h3_zrtt_persist(host, port, session, session_len, tp, tp_len);
++}
++
 +/* On hit: malloc copies into the session/tp out-params (caller frees) and
-+   return 1. Else 0. */
++   return 1. Else 0. Memory first, then the on-disk cache (which is then
++   promoted into memory). */
 +static int h3_zrtt_get(const char *host, int port,
 +                       uint8_t **session, size_t *session_len,
 +                       uint8_t **tp, size_t *tp_len)
@@ -360,6 +456,10 @@ index 0000000..2739baa
 +        }
 +    }
 +    ff_mutex_unlock(&h3_zrtt_mutex);
++    if (!hit && h3_zrtt_load(host, port, session, session_len, tp, tp_len)) {
++        h3_zrtt_store_mem(host, port, *session, *session_len, *tp, *tp_len);
++        hit = 1;
++    }
 +    return hit;
 +}
 +#endif /* CONFIG_GNUTLS */
