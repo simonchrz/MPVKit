@@ -279,8 +279,11 @@ let package = Package(
             // h3.4: QUIC flow-control fix (4bb49ba) — recv_data extends max_stream/conn offset
             // so DATA-frame payload is credited; without it multi-segment HLS (recordings) stalled
             // after segment 1 (window never reopened past 1MB/8MB).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.42-h3.4/Libavformat.xcframework.zip",
-            checksum: "94df45c523c04c9215e46230d0f74052c51b121ced074ed976656d0892513e29"
+            // h3.5: ca_file via env KUCKUCK_H3_CA_FILE — lavf-o-Plumbing erreichte die private
+            // AVOption nicht on-device → SecTrust fiel auf System-Store → Gateway-Playback
+            // scheiterte auf Geräten ohne Caddy-Profil (alle iPads). Patch-Commit 157f738.
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.42-h3.5/Libavformat.xcframework.zip",
+            checksum: "1d45087d0e9b772f9aa0208122d9f62c58aaed8afa66f7f28e209bcdd0237973"
         ),
         .binaryTarget(
             name: "Libngtcp2",
