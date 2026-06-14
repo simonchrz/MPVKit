@@ -386,8 +386,12 @@ let package = Package(
             // SDR-Live-TV (Tuner + Mediathek-Live) — bt.1886-Broadcast wirkt auf dem
             // Handy (~sRGB-Erwartung) sonst einen Tick zu dunkel. Sonst identisch .44.
             // ABI unverändert (.39). Nur ios-arm64-Slice neu, Simulator unverändert.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.50/Libmpv.xcframework.zip",
-            checksum: "f2a914c681eaa173dcf181df36d3054916c8ffd99784379a3636e6eb77fc93e5"
+            // renderpl.51: + kuckuck_hybrid_* (standalone libplacebo-Render-Entry für
+            // den AVPlayer-Hybrid Mediathek-Live; render_pl.c + render_mtl.h). Device-
+            // slice-swap auf .50; Libav* unverändert auf .50. App-Calls #if-guarded gegen
+            // Simulator (Sim-Slice ohne die Symbole; App eh device-only via QUIC-Libs).
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.51/Libmpv.xcframework.zip",
+            checksum: "10b7aabe70109071db7195093378f8e3be3ff01f69c7518c86d39d90a41a73f3"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]

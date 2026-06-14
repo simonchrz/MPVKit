@@ -9,10 +9,10 @@ index 02efefb..f64c418 100644
 +extern const struct render_backend_fns render_backend_pl;
 diff --git a/video/out/render_pl.c b/video/out/render_pl.c
 new file mode 100644
-index 0000000..ea9b030
+index 0000000..81d924d
 --- /dev/null
 +++ b/video/out/render_pl.c
-@@ -0,0 +1,1199 @@
+@@ -0,0 +1,1524 @@
 +/*
 + * libmpv render-API backend driven by libplacebo (pl_renderer) instead of the
 + * mpv `ra` abstraction. This is the future-proofing path: mpv is deprecating
@@ -422,22 +422,30 @@ index 0000000..ea9b030
 +// und der Render-Thread hot-swapt den pl_hook, sobald sich der Pfad ändert.
 +// strcmp-Guard → fopen/parse nur bei echtem Wechsel, nicht jeden Frame. Leeres/
 +// fehlendes env = kein Hook (Upscaler aus). Braucht p->gpu (in pl_init gesetzt).
-+static void pl_apply_user_shader(struct priv *p)
++// Core: shared by the mpv render path (pl_apply_user_shader) and the hybrid
++// path (kuckuck_hybrid_render). Mutates rparams->hooks + the caller's
++// user_hook/shader_path fields, allocating talloc children of tactx. user_hook
++// MUST be a stable address (a field in the owning struct): rparams->hooks is
++// set to point at it.
++static void kk_apply_user_shader(void *tactx, pl_gpu gpu,
++                                 struct pl_render_params *rparams,
++                                 const struct pl_hook **user_hook,
++                                 char **shader_path)
 +{
 +    const char *path = getenv("KUCKUCK_GLSL_SHADER");
 +    if (!path)
 +        path = "";
-+    const char *cur = p->user_shader_path ? p->user_shader_path : "";
++    const char *cur = *shader_path ? *shader_path : "";
 +    if (strcmp(path, cur) == 0)
 +        return;  // unverändert → nichts tun (kein fopen pro Frame)
 +
 +    // Pfad gewechselt → alten Hook weg, neuen laden (oder keinen).
-+    if (p->user_hook)
-+        pl_mpv_user_shader_destroy(&p->user_hook);
-+    p->rparams.hooks = NULL;
-+    p->rparams.num_hooks = 0;
-+    talloc_free(p->user_shader_path);
-+    p->user_shader_path = talloc_strdup(p, path);
++    if (*user_hook)
++        pl_mpv_user_shader_destroy(user_hook);
++    rparams->hooks = NULL;
++    rparams->num_hooks = 0;
++    talloc_free(*shader_path);
++    *shader_path = talloc_strdup(tactx, path);
 +
 +    if (!path[0])
 +        return;  // env geleert → Upscaler aus
@@ -449,17 +457,22 @@ index 0000000..ea9b030
 +    long ssz = ftell(sf);
 +    fseek(sf, 0, SEEK_SET);
 +    if (ssz > 0 && ssz < 8 * 1024 * 1024) {
-+        char *sbuf = talloc_size(p, ssz + 1);
++        char *sbuf = talloc_size(tactx, ssz + 1);
 +        size_t srd = fread(sbuf, 1, ssz, sf);
 +        sbuf[srd] = 0;
-+        p->user_hook = pl_mpv_user_shader_parse(p->gpu, sbuf, srd);
++        *user_hook = pl_mpv_user_shader_parse(gpu, sbuf, srd);
 +        talloc_free(sbuf);
 +    }
 +    fclose(sf);
-+    if (p->user_hook) {
-+        p->rparams.hooks = &p->user_hook;   // 1-Element-Array (Adresse des Pointers)
-+        p->rparams.num_hooks = 1;
++    if (*user_hook) {
++        rparams->hooks = user_hook;   // 1-Element-Array (Adresse des Pointers)
++        rparams->num_hooks = 1;
 +    }
++}
++
++static void pl_apply_user_shader(struct priv *p)
++{
++    kk_apply_user_shader(p, p->gpu, &p->rparams, &p->user_hook, &p->user_shader_path);
 +}
 +
 +// Per-Content-Debanding-Presets (G). Default (high_quality) = pl_deband_default_
@@ -479,25 +492,32 @@ index 0000000..ea9b030
 +// Debanding pro Content via env KUCKUCK_DEBAND: off|mild|strong; unset/anderes =
 +// high_quality-Default. App-Gate setzt es pro Video. strcmp-Cache wie der Upscaler
 +// (kein Reassign pro Frame). off spart den Deband-Compute-Pass ganz.
-+static void pl_apply_deband(struct priv *p)
++// Core: shared by the mpv path (pl_apply_deband) and the hybrid path.
++static void kk_apply_deband(void *tactx, struct pl_render_params *rparams,
++                            char **deband_mode)
 +{
 +    const char *mode = getenv("KUCKUCK_DEBAND");
 +    if (!mode)
 +        mode = "";
-+    const char *cur = p->deband_mode ? p->deband_mode : "";
++    const char *cur = *deband_mode ? *deband_mode : "";
 +    if (strcmp(mode, cur) == 0)
 +        return;
-+    talloc_free(p->deband_mode);
-+    p->deband_mode = talloc_strdup(p, mode);
++    talloc_free(*deband_mode);
++    *deband_mode = talloc_strdup(tactx, mode);
 +
 +    if (strcmp(mode, "off") == 0)
-+        p->rparams.deband_params = NULL;
++        rparams->deband_params = NULL;
 +    else if (strcmp(mode, "mild") == 0)
-+        p->rparams.deband_params = &deband_mild;
++        rparams->deband_params = &deband_mild;
 +    else if (strcmp(mode, "strong") == 0)
-+        p->rparams.deband_params = &deband_strong;
++        rparams->deband_params = &deband_strong;
 +    else
-+        p->rparams.deband_params = &pl_deband_default_params;  // unset/unbekannt
++        rparams->deband_params = &pl_deband_default_params;  // unset/unbekannt
++}
++
++static void pl_apply_deband(struct priv *p)
++{
++    kk_apply_deband(p, &p->rparams, &p->deband_mode);
 +}
 +
 +static int pl_init(struct render_backend *ctx, mpv_render_param *params)
@@ -1212,6 +1232,311 @@ index 0000000..ea9b030
 +    .render          = pl_render,
 +    .destroy         = pl_destroy,
 +};
++
++// ===========================================================================
++// Kuckuck Hybrid render path (Increment 1: minimal CVPixelBuffer -> drawable)
++// ---------------------------------------------------------------------------
++// A standalone libplacebo entry, decoupled from mpv's render_backend/vo. The
++// host runs an AVPlayer (decode + seamless HLS-ABR) and feeds the decoded
++// CVPixelBuffers here; we render them through pl_renderer into a CAMetalLayer
++// drawable that the host acquires + presents. This first increment proves the
++// plumbing (device -> pl_gpu, IOSurface -> pl_frame, drawable -> target,
++// pl_render_image, present) with the base high-quality params only — the
++// per-content user-shader / deband / VT-SR hooks are added in Increment 2.
++// Public API declared in include/mpv/render_mtl.h.
++// ===========================================================================
++
++struct hybrid_priv {
++    pl_log pllog;
++    pl_metal metal;
++    pl_gpu gpu;
++    pl_renderer rr;
++    pl_cache cache;
++    struct pl_render_params rparams;
++    // Per-content quality (Increment 2): user-shader (ArtCNN/CAS/Anime4K) +
++    // deband, env-driven exactly like the mpv path. user_hook needs a stable
++    // address (rparams.hooks points at it). strcmp-cached → no fopen/parse per
++    // frame unless the env path actually changes.
++    const struct pl_hook *user_hook;
++    char *user_shader_path;
++    char *deband_mode;
++};
++
++static void hybrid_log_cb(void *priv, enum pl_log_level level, const char *msg)
++{
++    (void) priv; (void) level;
++    fprintf(stderr, "[hybrid/pl] %s\n", msg);
++}
++
++// CoreVideo colour attachment -> libplacebo enums. Missing attachments default
++// to BT.709 SDR (the Mediathek-live common case). CVBufferGetAttachment returns
++// an unretained value (no release), and is warning-free at the slice's iOS-14
++// deployment target (unlike CVBufferCopyAttachment, iOS-15+).
++static enum pl_color_system hybrid_matrix(CVPixelBufferRef pb)
++{
++    CFTypeRef m = CVBufferGetAttachment(pb, kCVImageBufferYCbCrMatrixKey, NULL);
++    if (!m) return PL_COLOR_SYSTEM_BT_709;
++    if (CFEqual(m, kCVImageBufferYCbCrMatrix_ITU_R_601_4))
++        return PL_COLOR_SYSTEM_BT_601;
++    if (CFEqual(m, kCVImageBufferYCbCrMatrix_SMPTE_240M_1995))
++        return PL_COLOR_SYSTEM_SMPTE_240M;
++    if (CFEqual(m, kCVImageBufferYCbCrMatrix_ITU_R_2020))
++        return PL_COLOR_SYSTEM_BT_2020_NC;
++    return PL_COLOR_SYSTEM_BT_709;
++}
++
++static enum pl_color_primaries hybrid_prim(CVPixelBufferRef pb)
++{
++    CFTypeRef pr = CVBufferGetAttachment(pb, kCVImageBufferColorPrimariesKey, NULL);
++    if (!pr) return PL_COLOR_PRIM_BT_709;
++    if (CFEqual(pr, kCVImageBufferColorPrimaries_EBU_3213))
++        return PL_COLOR_PRIM_BT_601_625;
++    if (CFEqual(pr, kCVImageBufferColorPrimaries_SMPTE_C))
++        return PL_COLOR_PRIM_BT_601_525;
++    if (CFEqual(pr, kCVImageBufferColorPrimaries_ITU_R_2020))
++        return PL_COLOR_PRIM_BT_2020;
++    return PL_COLOR_PRIM_BT_709;
++}
++
++static enum pl_color_transfer hybrid_trc(CVPixelBufferRef pb)
++{
++    CFTypeRef tf = CVBufferGetAttachment(pb, kCVImageBufferTransferFunctionKey, NULL);
++    if (!tf) return PL_COLOR_TRC_BT_1886;
++    if (CFEqual(tf, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ))
++        return PL_COLOR_TRC_PQ;
++    if (CFEqual(tf, kCVImageBufferTransferFunction_ITU_R_2100_HLG))
++        return PL_COLOR_TRC_HLG;
++    return PL_COLOR_TRC_BT_1886;
++}
++
++// Wrap a decoded CVPixelBuffer's IOSurface planes as a pl_frame (zero-copy,
++// like vt_wrap_map but from a raw buffer with no mp_image). NV12 -> r8/rg8,
++// P010 -> r16/rg16. On success fills *frame + tex_out[2]; caller destroys the
++// textures after render.
++static bool hybrid_wrap_pixbuf(struct hybrid_priv *p, CVPixelBufferRef pb,
++                               struct pl_frame *frame, pl_tex tex_out[2])
++{
++    IOSurfaceRef surf = pb ? CVPixelBufferGetIOSurface(pb) : NULL;
++    if (!surf)
++        return false;
++
++    OSType pf = CVPixelBufferGetPixelFormatType(pb);
++    const char *lname, *cname;
++    struct pl_bit_encoding bits;
++    enum pl_color_levels levels;
++    switch (pf) {
++    case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
++        lname = "r8"; cname = "rg8"; levels = PL_COLOR_LEVELS_LIMITED;
++        bits = (struct pl_bit_encoding) { .sample_depth = 8, .color_depth = 8 };
++        break;
++    case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
++        lname = "r8"; cname = "rg8"; levels = PL_COLOR_LEVELS_FULL;
++        bits = (struct pl_bit_encoding) { .sample_depth = 8, .color_depth = 8 };
++        break;
++    case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange:
++        lname = "r16"; cname = "rg16"; levels = PL_COLOR_LEVELS_LIMITED;
++        bits = (struct pl_bit_encoding) { .sample_depth = 16, .color_depth = 10,
++                                          .bit_shift = 6 };
++        break;
++    case kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
++        lname = "r16"; cname = "rg16"; levels = PL_COLOR_LEVELS_FULL;
++        bits = (struct pl_bit_encoding) { .sample_depth = 16, .color_depth = 10,
++                                          .bit_shift = 6 };
++        break;
++    default:
++        return false;   // unsupported CV pixel format
++    }
++
++    int w  = (int) CVPixelBufferGetWidthOfPlane(pb, 0);
++    int h  = (int) CVPixelBufferGetHeightOfPlane(pb, 0);
++    int cw = (int) CVPixelBufferGetWidthOfPlane(pb, 1);
++    int ch = (int) CVPixelBufferGetHeightOfPlane(pb, 1);
++    pl_fmt fl = pl_find_named_fmt(p->gpu, lname);
++    pl_fmt fc = pl_find_named_fmt(p->gpu, cname);
++    pl_tex luma   = fl ? pl_metal_wrap_iosurface(p->metal, surf, 0, w, h, fl) : NULL;
++    pl_tex chroma = fc ? pl_metal_wrap_iosurface(p->metal, surf, 1, cw, ch, fc) : NULL;
++    if (!luma || !chroma) {
++        pl_tex_destroy(p->gpu, &luma);
++        pl_tex_destroy(p->gpu, &chroma);
++        return false;
++    }
++
++    *frame = (struct pl_frame) {
++        .num_planes = 2,
++        .planes = {
++            { .texture = luma, .components = 1,
++              .component_mapping = { PL_CHANNEL_Y, PL_CHANNEL_NONE,
++                                     PL_CHANNEL_NONE, PL_CHANNEL_NONE } },
++            { .texture = chroma, .components = 2,
++              .component_mapping = { PL_CHANNEL_CB, PL_CHANNEL_CR,
++                                     PL_CHANNEL_NONE, PL_CHANNEL_NONE } },
++        },
++        .repr = {
++            .sys    = hybrid_matrix(pb),
++            .levels = levels,
++            .bits   = bits,
++        },
++        .color = {
++            .primaries = hybrid_prim(pb),
++            .transfer  = hybrid_trc(pb),
++        },
++        .crop = { .x0 = 0, .y0 = 0, .x1 = w, .y1 = h },
++    };
++    pl_frame_set_chroma_location(frame, PL_CHROMA_LEFT);
++    tex_out[0] = luma;
++    tex_out[1] = chroma;
++    return true;
++}
++
++void *kuckuck_hybrid_create(void *mtl_device)
++{
++    if (!mtl_device)
++        return NULL;
++    struct hybrid_priv *p = talloc_zero(NULL, struct hybrid_priv);
++
++    p->pllog = pl_log_create(PL_API_VER, pl_log_params(
++        .log_cb    = hybrid_log_cb,
++        .log_level = PL_LOG_WARN,
++    ));
++    if (!p->pllog)
++        goto fail;
++
++    // Own queue (queue=NULL): the hybrid path isn't sharing the host queue yet
++    // (no-finish/shared-queue present is a later increment).
++    p->metal = pl_metal_create(p->pllog, pl_metal_params(
++        .device = mtl_device,
++    ));
++    if (!p->metal) {
++        fprintf(stderr, "[hybrid/pl] pl_metal_create failed\n");
++        goto fail;
++    }
++    p->gpu = p->metal->gpu;
++
++    // Reuse the same persisted GLSL->MSL transpile cache as the mpv path
++    // (shared file → warm first frame regardless of which path opened it).
++    p->cache = pl_cache_create(pl_cache_params(
++        .log            = p->pllog,
++        .max_total_size = 16 << 20,
++    ));
++    if (p->cache) {
++        char path[PATH_MAX];
++        if (pl_cache_file_path(path, sizeof(path))) {
++            FILE *f = fopen(path, "rb");
++            if (f) { pl_cache_load_file(p->cache, f); fclose(f); }
++        }
++        pl_gpu_set_cache(p->gpu, p->cache);
++    }
++
++    p->rr = pl_renderer_create(p->pllog, p->gpu);
++    if (!p->rr)
++        goto fail;
++
++    p->rparams = pl_render_high_quality_params;
++    p->rparams.error_diffusion = &pl_error_diffusion_sierra_lite;
++    // SDR target for Increment 1 → peak-detect off (matches the mpv SDR path).
++    p->rparams.peak_detect_params = NULL;
++
++    return p;
++
++fail:
++    kuckuck_hybrid_destroy(p);
++    return NULL;
++}
++
++int kuckuck_hybrid_render(void *ctx, void *cv_pixbuf, void *target_texture)
++{
++    struct hybrid_priv *p = ctx;
++    if (!p || !cv_pixbuf || !target_texture)
++        return -1;
++    CVPixelBufferRef pb = (CVPixelBufferRef) cv_pixbuf;
++
++    // Per-content quality hot-swap (Increment 2): the host sets KUCKUCK_GLSL_SHADER
++    // / KUCKUCK_DEBAND per content (same env as the mpv path); apply both here.
++    // strcmp-guarded → only reparses on an actual change.
++    kk_apply_user_shader(p, p->gpu, &p->rparams, &p->user_hook, &p->user_shader_path);
++    kk_apply_deband(p, &p->rparams, &p->deband_mode);
++
++    struct pl_frame img;
++    pl_tex src_tex[2] = { NULL, NULL };
++    if (!hybrid_wrap_pixbuf(p, pb, &img, src_tex))
++        return -2;
++
++    pl_tex target_tex = pl_metal_wrap_tex(p->metal, target_texture);
++    if (!target_tex) {
++        pl_tex_destroy(p->gpu, &src_tex[0]);
++        pl_tex_destroy(p->gpu, &src_tex[1]);
++        return -3;
++    }
++
++    // Y-orientation: CVPixelBuffer + CAMetalDrawable are both top-left origin,
++    // but libplacebo's swapchain convention may need a flip (the mpv path runs
++    // with FLIP_Y=1 since the mpv-master upgrade). Env toggle so the on-device
++    // orientation can be corrected without a rebuild; settle on the constant
++    // once verified.
++    const char *flipenv = getenv("KUCKUCK_HYBRID_FLIP");
++    bool flip = flipenv && flipenv[0] == '1';
++    struct pl_swapchain_frame sw_frame = {
++        .fbo         = target_tex,
++        .flipped     = flip,
++        .color_repr  = pl_color_repr_rgb,
++        .color_space = pl_color_space_srgb,   // SDR drawable (Increment 1)
++    };
++    struct pl_frame target;
++    pl_frame_from_swapchain(&target, &sw_frame);
++
++    // Aspect-correct letterbox: fit the source into the drawable, centred, and
++    // let libplacebo clear the bars to black (pl_frame_from_swapchain defaulted
++    // target.crop to the whole drawable = stretch-to-fill).
++    float tw = target_tex->params.w, th = target_tex->params.h;
++    float sw = img.crop.x1 - img.crop.x0, sh = img.crop.y1 - img.crop.y0;
++    if (sw > 0 && sh > 0 && tw > 0 && th > 0) {
++        float src_ar = sw / sh, dst_ar = tw / th;
++        if (src_ar > dst_ar) {           // source wider → bars top/bottom
++            float fh = tw / src_ar, y0 = (th - fh) / 2.0f;
++            target.crop = (struct pl_rect2df) { .x0 = 0, .y0 = y0, .x1 = tw, .y1 = y0 + fh };
++        } else {                          // source taller → bars left/right
++            float fw = th * src_ar, x0 = (tw - fw) / 2.0f;
++            target.crop = (struct pl_rect2df) { .x0 = x0, .y0 = 0, .x1 = x0 + fw, .y1 = th };
++        }
++    }
++
++    pl_render_image(p->rr, &img, &target, &p->rparams);
++
++    // Block until the GPU is done so the host can present the drawable right
++    // after this returns (no shared-queue present coordination yet).
++    pl_gpu_finish(p->gpu);
++
++    pl_tex_destroy(p->gpu, &target_tex);
++    pl_tex_destroy(p->gpu, &src_tex[0]);
++    pl_tex_destroy(p->gpu, &src_tex[1]);
++    return 0;
++}
++
++void kuckuck_hybrid_destroy(void *ctx)
++{
++    struct hybrid_priv *p = ctx;
++    if (!p)
++        return;
++    if (p->user_hook)
++        pl_mpv_user_shader_destroy(&p->user_hook);
++    if (p->rr)
++        pl_renderer_destroy(&p->rr);
++    if (p->cache) {
++        char path[PATH_MAX];
++        if (pl_cache_file_path(path, sizeof(path))) {
++            FILE *f = fopen(path, "wb");
++            if (f) { pl_cache_save_file(p->cache, f); fclose(f); }
++        }
++        if (p->gpu)
++            pl_gpu_set_cache(p->gpu, NULL);
++        pl_cache_destroy(&p->cache);
++    }
++    if (p->metal)
++        pl_metal_destroy(&p->metal);
++    if (p->pllog)
++        pl_log_destroy(&p->pllog);
++    talloc_free(p);
++}
 diff --git a/video/out/vo_libmpv.c b/video/out/vo_libmpv.c
 index a91016d..9084c85 100644
 --- a/video/out/vo_libmpv.c

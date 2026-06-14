@@ -1,8 +1,9 @@
 diff --git a/include/mpv/render_mtl.h b/include/mpv/render_mtl.h
 new file mode 100644
+index 0000000..6901630
 --- /dev/null
 +++ b/include/mpv/render_mtl.h
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,163 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Permission to use, copy, modify, and/or distribute this software for any
@@ -126,6 +127,40 @@ new file mode 100644
 +     */
 +    void *command_buffer;
 +} mpv_metal_drawable;
++
++/**
++ * Kuckuck hybrid render path
++ * --------------------------
++ *
++ * A standalone libplacebo (render_pl) entry point, independent of the mpv
++ * player/render-context. The host app runs an AVPlayer for decode + seamless
++ * HLS-ABR and pulls decoded CVPixelBuffers from an AVPlayerItemVideoOutput;
++ * each buffer is handed to kuckuck_hybrid_render() which runs the same
++ * libplacebo quality pipeline used by the mpv path and renders into a
++ * CAMetalLayer drawable's texture. Drawable acquisition + present stay on the
++ * host (Swift) side — this C API only renders into the texture it is given,
++ * mirroring MPV_RENDER_PARAM_METAL_DRAWABLE.
++ *
++ * All pointers are opaque to keep this header free of CoreVideo/Metal headers:
++ *   - mtl_device     : id<MTLDevice>      (the host's render device)
++ *   - cv_pixbuf      : CVPixelBufferRef   (decoded frame, NV12 or P010, IOSurface-backed)
++ *   - target_texture : id<MTLTexture>     (CAMetalDrawable.texture)
++ *
++ * Thread-safety: create/render/destroy must all run on the same (render) thread.
++ */
++
++/** Create a hybrid render context bound to the given MTLDevice. Returns NULL on
++ *  failure. */
++void *kuckuck_hybrid_create(void *mtl_device);
++
++/** Render one decoded CVPixelBuffer into target_texture. Returns 0 on success,
++ *  <0 on failure (in which case the target texture is left unmodified). The
++ *  call blocks until the GPU has finished, so the host may present the drawable
++ *  immediately after it returns. */
++int kuckuck_hybrid_render(void *ctx, void *cv_pixbuf, void *target_texture);
++
++/** Tear down a context from kuckuck_hybrid_create(). */
++void kuckuck_hybrid_destroy(void *ctx);
 +
 +#ifdef __cplusplus
 +}
