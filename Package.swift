@@ -265,13 +265,13 @@ let package = Package(
             // renderpl.43: identisch .42 (FFmpeg 625ab01) MINUS dem FFmpeg-Patch
             // 0001-vt-inline-retry — die VT-Session-Recovery wandert von hier in
             // libmpv (vd_lavc-Patch 0017, s. Libmpv unten). Sonst kein Source-Δ.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.48/Libavcodec.xcframework.zip",
-            checksum: "30845e924405c822e263f9c4a15969cc320b2ca5f11f200bca85aedcc88a5e24"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.49/Libavcodec.xcframework.zip",
+            checksum: "a40db1548cd371409f833a048e6cd5dd0fe78746146f9bc37088123559829b97"
         ),
         .binaryTarget(
             name: "Libavdevice",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.48/Libavdevice.xcframework.zip",
-            checksum: "61aac2d23daf702a96dfc9d1654f0097643d13c32409ffbfabaeb660c0554939"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.49/Libavdevice.xcframework.zip",
+            checksum: "42c28c3eb7d92291b7f8ab1d248fc65ac87c224d54d8e93c3ba3117cdd9e5aa9"
         ),
         .binaryTarget(
             name: "Libavformat",
@@ -282,8 +282,8 @@ let package = Package(
             // h3.5: ca_file via env KUCKUCK_H3_CA_FILE — lavf-o-Plumbing erreichte die private
             // AVOption nicht on-device → SecTrust fiel auf System-Store → Gateway-Playback
             // scheiterte auf Geräten ohne Caddy-Profil (alle iPads). Patch-Commit 157f738.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.48/Libavformat.xcframework.zip",
-            checksum: "969a63583ac79867661be9608fcb8708ca3a01063e010b8f5b6b2c9e73a80bc5"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.49/Libavformat.xcframework.zip",
+            checksum: "4f55201af49d5533261f8d47d0c228f11c7013e057ca14c79a114ed2b2dd0212"
         ),
         .binaryTarget(
             name: "Libngtcp2",
@@ -309,23 +309,23 @@ let package = Package(
             // Whitelist).
             // renderpl.42: FFmpeg-Rebase d1faab7 → master 625ab01 (2026-06-11);
             // dynaudnorm/speechnorm/bwdif in der Whitelist bestätigt (Build-Log).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.48/Libavfilter.xcframework.zip",
-            checksum: "b5c4ed7f41c1dba70dc16f1fc6bc8e3bea8fba1f69bc0d5eacdac00866629a39"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.49/Libavfilter.xcframework.zip",
+            checksum: "88d4e92a12e08e1ae60dfd5a0422c5041ee7677a792324f2bcbf4f5b07b67d51"
         ),
         .binaryTarget(
             name: "Libavutil",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.48/Libavutil.xcframework.zip",
-            checksum: "2ebf986c8cae3766974eff3eeb3ef8bc89d3f9b75794dbc60c72bef896b816df"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.49/Libavutil.xcframework.zip",
+            checksum: "df9739aead16fc8dea22f2040725799f548b15ad95ca5ab71dfc3f130bc28f75"
         ),
         .binaryTarget(
             name: "Libswresample",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.48/Libswresample.xcframework.zip",
-            checksum: "b73b54498550292d9632066b0a0376fb9c877f072af84d3a3387bb01d91e7356"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.49/Libswresample.xcframework.zip",
+            checksum: "d2161f8f2d0d52d89d5407a6e99969356cde1a177fcf629ced30f3a0b5285634"
         ),
         .binaryTarget(
             name: "Libswscale",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.48/Libswscale.xcframework.zip",
-            checksum: "3740a3301f081535883dcdc5f2ba044256adad495d8a970d06ae8b2f33e6669a"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.49/Libswscale.xcframework.zip",
+            checksum: "bbd0e64e5e18a3f2623d341bf8fb022f80ea06428f3254e48809cdc8962080e9"
         ),
 
         .binaryTarget(
@@ -386,8 +386,8 @@ let package = Package(
             // SDR-Live-TV (Tuner + Mediathek-Live) — bt.1886-Broadcast wirkt auf dem
             // Handy (~sRGB-Erwartung) sonst einen Tick zu dunkel. Sonst identisch .44.
             // ABI unverändert (.39). Nur ios-arm64-Slice neu, Simulator unverändert.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.48/Libmpv.xcframework.zip",
-            checksum: "15380ae27319694137b562c976a73b9df43036a9ff95a958fb47746abc753940"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.49/Libmpv.xcframework.zip",
+            checksum: "ead9152c2990fd890bba5962dcc8052ecfcb7df65fb81decf6fd249083c0cc90"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
