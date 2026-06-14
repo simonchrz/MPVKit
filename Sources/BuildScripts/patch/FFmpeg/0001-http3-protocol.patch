@@ -103,10 +103,10 @@ index 0db0c7c..72fc4fe 100644
  OBJS-$(CONFIG_LIBZMQ_PROTOCOL)           += libzmq.o
 diff --git a/libavformat/http3.c b/libavformat/http3.c
 new file mode 100644
-index 0000000..9f7939c
+index 0000000..9d8484f
 --- /dev/null
 +++ b/libavformat/http3.c
-@@ -0,0 +1,1848 @@
+@@ -0,0 +1,1859 @@
 +/*
 + * HTTP/3 (QUIC) protocol for FFmpeg.
 + *
@@ -257,6 +257,7 @@ index 0000000..9f7939c
 +
 +    int64_t stream_id;
 +    int     stream_done;
++    int     stream_err;    /* stream was reset/aborted (not a clean FIN) */
 +    int     status;
 +    int     headers_done;
 +    char    location[2048];
@@ -563,8 +564,13 @@ index 0000000..9f7939c
 +            app_error_code = NGHTTP3_H3_NO_ERROR;
 +        nghttp3_conn_close_stream(hc->h3conn, stream_id, app_error_code);
 +    }
-+    if (hc->cur && stream_id == hc->cur->stream_id)
++    if (hc->cur && stream_id == hc->cur->stream_id) {
 +        hc->cur->stream_done = 1;
++        /* RESET_STREAM (not a clean FIN) => the response body is truncated */
++        if ((flags & NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET) &&
++            app_error_code != NGHTTP3_H3_NO_ERROR)
++            hc->cur->stream_err = 1;
++    }
 +    return 0;
 +}
 +
@@ -776,7 +782,9 @@ index 0000000..9f7939c
 +    return h3_apple_verify(der, len, n, hc->vhost, hc->ca_file) == 0
 +               ? 0 : GNUTLS_E_CERTIFICATE_ERROR;
 +}
++#endif
 +
++#if CONFIG_GNUTLS
 +/* NEW_SESSION_TICKET hook (GNUTLS_HOOK_POST): stash the resumable TLS session
 +   + the server's encoded QUIC transport params for a later 0-RTT cold dial. */
 +static int h3_gnutls_ticket_hook(gnutls_session_t session, unsigned int htype,
@@ -1551,7 +1559,7 @@ index 0000000..9f7939c
 +        ngtcp2_conn_shutdown_stream(hc->conn, 0, c->stream_id, NGHTTP3_H3_REQUEST_CANCELLED);
 +
 +    c->rb_len = c->rb_off = 0;
-+    c->stream_done = c->headers_done = c->status = 0;
++    c->stream_done = c->headers_done = c->status = c->stream_err = 0;
 +
 +    if (range_start > 0) {
 +        snprintf(rangebuf, sizeof(rangebuf), "bytes=%"PRId64"-", range_start);
@@ -1857,7 +1865,10 @@ index 0000000..9f7939c
 +    while (c->rb_off >= c->rb_len) {
 +        int rv;
 +        if (c->stream_done)
-+            return AVERROR_EOF;
++            /* a reset stream or a short read vs the announced Content-Length is
++               a truncated response, not a clean EOF -- report it as an error */
++            return (c->stream_err || (c->filesize >= 0 && c->off < c->filesize))
++                       ? AVERROR(EIO) : AVERROR_EOF;
 +        if (av_gettime_relative() > deadline)
 +            return AVERROR(ETIMEDOUT);
 +        if ((rv = h3_pump(h, c->hc, 1000)) < 0)
