@@ -103,10 +103,10 @@ index 0db0c7c..72fc4fe 100644
  OBJS-$(CONFIG_LIBZMQ_PROTOCOL)           += libzmq.o
 diff --git a/libavformat/http3.c b/libavformat/http3.c
 new file mode 100644
-index 0000000..2805342
+index 0000000..2739baa
 --- /dev/null
 +++ b/libavformat/http3.c
-@@ -0,0 +1,1387 @@
+@@ -0,0 +1,1558 @@
 +/*
 + * HTTP/3 (QUIC) protocol for FFmpeg.
 + *
@@ -224,6 +224,11 @@ index 0000000..2805342
 +    char vhost[1024];      /* host to verify the cert name against */
 +    char ca_file[1024];    /* extra CA anchor file (PEM), "" if none */
 +    int  port;
++#if CONFIG_GNUTLS
++    int      zrtt;                                   /* attempting 0-RTT on this conn */
++    uint8_t *zrtt_session; size_t zrtt_session_len;  /* resumption ticket (freed after dial) */
++    uint8_t *zrtt_tp;      size_t zrtt_tp_len;       /* cached server transport params */
++#endif
 +
 +    HTTP3Context *cur; /* request currently driving this connection */
 +} H3Conn;
@@ -274,6 +279,90 @@ index 0000000..2805342
 +#define H3_POOL_MAX 8
 +static AVMutex h3_pool_mutex = AV_MUTEX_INITIALIZER;
 +static H3Conn *h3_pool[H3_POOL_MAX];
++
++#if CONFIG_GNUTLS
++/* ---- 0-RTT session cache (host-keyed) ----
++   After a handshake the server sends a TLS session ticket; we stash it
++   together with the server's encoded QUIC transport params. A later COLD
++   dial (no live pooled conn) to the same host can then resume the TLS
++   session and send the request as 0-RTT early data, saving one RTT. Only
++   idempotent GETs are ever sent as early data, so replay is harmless.
++   gnutls-only for now (= the iOS/Pi/Mac crypto backend). */
++#define H3_ZRTT_MAX 8
++typedef struct H3ZeroRTT {
++    char     host[1024];
++    int      port;
++    uint8_t *session; size_t session_len;  /* gnutls_session_get_data2 blob */
++    uint8_t *tp;      size_t tp_len;        /* ngtcp2 0-RTT transport params */
++} H3ZeroRTT;
++static AVMutex h3_zrtt_mutex = AV_MUTEX_INITIALIZER;
++static H3ZeroRTT h3_zrtt[H3_ZRTT_MAX];
++
++static void h3_zrtt_free_entry(H3ZeroRTT *e)
++{
++    av_freep(&e->session); e->session_len = 0;
++    av_freep(&e->tp);      e->tp_len = 0;
++    e->host[0] = 0; e->port = 0;
++}
++
++/* Store (copy) the freshest ticket+tp for host:port, replacing any prior
++   entry for the same host:port, else taking a free slot, else evicting
++   slot 0 (FIFO). */
++static void h3_zrtt_put(const char *host, int port,
++                        const uint8_t *session, size_t session_len,
++                        const uint8_t *tp, size_t tp_len)
++{
++    int i, slot = -1;
++    uint8_t *sc = av_memdup(session, session_len);
++    uint8_t *tc = av_memdup(tp, tp_len);
++    if (!sc || !tc) { av_free(sc); av_free(tc); return; }
++    ff_mutex_lock(&h3_zrtt_mutex);
++    for (i = 0; i < H3_ZRTT_MAX; i++)
++        if (h3_zrtt[i].host[0] && h3_zrtt[i].port == port &&
++            !strcmp(h3_zrtt[i].host, host)) { slot = i; break; }
++    if (slot < 0)
++        for (i = 0; i < H3_ZRTT_MAX; i++)
++            if (!h3_zrtt[i].host[0]) { slot = i; break; }
++    if (slot < 0) {                 /* full: evict slot 0, shift down */
++        h3_zrtt_free_entry(&h3_zrtt[0]);
++        for (i = 1; i < H3_ZRTT_MAX; i++) h3_zrtt[i - 1] = h3_zrtt[i];
++        memset(&h3_zrtt[H3_ZRTT_MAX - 1], 0, sizeof(h3_zrtt[0]));
++        slot = H3_ZRTT_MAX - 1;
++    } else {
++        h3_zrtt_free_entry(&h3_zrtt[slot]);
++    }
++    av_strlcpy(h3_zrtt[slot].host, host, sizeof(h3_zrtt[slot].host));
++    h3_zrtt[slot].port = port;
++    h3_zrtt[slot].session = sc; h3_zrtt[slot].session_len = session_len;
++    h3_zrtt[slot].tp = tc;      h3_zrtt[slot].tp_len = tp_len;
++    ff_mutex_unlock(&h3_zrtt_mutex);
++}
++
++/* On hit: malloc copies into the session/tp out-params (caller frees) and
++   return 1. Else 0. */
++static int h3_zrtt_get(const char *host, int port,
++                       uint8_t **session, size_t *session_len,
++                       uint8_t **tp, size_t *tp_len)
++{
++    int i, hit = 0;
++    ff_mutex_lock(&h3_zrtt_mutex);
++    for (i = 0; i < H3_ZRTT_MAX; i++) {
++        if (h3_zrtt[i].host[0] && h3_zrtt[i].port == port &&
++            !strcmp(h3_zrtt[i].host, host)) {
++            *session = av_memdup(h3_zrtt[i].session, h3_zrtt[i].session_len);
++            *tp      = av_memdup(h3_zrtt[i].tp,      h3_zrtt[i].tp_len);
++            if (*session && *tp) {
++                *session_len = h3_zrtt[i].session_len;
++                *tp_len      = h3_zrtt[i].tp_len;
++                hit = 1;
++            } else { av_freep(session); av_freep(tp); }
++            break;
++        }
++    }
++    ff_mutex_unlock(&h3_zrtt_mutex);
++    return hit;
++}
++#endif /* CONFIG_GNUTLS */
 +
 +/* ---- helpers ---- */
 +
@@ -586,6 +675,31 @@ index 0000000..2805342
 +    return h3_apple_verify(der, len, n, hc->vhost, hc->ca_file) == 0
 +               ? 0 : GNUTLS_E_CERTIFICATE_ERROR;
 +}
++
++/* NEW_SESSION_TICKET hook (GNUTLS_HOOK_POST): stash the resumable TLS session
++   + the server's encoded QUIC transport params for a later 0-RTT cold dial. */
++static int h3_gnutls_ticket_hook(gnutls_session_t session, unsigned int htype,
++                                 unsigned when, unsigned int incoming,
++                                 const gnutls_datum_t *msg)
++{
++    ngtcp2_crypto_conn_ref *ref = gnutls_session_get_ptr(session);
++    H3Conn *hc = ref ? ref->user_data : NULL;
++    gnutls_datum_t sd = { 0 };
++    uint8_t tp[256];
++    ngtcp2_ssize tplen;
++    if (!hc || htype != GNUTLS_HANDSHAKE_NEW_SESSION_TICKET || !hc->conn)
++        return 0;
++    if (gnutls_session_get_data2(session, &sd) != 0)
++        return 0;
++    tplen = ngtcp2_conn_encode_0rtt_transport_params2(hc->conn, tp, sizeof(tp));
++    if (tplen > 0) {
++        h3_zrtt_put(hc->host, hc->port, sd.data, sd.size, tp, (size_t)tplen);
++        av_log(NULL, AV_LOG_VERBOSE, "http3: cached 0-RTT ticket for %s:%d\n",
++               hc->host, hc->port);
++    }
++    gnutls_free(sd.data);
++    return 0;
++}
 +#endif
 +
 +static int h3_init_tls(URLContext *h, H3Conn *hc, const char *host)
@@ -626,7 +740,8 @@ index 0000000..2805342
 +            return AVERROR_EXTERNAL;
 +        gnutls_certificate_set_x509_system_trust(hc->cred);
 +
-+        if (gnutls_init(&hc->session, GNUTLS_CLIENT) != 0)
++        if (gnutls_init(&hc->session, GNUTLS_CLIENT | GNUTLS_ENABLE_EARLY_DATA |
++                                      GNUTLS_NO_END_OF_EARLY_DATA) != 0)
 +            return AVERROR_EXTERNAL;
 +        if ((rv = gnutls_priority_set_direct(hc->session, priority, NULL)) != 0) {
 +            av_log(h, AV_LOG_ERROR, "gnutls priority: %s\n", gnutls_strerror(rv));
@@ -636,6 +751,16 @@ index 0000000..2805342
 +            return AVERROR_EXTERNAL;
 +
 +        gnutls_session_set_ptr(hc->session, &hc->conn_ref);
++        /* stash session tickets for 0-RTT resumption on a later cold dial */
++        gnutls_handshake_set_hook_function(hc->session,
++            GNUTLS_HANDSHAKE_NEW_SESSION_TICKET, GNUTLS_HOOK_POST,
++            h3_gnutls_ticket_hook);
++        /* 0-RTT: resume the cached TLS session so the request can be sent as
++           early data; on failure fall back to a full 1-RTT handshake. */
++        if (hc->zrtt && hc->zrtt_session &&
++            gnutls_session_set_data(hc->session, hc->zrtt_session,
++                                    hc->zrtt_session_len) != 0)
++            hc->zrtt = 0;
 +        if (gnutls_credentials_set(hc->session, GNUTLS_CRD_CERTIFICATE, hc->cred) != 0)
 +            return AVERROR_EXTERNAL;
 +        gnutls_alpn_set_protocols(hc->session, &alpn, 1, GNUTLS_ALPN_MANDATORY);
@@ -800,6 +925,14 @@ index 0000000..2805342
 +        return AVERROR_EXTERNAL;
 +    }
 +    ngtcp2_conn_set_tls_native_handle(hc->conn, H3_TLS_HANDLE(hc));
++#if CONFIG_GNUTLS
++    /* 0-RTT: install the server's transport params from the prior connection so
++       early data respects its flow-control limits; on failure fall back to 1-RTT. */
++    if (hc->zrtt && hc->zrtt_tp &&
++        ngtcp2_conn_decode_and_set_0rtt_transport_params(
++            hc->conn, hc->zrtt_tp, hc->zrtt_tp_len) != 0)
++        hc->zrtt = 0;
++#endif
 +    /* let ngtcp2 emit keep-alive packets once idle 15s; the pool reaper pumps
 +       parked connections so these actually go out and the conn survives the
 +       30s idle timeout for reuse by a later request. */
@@ -1003,6 +1136,8 @@ index 0000000..2805342
 +#if CONFIG_GNUTLS
 +    if (hc->session) gnutls_deinit(hc->session);
 +    if (hc->cred)    gnutls_certificate_free_credentials(hc->cred);
++    av_free(hc->zrtt_session);
++    av_free(hc->zrtt_tp);
 +#else
 +#if !defined(OPENSSL_IS_BORINGSSL)
 +    if (hc->ossl_ctx) ngtcp2_crypto_ossl_ctx_del(hc->ossl_ctx);
@@ -1014,12 +1149,38 @@ index 0000000..2805342
 +    av_free(hc);
 +}
 +
++static int h3_start_request(URLContext *h, HTTP3Context *c, int64_t range_start);
++
 +static int h3_dial(URLContext *h, H3Conn *hc, const char *portstr, int64_t timeout_us)
 +{
 +    int ret;
 +    if ((ret = h3_connect_udp(h, hc, hc->host, portstr)) < 0) return ret;
 +    if ((ret = h3_init_tls(h, hc, hc->host)) < 0)             return ret;
 +    if ((ret = h3_init_quic(h, hc)) < 0)                      return ret;
++#if CONFIG_GNUTLS
++    if (hc->zrtt) {
++        /* 0-RTT: bring up the h3 layer + submit the request as early data
++           BEFORE the handshake completes, then drive the handshake. */
++        if ((ret = h3_setup_http3(h, hc)) < 0)                return ret;
++        if (hc->cur && (ret = h3_start_request(h, hc->cur, 0)) < 0) return ret;
++        if ((ret = h3_handshake(h, hc, timeout_us)) < 0)      return ret;
++        if (!(gnutls_session_get_flags(hc->session) & GNUTLS_SFLAGS_EARLY_DATA)) {
++            /* server refused early data: reset the 0-RTT streams, rebuild the
++               h3 layer, and resubmit the request over the 1-RTT connection. */
++            av_log(h, AV_LOG_VERBOSE, "http3: 0-RTT rejected by %s, retrying 1-RTT\n", hc->host);
++            ngtcp2_conn_tls_early_data_rejected(hc->conn);
++            if (hc->h3conn) { nghttp3_conn_del(hc->h3conn); hc->h3conn = NULL; }
++            if ((ret = h3_setup_http3(h, hc)) < 0)            return ret;
++            if (hc->cur) {
++                hc->cur->stream_id = -1;
++                if ((ret = h3_start_request(h, hc->cur, 0)) < 0) return ret;
++            }
++        } else {
++            av_log(h, AV_LOG_VERBOSE, "http3: 0-RTT accepted by %s\n", hc->host);
++        }
++        return 0;
++    }
++#endif
 +    if ((ret = h3_handshake(h, hc, timeout_us)) < 0)          return ret;
 +    if ((ret = h3_setup_http3(h, hc)) < 0)                    return ret;
 +    return 0;
@@ -1316,6 +1477,7 @@ index 0000000..2805342
 +    for (;;) {
 +        port = -1;
 +        c->filesize = -1;
++        c->stream_id = -1;   /* fresh per iteration; the 0-RTT dial may set it */
 +        av_url_split(NULL, 0, NULL, 0, host, sizeof(host), &port,
 +                     c->path, sizeof(c->path), nexturi);
 +        if (port < 0)
@@ -1356,11 +1518,20 @@ index 0000000..2805342
 +            c->hc->cur = c;
 +            av_strlcpy(c->hc->host, host, sizeof(c->hc->host));
 +            c->hc->port = port;
++#if CONFIG_GNUTLS
++            /* 0-RTT: if a ticket+tp is cached for this host, dial with early
++               data (h3_dial then submits the request before handshake). */
++            if (h3_zrtt_get(host, port,
++                            &c->hc->zrtt_session, &c->hc->zrtt_session_len,
++                            &c->hc->zrtt_tp, &c->hc->zrtt_tp_len))
++                c->hc->zrtt = 1;
++#endif
 +            if ((ret = h3_dial(h, c->hc, portstr, c->open_timeout_us)) < 0)
 +                goto fail;
 +        }
 +
-+        if ((ret = h3_start_request(h, c, 0)) < 0) goto fail;
++        /* 1-RTT + pooled paths submit here; the 0-RTT dial already did. */
++        if (c->stream_id < 0 && (ret = h3_start_request(h, c, 0)) < 0) goto fail;
 +        if ((ret = h3_await_headers(h, c)) < 0)    goto fail;
 +
 +        if (c->status >= 300 && c->status < 400 && c->location[0]) {
