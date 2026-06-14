@@ -276,8 +276,11 @@ let package = Package(
         .binaryTarget(
             name: "Libavformat",
             // renderpl.42 base + HTTP/3 (ff_http3_protocol). Other libav* stay on their pins (same 625ab01 ffmpeg).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.42-h3.3/Libavformat.xcframework.zip",
-            checksum: "bc53e8c903a37f2e56dca34c361cca236736d6f63779377c9bf390f1ee7502c5"
+            // h3.4: QUIC flow-control fix (4bb49ba) — recv_data extends max_stream/conn offset
+            // so DATA-frame payload is credited; without it multi-segment HLS (recordings) stalled
+            // after segment 1 (window never reopened past 1MB/8MB).
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.42-h3.4/Libavformat.xcframework.zip",
+            checksum: "94df45c523c04c9215e46230d0f74052c51b121ced074ed976656d0892513e29"
         ),
         .binaryTarget(
             name: "Libngtcp2",
