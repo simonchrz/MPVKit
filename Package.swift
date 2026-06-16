@@ -395,7 +395,7 @@ let package = Package(
             // (Default 1000). SDR-Pfad unverändert. Device-slice-swap auf .51; Sim unverändert.
             // ABI identisch (.39) — Signatur unverändert. Für den AV1-HDR-Hybrid-Pfad.
             url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.52/Libmpv.xcframework.zip",
-            checksum: "4d820b5f42d3c415be91cc7a6d9e74540c8dde1a40c313d3e0cdd73bf1bf2f41"
+            checksum: "3a79c8bbe1bf0a14c3f22f6a56e26cf0d54f364b832d41383554a4fbd4df649b"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
