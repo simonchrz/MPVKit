@@ -282,8 +282,11 @@ let package = Package(
             // h3.5: ca_file via env KUCKUCK_H3_CA_FILE — lavf-o-Plumbing erreichte die private
             // AVOption nicht on-device → SecTrust fiel auf System-Store → Gateway-Playback
             // scheiterte auf Geräten ohne Caddy-Profil (alle iPads). Patch-Commit 157f738.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.53/Libavformat.xcframework.zip",
-            checksum: "00f7978ea40c99507e6ae94ed970850aaec803608775389686ae634f76fec290"
+            // renderpl.54: libcurl-Pivot — hls.c open_url()-Gate lässt jetzt das `libcurl`-
+            // Segment-Protokoll durch (sonst AVERROR_INVALIDDATA vor url_open → Scrub/Seek
+            // kaputt, sequenziell lief nur über den Playlist-Connection-Reuse). pi-infra-Patch.
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.54/Libavformat.xcframework.zip",
+            checksum: "3518440e896ea9d73243113d384246b66f394bbd6f547babd0ca17e545ed69a2"
         ),
         .binaryTarget(
             name: "Libngtcp2",
