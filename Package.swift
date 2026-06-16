@@ -265,13 +265,13 @@ let package = Package(
             // renderpl.43: identisch .42 (FFmpeg 625ab01) MINUS dem FFmpeg-Patch
             // 0001-vt-inline-retry — die VT-Session-Recovery wandert von hier in
             // libmpv (vd_lavc-Patch 0017, s. Libmpv unten). Sonst kein Source-Δ.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.53/Libavcodec.xcframework.zip",
-            checksum: "da74d8697e6a30997b36636065985a3dd25f3ba776e7dd7120634a1121907cc8"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.55/Libavcodec.xcframework.zip",
+            checksum: "dd41128b6311834f15830e226e7ec82bfb4844472f9423a2f7053deee2582e2c"
         ),
         .binaryTarget(
             name: "Libavdevice",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.53/Libavdevice.xcframework.zip",
-            checksum: "55082c1b822557d163df80a05ed3edd5b78a4aca4f2e7297c27029c222fcfe68"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.55/Libavdevice.xcframework.zip",
+            checksum: "290c48b537920083e60192fc1ee59c34b4f7823b5ed7a421c0c720556715e063"
         ),
         .binaryTarget(
             name: "Libavformat",
@@ -285,8 +285,8 @@ let package = Package(
             // renderpl.54: libcurl-Pivot — hls.c open_url()-Gate lässt jetzt das `libcurl`-
             // Segment-Protokoll durch (sonst AVERROR_INVALIDDATA vor url_open → Scrub/Seek
             // kaputt, sequenziell lief nur über den Playlist-Connection-Reuse). pi-infra-Patch.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.54/Libavformat.xcframework.zip",
-            checksum: "3518440e896ea9d73243113d384246b66f394bbd6f547babd0ca17e545ed69a2"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.55/Libavformat.xcframework.zip",
+            checksum: "487d4fea7b9f7836124c4f9c3b4eafdbb0ed33a271ad78b1918c3a57982595ea"
         ),
         .binaryTarget(
             name: "Libngtcp2",
@@ -321,23 +321,23 @@ let package = Package(
             // Whitelist).
             // renderpl.42: FFmpeg-Rebase d1faab7 → master 625ab01 (2026-06-11);
             // dynaudnorm/speechnorm/bwdif in der Whitelist bestätigt (Build-Log).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.53/Libavfilter.xcframework.zip",
-            checksum: "a45b7cc1cf1d4d6ca9451690ed208920e7dab31d297798f353edcdcb3aeb4202"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.55/Libavfilter.xcframework.zip",
+            checksum: "3ab4eadaa9cdaee49c5bf0bd5147bcf794853acfae2a2ed3a1c640c1d6f59b52"
         ),
         .binaryTarget(
             name: "Libavutil",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.53/Libavutil.xcframework.zip",
-            checksum: "241ee10f2f08b28ed6e0c7c7e3b0dd82794f524128e1d2552fdefaf7d5231150"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.55/Libavutil.xcframework.zip",
+            checksum: "229c9b0010d36abf4d4fc979d7f10a273f20544c71c988c85b1448f041bdbcce"
         ),
         .binaryTarget(
             name: "Libswresample",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.53/Libswresample.xcframework.zip",
-            checksum: "1718ff7388298eb5d50aaf41d94dce0c9db463569d0816e2826bfd752ce2b0ae"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.55/Libswresample.xcframework.zip",
+            checksum: "9c97776a54194c8d7ecac15a76692569b2c5c9295b09e0926511354abaf8b826"
         ),
         .binaryTarget(
             name: "Libswscale",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.53/Libswscale.xcframework.zip",
-            checksum: "f51f6201baf599b2068815fcaeb0511a09c006cbf124f64bf53003317a5d266f"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.55/Libswscale.xcframework.zip",
+            checksum: "6cdbb3e74319a192778551ff3326157de59e3f589d4c4e90eb61c1f69928341c"
         ),
 
         .binaryTarget(
