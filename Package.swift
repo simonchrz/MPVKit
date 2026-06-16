@@ -390,8 +390,12 @@ let package = Package(
             // den AVPlayer-Hybrid Mediathek-Live; render_pl.c + render_mtl.h). Device-
             // slice-swap auf .50; Libav* unverändert auf .50. App-Calls #if-guarded gegen
             // Simulator (Sim-Slice ohne die Symbole; App eh device-only via QUIC-Libs).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.51/Libmpv.xcframework.zip",
-            checksum: "10b7aabe70109071db7195093378f8e3be3ff01f69c7518c86d39d90a41a73f3"
+            // renderpl.52: kuckuck_hybrid_render erkennt HDR-Drawable (PL_FMT_FLOAT-Target)
+            // → PQ/BT.2020-HDR10-Output mit HQ-Peak-Detect, gedeckelt via KUCKUCK_HDR_TARGET_NITS
+            // (Default 1000). SDR-Pfad unverändert. Device-slice-swap auf .51; Sim unverändert.
+            // ABI identisch (.39) — Signatur unverändert. Für den AV1-HDR-Hybrid-Pfad.
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.52/Libmpv.xcframework.zip",
+            checksum: "4d820b5f42d3c415be91cc7a6d9e74540c8dde1a40c313d3e0cdd73bf1bf2f41"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
