@@ -54,6 +54,11 @@ enum Library: String, CaseIterable {
     /// staged into dist/<lib>/ios/thin/arm64. Like libspirv_cross: enum-only for
     /// pkgConfigPath + cFlags/ldFlags wiring; NOT built by the main sequence.
     case libngtcp2, libnghttp3, libngtcp2_crypto_gnutls
+    /// curl-with-HTTP/3 (ngtcp2+nghttp3, GnuTLS backend), cross-compiled for
+    /// arm64-iphoneos by tv-h3-ios/build-curl-ios.sh and staged into
+    /// dist/libcurl/ios/thin/arm64. Drives FFmpeg's libcurl:// protocol
+    /// (replaces the hand-rolled http3.c). Enum-only, like the QUIC libs.
+    case libcurl
     var version: String {
         switch self {
         case .libmpv:
@@ -129,6 +134,8 @@ enum Library: String, CaseIterable {
             return "main"  // built from source via build_spirv_cross.sh
         case .libngtcp2, .libnghttp3, .libngtcp2_crypto_gnutls:
             return "1.24.0-DEV"  // prebuilt (tv-h3-ios), no download
+        case .libcurl:
+            return "8.11.1-DEV"  // prebuilt (tv-h3-ios build-curl-ios.sh), no download
         }
     }
 
@@ -183,7 +190,7 @@ enum Library: String, CaseIterable {
             return "https://github.com/mpvkit/libuavs3d-build/releases/download/\(self.version)/libuavs3d-all.zip"
         case .libspirv_cross:
             return ""  // built from source, no download URL
-        case .libngtcp2, .libnghttp3, .libngtcp2_crypto_gnutls:
+        case .libngtcp2, .libnghttp3, .libngtcp2_crypto_gnutls, .libcurl:
             return ""  // prebuilt static .a (tv-h3-ios), no download URL
         }
     }
@@ -409,7 +416,7 @@ enum Library: String, CaseIterable {
             ]
         case .libspirv_cross:
             return []  // built from source, not surfaced as a SwiftPM target
-        case .libngtcp2, .libnghttp3, .libngtcp2_crypto_gnutls:
+        case .libngtcp2, .libnghttp3, .libngtcp2_crypto_gnutls, .libcurl:
             return []  // linked into FFmpeg; final-link xcframeworks added separately
         }
     }
@@ -602,7 +609,9 @@ private class BuildFFMPEG: BaseBuild {
         // crypto_gnutls is NOT in dependencyLibrary (no --enable-* flag exists for
         // it); it only needs to be on the link path — configure's gnutls branch
         // appends -lngtcp2_crypto_gnutls itself.
-        let h3 = [Library.libngtcp2, .libnghttp3, .libngtcp2_crypto_gnutls]
+        // libcurl first (it references the QUIC/crypto symbols); the QUIC libs
+        // + crypto helper follow so static link order resolves.
+        let h3 = [Library.libcurl, .libngtcp2, .libnghttp3, .libngtcp2_crypto_gnutls]
         if BaseBuild.options.enableGPL {
             return [.gmp, .nettle, .gnutls, .libsmbclient] + h3
         } else {
@@ -741,7 +750,11 @@ private class BuildFFMPEG: BaseBuild {
         //        if platform == .isimulator || platform == .tvsimulator {
         //            arguments.append("--assert-level=1")
         //        }
-        var dependencyLibrary = [Library.gmp, .gnutls, .libfreetype, .libharfbuzz, .libfribidi, .libass, .vulkan, .libshaderc, .lcms2, .libplacebo, .libdav1d, .libuavs3d, .libngtcp2, .libnghttp3]
+        // libcurl-Pivot: FFmpeg kennt jetzt `--enable-libcurl` (pi-infra-Patch),
+        // NICHT mehr `--enable-libngtcp2/-libnghttp3` (die gab's nur im alten
+        // http3.c-Patch). Die QUIC-Libs bleiben rein auf dem Link-Pfad
+        // (flagsDependencelibrarys), curl zieht sie transitiv.
+        var dependencyLibrary = [Library.gmp, .gnutls, .libfreetype, .libharfbuzz, .libfribidi, .libass, .vulkan, .libshaderc, .lcms2, .libplacebo, .libdav1d, .libuavs3d, .libcurl]
         if BaseBuild.options.enableGPL {
             dependencyLibrary += [.libsmbclient]
         }
@@ -794,7 +807,7 @@ private class BuildFFMPEG: BaseBuild {
         "--disable-bzlib", "--disable-gray", "--disable-iconv", "--disable-linux-perf",
         "--disable-shared", "--disable-small", "--disable-symver", "--disable-xlib",
         "--enable-cross-compile", "--enable-libxml2", "--enable-nonfree",
-        "--enable-protocol=http3",   // QUIC/HTTP3 (deps libngtcp2+libnghttp3, gnutls crypto)
+        "--enable-protocol=libcurl",   // HTTP/3 via libcurl (ngtcp2+nghttp3, gnutls); ersetzt http3.c
         "--enable-optimizations", "--enable-pic", "--enable-runtime-cpudetect", "--enable-static", "--enable-thumb", "--enable-version3",
         "--pkg-config-flags=--static",
         // Documentation options:

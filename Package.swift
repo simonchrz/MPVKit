@@ -35,7 +35,7 @@ let package = Package(
                 "Libssl", "Libcrypto", "Libass", "Libfreetype", "Libfribidi", "Libharfbuzz",
                 "MoltenVK", "Libshaderc_combined", "lcms2", "Libplacebo", "Libdovi", "Libunibreak",
                 "gmp", "nettle", "hogweed", "gnutls", "Libdav1d", "Libuavs3d",
-                "Libngtcp2", "Libnghttp3", "Libngtcp2_crypto_gnutls"   // HTTP/3 (http3://)
+                "Libngtcp2", "Libnghttp3", "Libngtcp2_crypto_gnutls", "Libcurl"   // HTTP/3 via libcurl (libcurl://)
             ],
             path: "Sources/_FFmpeg",
             linkerSettings: [
@@ -73,7 +73,7 @@ let package = Package(
                 "Libssl", "Libcrypto", "Libass", "Libfreetype", "Libfribidi", "Libharfbuzz",
                 "MoltenVK", "Libshaderc_combined", "lcms2", "Libplacebo", "Libdovi", "Libunibreak",
                 "Libsmbclient", "gmp", "nettle", "hogweed", "gnutls", "Libdav1d", "Libuavs3d",
-                "Libngtcp2", "Libnghttp3", "Libngtcp2_crypto_gnutls"   // HTTP/3 (http3://)
+                "Libngtcp2", "Libnghttp3", "Libngtcp2_crypto_gnutls", "Libcurl"   // HTTP/3 via libcurl (libcurl://)
             ],
             path: "Sources/_FFmpeg-GPL",
             linkerSettings: [
@@ -265,13 +265,13 @@ let package = Package(
             // renderpl.43: identisch .42 (FFmpeg 625ab01) MINUS dem FFmpeg-Patch
             // 0001-vt-inline-retry — die VT-Session-Recovery wandert von hier in
             // libmpv (vd_lavc-Patch 0017, s. Libmpv unten). Sonst kein Source-Δ.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.50/Libavcodec.xcframework.zip",
-            checksum: "751e937e1dd0fbc073e59e22ffe2c21839187e73aadb65fc63217ff21267c968"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.53/Libavcodec.xcframework.zip",
+            checksum: "da74d8697e6a30997b36636065985a3dd25f3ba776e7dd7120634a1121907cc8"
         ),
         .binaryTarget(
             name: "Libavdevice",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.50/Libavdevice.xcframework.zip",
-            checksum: "efa0d2f580d4cf9e844fd52422b461fe9c5f95c98882d96e5a6af8394dcb9c70"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.53/Libavdevice.xcframework.zip",
+            checksum: "55082c1b822557d163df80a05ed3edd5b78a4aca4f2e7297c27029c222fcfe68"
         ),
         .binaryTarget(
             name: "Libavformat",
@@ -282,8 +282,8 @@ let package = Package(
             // h3.5: ca_file via env KUCKUCK_H3_CA_FILE — lavf-o-Plumbing erreichte die private
             // AVOption nicht on-device → SecTrust fiel auf System-Store → Gateway-Playback
             // scheiterte auf Geräten ohne Caddy-Profil (alle iPads). Patch-Commit 157f738.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.50/Libavformat.xcframework.zip",
-            checksum: "6492e364fdc6268a87e20456db1ef71b037e829a85a113234b25b5ec7093e028"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.53/Libavformat.xcframework.zip",
+            checksum: "00f7978ea40c99507e6ae94ed970850aaec803608775389686ae634f76fec290"
         ),
         .binaryTarget(
             name: "Libngtcp2",
@@ -301,6 +301,15 @@ let package = Package(
             checksum: "01cedde8e4e50c718565cd751da1fd9dae4edd47c3038b8238a217024fbf27e9"
         ),
         .binaryTarget(
+            name: "Libcurl",
+            // curl-with-HTTP/3 (ngtcp2+nghttp3, GnuTLS), device-only, gebaut von
+            // tv-h3-ios/build-curl-ios.sh. Trägt das FFmpeg `libcurl://`-Protokoll
+            // (ff_libcurl_protocol, ersetzt das alte http3.c). curl_* sind in
+            // Libavformat undefined → hier aufgelöst. CA via CURL_CA_BUNDLE-Env.
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.53/Libcurl.xcframework.zip",
+            checksum: "eb3aade155b2ce8fde8b0770759dfbea834b23ec2084fae78391011339af6e3b"
+        ),
+        .binaryTarget(
             name: "Libavfilter",
             // prod-3-consistent rebuild (renderpl.17): vf_libplacebo against
             // libplacebo apiver 365, matching the Libplacebo target above.
@@ -309,23 +318,23 @@ let package = Package(
             // Whitelist).
             // renderpl.42: FFmpeg-Rebase d1faab7 → master 625ab01 (2026-06-11);
             // dynaudnorm/speechnorm/bwdif in der Whitelist bestätigt (Build-Log).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.50/Libavfilter.xcframework.zip",
-            checksum: "f7b847e214b2546cea7195bdac6b26a124893878530097c82cfca23a7b3f1644"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.53/Libavfilter.xcframework.zip",
+            checksum: "a45b7cc1cf1d4d6ca9451690ed208920e7dab31d297798f353edcdcb3aeb4202"
         ),
         .binaryTarget(
             name: "Libavutil",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.50/Libavutil.xcframework.zip",
-            checksum: "005524d72de2dad1b7e5c9574de283faf83aa3bfde54b6f03a057f71dc7f283b"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.53/Libavutil.xcframework.zip",
+            checksum: "241ee10f2f08b28ed6e0c7c7e3b0dd82794f524128e1d2552fdefaf7d5231150"
         ),
         .binaryTarget(
             name: "Libswresample",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.50/Libswresample.xcframework.zip",
-            checksum: "910a0a1cb15f7cb6bd3c100d122f85fa572f64a24f8aba24177db10f521e91a9"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.53/Libswresample.xcframework.zip",
+            checksum: "1718ff7388298eb5d50aaf41d94dce0c9db463569d0816e2826bfd752ce2b0ae"
         ),
         .binaryTarget(
             name: "Libswscale",
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.50/Libswscale.xcframework.zip",
-            checksum: "b95a340a6a8bb6ff93da9bc264115d3103eb1bd2ecfedb63807bed769c69c345"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.53/Libswscale.xcframework.zip",
+            checksum: "f51f6201baf599b2068815fcaeb0511a09c006cbf124f64bf53003317a5d266f"
         ),
 
         .binaryTarget(
