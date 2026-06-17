@@ -19,13 +19,23 @@ let package = Package(
         .target(
             name: "_MPVKit",
             dependencies: [
-                "Libmpv", "_FFmpeg", "Libuchardet", "Libbluray",
-                .target(name: "Libluajit", condition: .when(platforms: [.macOS])),
+                // libmpv/FFmpeg/libcurl/QUIC + Subtitle-/Decoder-/TLS-Libs ENTFERNT:
+                // Video läuft komplett über den AVPlayer-Hybrid (Decode = AVPlayer,
+                // Render = kuckuck_hybrid_render aus Libkkrender → libplacebo). Nur
+                // der GPU-Render-Stack bleibt.
+                "Libkkrender", "Libplacebo", "Libshaderc_combined", "lcms2", "Libdovi", "MoltenVK",
             ],
             path: "Sources/_MPVKit",
             linkerSettings: [
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("CoreAudio"),
+                .linkedFramework("CoreVideo"),
+                .linkedFramework("CoreMedia"),
+                .linkedFramework("Metal"),
+                .linkedFramework("IOSurface"),
+                .linkedFramework("QuartzCore"),
+                .linkedLibrary("c++"),
+                .linkedLibrary("z"),
             ]
         ),
         .target(
@@ -252,6 +262,15 @@ let package = Package(
             // + !859-Re-Pick wiederhergestellt. apiver 365 unverändert.
             url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.40/Libplacebo.xcframework.zip",
             checksum: "91a5c712ffddedb124a63bc720dbabf3bcfd7907ea8bac4a54ebd76b38b9850f"
+        ),
+        .binaryTarget(
+            name: "Libkkrender",
+            // Standalone Hybrid-Render-Entry (kuckuck_hybrid_create/render/destroy),
+            // extrahiert aus libmpvs render_pl.c + spirv-cross reingemergt (libplacebo-
+            // Metal braucht spvc_* zur Laufzeit). Ersetzt Libmpv für den App-Render →
+            // libmpv/FFmpeg/libcurl fallen weg. Gebaut von kkrender/build-kkrender.sh.
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.56/Libkkrender.xcframework.zip",
+            checksum: "098dfea8283533998586285b49f1117ef7643959ad061dbea0ce60b509247f5b"
         ),
 
         .binaryTarget(
