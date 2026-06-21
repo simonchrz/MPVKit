@@ -269,8 +269,8 @@ let package = Package(
             // extrahiert aus libmpvs render_pl.c + spirv-cross reingemergt (libplacebo-
             // Metal braucht spvc_* zur Laufzeit). Ersetzt Libmpv für den App-Render →
             // libmpv/FFmpeg/libcurl fallen weg. Gebaut von kkrender/build-kkrender.sh.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.56/Libkkrender.xcframework.zip",
-            checksum: "098dfea8283533998586285b49f1117ef7643959ad061dbea0ce60b509247f5b"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.57/Libkkrender.xcframework.zip",
+            checksum: "40e7a1040d6a88b70c4b3b1aa5adcdede49dcf795a6e7fa24d3e88fdcf6a7171"
         ),
 
         .binaryTarget(
