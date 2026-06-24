@@ -244,90 +244,63 @@ static bool hybrid_wrap_pixbuf(struct hybrid_priv *p, CVPixelBufferRef pb,
     return true;
 }
 
-// TEMP (AOT-Schritt 4): füllt den MSL-Cache device-nativ über das volle kk-Combo-
-// Kreuzprodukt (prozeduraler Frame; Pixelinhalt egal — nur die Param-Combos
-// bestimmen die GLSL). Speichert danach den Cache. Logt die Shader-Zahl.
-static void kk_cap_planes(pl_gpu gpu, int w, int h, int hdr, struct pl_frame *out, pl_tex tx[2])
+// Render-Kern (aus kuckuck_hybrid_render extrahiert): Swapchain-Target, Aspect-Crop,
+// HDR-Erkennung, HD-Light, kk/Stock-Render. p->rparams (inkl. Hook/Deband aus
+// kk_apply_user_shader/kk_apply_deband) muss vom Aufrufer bereits gesetzt sein.
+static void hybrid_render_core(struct hybrid_priv *p, struct pl_frame *img, pl_tex target_tex)
 {
-    int cw=w/2, ch=h/2;
-    if (hdr) {
-        uint16_t *yp=malloc((size_t)w*h*2), *cp=malloc((size_t)cw*ch*2*2);
-        for (int i=0;i<w*h;i++) yp[i]=(uint16_t)(((i*977)&1023)<<6);
-        for (int i=0;i<cw*ch;i++){ cp[i*2]=(uint16_t)(((i*131)&1023)<<6); cp[i*2+1]=(uint16_t)(((i*419)&1023)<<6); }
-        pl_tex ty=pl_tex_create(gpu,pl_tex_params(.w=w,.h=h,.format=pl_find_named_fmt(gpu,"r16"),.sampleable=true,.initial_data=yp));
-        pl_tex tc=pl_tex_create(gpu,pl_tex_params(.w=cw,.h=ch,.format=pl_find_named_fmt(gpu,"rg16"),.sampleable=true,.initial_data=cp));
-        free(yp);free(cp);
-        *out=(struct pl_frame){.num_planes=2,
-            .planes[0]={.texture=ty,.components=1,.component_mapping={PL_CHANNEL_Y}},
-            .planes[1]={.texture=tc,.components=2,.component_mapping={PL_CHANNEL_CB,PL_CHANNEL_CR}},
-            .repr={.sys=PL_COLOR_SYSTEM_BT_2020_NC,.levels=PL_COLOR_LEVELS_LIMITED,.bits={16,10,6}},
-            .color={.primaries=PL_COLOR_PRIM_BT_2020,.transfer=PL_COLOR_TRC_PQ},.crop={0,0,w,h}};
-        tx[0]=ty;tx[1]=tc;
-    } else {
-        unsigned char *yp=malloc((size_t)w*h), *cp=malloc((size_t)cw*ch*2);
-        for (int i=0;i<w*h;i++) yp[i]=(unsigned char)(i*7);
-        for (int i=0;i<cw*ch;i++){ cp[i*2]=(unsigned char)(i*3); cp[i*2+1]=(unsigned char)(i*5); }
-        pl_tex ty=pl_tex_create(gpu,pl_tex_params(.w=w,.h=h,.format=pl_find_named_fmt(gpu,"r8"),.sampleable=true,.initial_data=yp));
-        pl_tex tc=pl_tex_create(gpu,pl_tex_params(.w=cw,.h=ch,.format=pl_find_named_fmt(gpu,"rg8"),.sampleable=true,.initial_data=cp));
-        free(yp);free(cp);
-        *out=(struct pl_frame){.num_planes=2,
-            .planes[0]={.texture=ty,.components=1,.component_mapping={PL_CHANNEL_Y}},
-            .planes[1]={.texture=tc,.components=2,.component_mapping={PL_CHANNEL_CB,PL_CHANNEL_CR}},
-            .repr={.sys=PL_COLOR_SYSTEM_BT_709,.levels=PL_COLOR_LEVELS_LIMITED},
-            .color={.primaries=PL_COLOR_PRIM_BT_709,.transfer=PL_COLOR_TRC_BT_1886},.crop={0,0,w,h}};
-        tx[0]=ty;tx[1]=tc;
+    const char *flipenv = getenv("KUCKUCK_HYBRID_FLIP");
+    bool flip = flipenv && flipenv[0] == '1';
+    bool hdr_target = target_tex->params.format &&
+                      target_tex->params.format->type == PL_FMT_FLOAT;
+    p->rparams.peak_detect_params = hdr_target ? &pl_peak_detect_high_quality_params : NULL;
+    struct pl_color_space hdr_csp = pl_color_space_hdr10;
+    {
+        const char *hmode = getenv("KUCKUCK_HDR_TARGET");
+        const char *hnits = getenv("KUCKUCK_HDR_TARGET_NITS");
+        if (!(hmode && strcmp(hmode, "hdr10") == 0))
+            hdr_csp.hdr.max_luma = hnits ? (float) atof(hnits) : 1000.0f;
     }
-    pl_frame_set_chroma_location(out, PL_CHROMA_LEFT);
+    struct pl_swapchain_frame sw_frame = {
+        .fbo         = target_tex,
+        .flipped     = flip,
+        .color_repr  = pl_color_repr_rgb,
+        .color_space = hdr_target ? hdr_csp : pl_color_space_srgb,
+    };
+    struct pl_frame target;
+    pl_frame_from_swapchain(&target, &sw_frame);
+
+    float tw = target_tex->params.w, th = target_tex->params.h;
+    float sw = img->crop.x1 - img->crop.x0, sh = img->crop.y1 - img->crop.y0;
+    if (sw > 0 && sh > 0 && tw > 0 && th > 0) {
+        float src_ar = sw / sh, dst_ar = tw / th;
+        if (src_ar > dst_ar) {
+            float fh = tw / src_ar, y0 = (th - fh) / 2.0f;
+            target.crop = (struct pl_rect2df) { .x0 = 0, .y0 = y0, .x1 = tw, .y1 = y0 + fh };
+        } else {
+            float fw = th * src_ar, x0 = (tw - fw) / 2.0f;
+            target.crop = (struct pl_rect2df) { .x0 = x0, .y0 = 0, .x1 = x0 + fw, .y1 = th };
+        }
+    }
+
+    struct pl_render_params rp = p->rparams;
+    {
+        const char *hl = getenv("KUCKUCK_HD_LIGHT");
+        bool light = hl ? (hl[0] == '1') : (sh >= 1080.0f);
+        if (light) {
+            rp.upscaler        = &pl_filter_lanczos;
+            rp.downscaler      = &pl_filter_lanczos;
+            rp.error_diffusion = NULL;
+            rp.dither_params   = NULL;
+            rp.deband_params   = NULL;
+        }
+    }
+    // kk-Pfad (Strangler); bei Nicht-Handhabbarkeit Fallback auf Stock pl_render_image.
+    if (!(p->kk && kk_render_image(p->kk, img, &target, &rp)))
+        pl_render_image(p->rr, img, &target, &rp);
+    pl_gpu_finish(p->gpu);
 }
 
-static void kk_capture_all(struct hybrid_priv *p)
-{
-    const char *shdir = getenv("KUCKUCK_KK_CAPTURE_SHADERS");
-    if (!shdir) { fprintf(stderr, "[kk-capture] KUCKUCK_KK_CAPTURE_SHADERS fehlt\n"); return; }
-    const char *shaders[]={ NULL,"cas.glsl","anime4k_mode_a_mobile.glsl","anime4k_mode_a_m.glsl",
-                            "ArtCNN_C4F16.glsl","artcnn_ds_cas.glsl","fsrcnnx_x2_8.glsl" };
-    // DICHTER Downscale-Sweep (0.30..1.0 in 0.02-Schritten): der Polar-/Ortho-
-    // Downscaler unrollt die Tap-Schleife je Ratio (ceil(radius/scale)) -> jeder
-    // Tap-Bound = eigener Shader; grobe Sweeps lassen Lücken (-> KK_AOT-Schwarz).
-    // + Upscale-Punkte >1.3 aktivieren die WHEN-geguardeten LUMA-Hook-CNNs.
-    double scales[64]; int ns=0;
-    for (double s=0.30; s<=1.001; s+=0.02) scales[ns++]=s;
-    double up[]={1.1,1.2,1.3,1.5,1.8,2.0,2.3,2.6,3.0,3.5,4.0};
-    for (int i=0;i<(int)(sizeof(up)/sizeof(*up));i++) scales[ns++]=up[i];
-    static const struct pl_deband_params dbp={.iterations=2,.threshold=4,.radius=16,.grain=0};
-    int W=640,H=360, renders=0;
-    pl_fmt rgba8=pl_find_named_fmt(p->gpu,"rgba8"), rgba16f=pl_find_named_fmt(p->gpu,"rgba16f");
-    for (int hdr=0;hdr<2;hdr++)
-    for (int si=0; si<(int)(sizeof(shaders)/sizeof(*shaders)); si++)
-    for (int oi=0; oi<2; oi++)
-    for (int di=0; di<2; di++)
-    for (int sc=0; sc<ns; sc++) {
-        struct pl_frame img; pl_tex tx[2]; kk_cap_planes(p->gpu, W, H, hdr, &img, tx);
-        int ow=(int)(W*scales[sc]), oh=(int)(H*scales[sc]);
-        pl_tex out=pl_tex_create(p->gpu,pl_tex_params(.w=ow,.h=oh,.format=hdr?rgba16f:rgba8,.renderable=true,.storable=true));
-        struct pl_frame target={.num_planes=1,.planes[0]={.texture=out,.components=4,.component_mapping={0,1,2,3}},
-            .repr=pl_color_repr_rgb,.color=hdr?pl_color_space_hdr10:pl_color_space_srgb,.crop={0,0,ow,oh}};
-        struct pl_render_params rp=pl_render_high_quality_params;
-        rp.error_diffusion=&pl_error_diffusion_sierra_lite;
-        rp.deband_params = di ? &dbp : NULL;
-        rp.peak_detect_params = hdr ? &pl_peak_detect_high_quality_params : NULL;
-        if (oi) rp.upscaler=&pl_filter_lanczos;
-        const struct pl_hook *hook=NULL;
-        if (shaders[si]) { char path[1024]; snprintf(path,sizeof path,"%s/%s",shdir,shaders[si]);
-            FILE *f=fopen(path,"rb"); if(f){fseek(f,0,SEEK_END);long n=ftell(f);fseek(f,0,SEEK_SET);
-                char *b=malloc(n+1);size_t r=fread(b,1,n,f);b[r]=0;fclose(f);
-                hook=pl_mpv_user_shader_parse(p->gpu,b,r);free(b); if(hook){rp.hooks=&hook;rp.num_hooks=1;}}}
-        if (!(p->kk && kk_render_image(p->kk,&img,&target,&rp)))
-            pl_render_image(p->rr,&img,&target,&rp);
-        pl_gpu_finish(p->gpu);
-        renders++;
-        if (hook) pl_mpv_user_shader_destroy(&hook);
-        pl_tex_destroy(p->gpu,&out); pl_tex_destroy(p->gpu,&tx[0]); pl_tex_destroy(p->gpu,&tx[1]);
-    }
-    if (p->cache) { char path[PATH_MAX]; if (kk_cache_file_path(path,sizeof path)) {
-        FILE *f=fopen(path,"wb"); if(f){pl_cache_save_file(p->cache,f);fclose(f);} } }
-    fprintf(stderr, "[kk-capture] %d renders fertig, Cache gespeichert\n", renders);
-}
 
 void *kuckuck_hybrid_create(void *mtl_device)
 {
@@ -394,12 +367,6 @@ void *kuckuck_hybrid_create(void *mtl_device)
             p->kk = kk_renderer_create(p->pllog, p->gpu);
     }
 
-    // TEMP (AOT-Schritt 4): On-Device-Shader-Capture. KUCKUCK_KK_CAPTURE=1 +
-    // KUCKUCK_KK_CAPTURE_SHADERS=<Resources-Dir> -> rendert das volle Combo-
-    // Kreuzprodukt durch kk, füllt den (persistenten) MSL-Cache device-nativ.
-    if (p->kk && getenv("KUCKUCK_KK_CAPTURE"))
-        kk_capture_all(p);
-
     return p;
 
 fail:
@@ -429,63 +396,8 @@ int kuckuck_hybrid_render(void *ctx, void *cv_pixbuf, void *target_texture)
         return -3;
     }
 
-    const char *flipenv = getenv("KUCKUCK_HYBRID_FLIP");
-    bool flip = flipenv && flipenv[0] == '1';
-    bool hdr_target = target_tex->params.format &&
-                      target_tex->params.format->type == PL_FMT_FLOAT;
-    p->rparams.peak_detect_params = hdr_target ? &pl_peak_detect_high_quality_params : NULL;
-    struct pl_color_space hdr_csp = pl_color_space_hdr10;
-    {
-        const char *hmode = getenv("KUCKUCK_HDR_TARGET");
-        const char *hnits = getenv("KUCKUCK_HDR_TARGET_NITS");
-        if (!(hmode && strcmp(hmode, "hdr10") == 0))
-            hdr_csp.hdr.max_luma = hnits ? (float) atof(hnits) : 1000.0f;
-    }
-    struct pl_swapchain_frame sw_frame = {
-        .fbo         = target_tex,
-        .flipped     = flip,
-        .color_repr  = pl_color_repr_rgb,
-        .color_space = hdr_target ? hdr_csp : pl_color_space_srgb,
-    };
-    struct pl_frame target;
-    pl_frame_from_swapchain(&target, &sw_frame);
-
-    float tw = target_tex->params.w, th = target_tex->params.h;
-    float sw = img.crop.x1 - img.crop.x0, sh = img.crop.y1 - img.crop.y0;
-    if (sw > 0 && sh > 0 && tw > 0 && th > 0) {
-        float src_ar = sw / sh, dst_ar = tw / th;
-        if (src_ar > dst_ar) {
-            float fh = tw / src_ar, y0 = (th - fh) / 2.0f;
-            target.crop = (struct pl_rect2df) { .x0 = 0, .y0 = y0, .x1 = tw, .y1 = y0 + fh };
-        } else {
-            float fw = th * src_ar, x0 = (tw - fw) / 2.0f;
-            target.crop = (struct pl_rect2df) { .x0 = x0, .y0 = 0, .x1 = x0 + fw, .y1 = th };
-        }
-    }
-
-    // HD-Light-Render für ≥1080p: separabler Scaler (pl_filter_lanczos) statt des
-    // teuren 2D-ewa_lanczossharp + Dither/Deband aus → Render ~16ms statt ~22ms,
-    // bleibt unter dem 50fps-Budget (20ms) auch bei thermisch gedrosselter GPU
-    // (sonst Frame-Drops/maxGap-Spikes bei HD-50p-Broadcast, [[project_hd_pacing_render_bound]]).
-    // Der CAS-User-Shader bleibt (Schärfe). Bei ≤1080p (SD/720p) bleibt der volle
-    // HQ-Pfad. Env KUCKUCK_HD_LIGHT: "1"=force on, "0"=force off, unset=auto (src_h>=1080).
-    struct pl_render_params rp = p->rparams;
-    {
-        const char *hl = getenv("KUCKUCK_HD_LIGHT");
-        bool light = hl ? (hl[0] == '1') : (sh >= 1080.0f);
-        if (light) {
-            rp.upscaler        = &pl_filter_lanczos;
-            rp.downscaler      = &pl_filter_lanczos;
-            rp.error_diffusion = NULL;
-            rp.dither_params   = NULL;
-            rp.deband_params   = NULL;
-        }
-    }
-    // kk-Pfad übernimmt den Frame, wenn aktiv UND der Fall migriert ist;
-    // sonst Fallback auf den bewährten Stock-Renderer (kein Regressionsrisiko).
-    if (!(p->kk && kk_render_image(p->kk, &img, &target, &rp)))
-        pl_render_image(p->rr, &img, &target, &rp);
-    pl_gpu_finish(p->gpu);
+    // Render über den geteilten Kern (identisch zum AOT-Capture-Pfad).
+    hybrid_render_core(p, &img, target_tex);
 
     pl_tex_destroy(p->gpu, &target_tex);
     pl_tex_destroy(p->gpu, &src_tex[0]);

@@ -960,6 +960,12 @@ private class BuildPlacebo: BaseBuild {
             "-Dvulkan=disabled", "-Dopengl=disabled", "-Dd3d11=disabled",
             "-Dlcms=disabled", "-Ddovi=disabled", "-Dxxhash=disabled",
             "-Dunwind=disabled", "-Ddemos=false", "-Dtests=false",
+            // PRODUKTION: Asserts AUS. libplacebos pl_assert -> assert() würde sonst
+            // bei internen Invarianten-Checks (z.B. sh_subpass-NULL bei bestimmten
+            // Plane-/Merge-Kanten auf dem Metal-Backend) abort()en = App-Crash statt
+            // graceful Degradation. Standard-libplacebo-Releases shippen mit NDEBUG;
+            // unser Build hatte fälschlich b_ndebug=false (release-buildtype reicht NICHT).
+            "-Db_ndebug=true",
         ]
         // KK_AOT=1 (Kuckuck): drop the runtime GLSL->SPIR-V->MSL toolchain
         // (shaderc + SPIRV-Cross). Renders solely from the shipped MSL cache.

@@ -1,6 +1,15 @@
 // swift-tools-version:5.9
 
 import PackageDescription
+import Foundation
+
+// KK_AOT-Zwei-Config: der Capture-Build (KK_AOT_CAPTURE=1) braucht den Runtime-
+// Compiler (Libshaderc/shaderc) zum Erzeugen des MSL-Cache; der Ship-Build (AOT)
+// linkt ihn NICHT (= die ~8,6 MB Ersparnis). Eine Package.swift, env-getoggelt.
+var mpvkitDeps: [Target.Dependency] = ["Libkkrender", "Libplacebo", "lcms2", "Libdovi", "MoltenVK"]
+if ProcessInfo.processInfo.environment["KK_AOT_CAPTURE"] != nil {
+    mpvkitDeps.append("Libshaderc_combined")
+}
 
 let package = Package(
     name: "MPVKit",
@@ -23,12 +32,11 @@ let package = Package(
                 // Video läuft komplett über den AVPlayer-Hybrid (Decode = AVPlayer,
                 // Render = kuckuck_hybrid_render aus Libkkrender → libplacebo). Nur
                 // der GPU-Render-Stack bleibt.
-                // KK_AOT: Libshaderc_combined (shaderc+glslang) ENTFERNT — der AOT-
-                // Render-Pfad hat keinen Runtime-GLSL→SPIR-V→MSL-Compiler mehr
-                // (libplacebo -Dkk-aot=true + Libkkrender ohne spvc-Merge); gerendert
-                // wird nur aus dem gebündelten MSL-Cache. ~8,6 MB Code gespart.
-                "Libkkrender", "Libplacebo", "lcms2", "Libdovi", "MoltenVK",
-            ],
+                // KK_AOT: Libshaderc_combined (shaderc+glslang) nur im Capture-Build
+                // (KK_AOT_CAPTURE=1, s. mpvkitDeps oben). Ship-Build hat keinen
+                // Runtime-Compiler mehr (libplacebo -Dkk-aot=true + Libkkrender ohne
+                // spvc-Merge) → rendert aus dem MSL-Cache; ~8,6 MB gespart.
+            ] + mpvkitDeps,
             path: "Sources/_MPVKit",
             linkerSettings: [
                 .linkedFramework("AVFoundation"),
@@ -267,8 +275,8 @@ let package = Package(
             // renderpl.58 = kuckuck-prod-7 (= prod-6 + KK_AOT, HDR-Picks erhalten)
             // mit -Dkk-aot=true: shaderc/SPIRV-Cross gedroppt, rendert nur aus dem
             // gebündelten MSL-Cache. apiver 365 unverändert.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.58/Libplacebo.xcframework.zip",
-            checksum: "c4c8a1437603d24e28ad2bb97d2fb0df44183e30b4e8f7fdce113a43e23bdb74"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.59/Libplacebo.xcframework.zip",
+            checksum: "f7028f67ae8ceabfcafa457357800668604c3f2f1f651b47941a9fe4e6533808"
         ),
         .binaryTarget(
             name: "Libkkrender",
@@ -278,8 +286,8 @@ let package = Package(
             // libmpv/FFmpeg/libcurl fallen weg. Gebaut von kkrender/build-kkrender.sh.
             // renderpl.58 = KK_AOT=1: OHNE spirv-cross-Merge (30K), Render aus dem
             // gebündelten MSL-Cache — passt zur AOT-libplacebo derselben Version.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.58/Libkkrender.xcframework.zip",
-            checksum: "7bf97e6d811e9c89d39966c31e1bd9af968dcad130339084cfda35ca09ecef10"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.59/Libkkrender.xcframework.zip",
+            checksum: "0c423ed5ada66ef5fd29258315514749024a22a587b189b7a4ce01003d715ab1"
         ),
 
         .binaryTarget(

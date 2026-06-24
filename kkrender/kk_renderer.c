@@ -118,8 +118,8 @@ static bool kk_can_handle(const struct pl_frame *image,
     if (image->num_planes != 2)                 return false; // nur biplanar 4:2:0
     // SDR (BT.1886/sRGB) und HDR (PQ/HLG) — Tonemap+Peak via color_map/detect_peak.
     // Hooks: RGB/MAIN (CAS, Anime4K) + PRE_KERNEL (Anime4K) + LUMA_INPUT
-    // (ArtCNN/FSRCNNX; aktiver 2x-CNN -> kk_luma_hooked signalisiert Resize ->
-    // Fallback zur Laufzeit). Andere Stages (CHROMA/NATIVE/OUTPUT/…) -> Stock.
+    // (ArtCNN/FSRCNNX; aktiver 2x-CNN -> kk_luma_hooked liefert die resized Luma,
+    // Merge/Scale laufen auf der neuen Res). Andere Stages (CHROMA/NATIVE/OUTPUT/…) -> Stock.
     for (int n = 0; n < params->num_hooks; n++)
         if (params->hooks[n]->stages &
             ~(unsigned)(PL_HOOK_RGB | PL_HOOK_PRE_KERNEL | PL_HOOK_LUMA_INPUT))
@@ -268,6 +268,7 @@ static pl_tex kk_luma_hooked(struct kk_renderer *kr, pl_tex ltex, int w, int h,
     struct pl_color_repr repr = image->repr;
     struct pl_color_space col = image->color;
     bool modified = false;
+    int cur_w = w, cur_h = h;  // wächst, wenn ein Hook (ArtCNN/FSRCNNX) hochskaliert
 
     for (int n = 0; n < params->num_hooks; n++) {
         const struct pl_hook *hook = params->hooks[n];
@@ -275,13 +276,13 @@ static pl_tex kk_luma_hooked(struct kk_renderer *kr, pl_tex ltex, int w, int h,
             continue;
         struct pl_hook_params hp = {
             .gpu = kr->gpu, .dispatch = kr->dp, .get_tex = kk_get_hook_tex, .priv = kr,
-            .stage = PL_HOOK_LUMA_INPUT, .rect = { 0, 0, w, h }, .repr = repr, .color = col,
+            .stage = PL_HOOK_LUMA_INPUT, .rect = { 0, 0, cur_w, cur_h }, .repr = repr, .color = col,
             .orig_repr = &image->repr, .orig_color = &image->color, .components = 1,
-            .src_rect = { 0, 0, w, h }, .dst_rect = { 0, 0, w, h },
+            .src_rect = { 0, 0, cur_w, cur_h }, .dst_rect = { 0, 0, cur_w, cur_h },
         };
         pl_tex hin = NULL;
         if (hook->input == PL_HOOK_SIG_TEX) {
-            hin = kk_get_hook_tex(kr, w, h);
+            hin = kk_get_hook_tex(kr, cur_w, cur_h);
             if (!hin || !pl_dispatch_finish(kr->dp, pl_dispatch_params(.shader = &sh, .target = hin)))
                 return NULL;
             hp.tex = hin;
@@ -291,7 +292,7 @@ static pl_tex kk_luma_hooked(struct kk_renderer *kr, pl_tex ltex, int w, int h,
         struct pl_hook_res res = hook->hook(hook->priv, &hp);
         if (res.failed)
             return NULL;
-        int ow = w, oh = h;
+        int ow = cur_w, oh = cur_h;
         if (res.output == PL_HOOK_SIG_NONE) {
             // unverändert: bei SIG_TEX-Input wurde sh in hin gebacken -> aus hin neu
             if (hook->input == PL_HOOK_SIG_TEX) {
@@ -305,13 +306,12 @@ static pl_tex kk_luma_hooked(struct kk_renderer *kr, pl_tex ltex, int w, int h,
             pl_shader_sample_direct(sh, pl_sample_src( .tex = res.tex ));
         } else { // SIG_COLOR
             sh = res.sh;
-            if (!pl_shader_output_size(sh, &ow, &oh)) { ow = w; oh = h; }
+            if (!pl_shader_output_size(sh, &ow, &oh)) { ow = cur_w; oh = cur_h; }
         }
         repr = res.repr; col = res.color; modified = true;
-        if (ow != w || oh != h) {
+        if (ow != cur_w || oh != cur_h) {  // aktiver Upscaler-Hook -> neue Luma-Res
             *resized = true;
-            pl_dispatch_abort(kr->dp, &sh);
-            return NULL;
+            cur_w = ow; cur_h = oh;
         }
     }
 
@@ -319,7 +319,8 @@ static pl_tex kk_luma_hooked(struct kk_renderer *kr, pl_tex ltex, int w, int h,
         pl_dispatch_abort(kr->dp, &sh);
         return ltex;
     }
-    if (!kk_get_fbo(kr, &kr->luma_tex, w, h, false) ||
+    // Bake bei der finalen (evtl. resized) Luma-Res. Caller liest luma_tex->params.w/h.
+    if (!kk_get_fbo(kr, &kr->luma_tex, cur_w, cur_h, false) ||
         !pl_dispatch_finish(kr->dp, pl_dispatch_params(.shader = &sh, .target = kr->luma_tex)))
         return NULL;
     return kr->luma_tex;
@@ -329,10 +330,16 @@ static pl_tex kk_luma_hooked(struct kk_renderer *kr, pl_tex ltex, int w, int h,
 // licht (Downscale) bzw. Sigmoid-Linear (Upscale). Wird hier VOR dem Bake von
 // rgb_tex angewandt (= Stock linearisiert die Quelle, bevor der Scaler sie
 // als Textur sampelt). Bei true ist der Output prelinearized fürs color_map.
+// dst_w/dst_h + is_hdr: nötig, um up/down (und damit use_linear/use_sigmoid) NACH
+// einem evtl. Luma-Resize (aktiver 2x-CNN wie ArtCNN) zu bestimmen — der Resize kann
+// die Scale-Richtung kippen. Gibt die echten rgb_tex-Dims (out_w/out_h = resized
+// Luma-Res) + use_linear/use_sigmoid zurück, die der Aufrufer für Scale/unsigmoid braucht.
 static bool kk_build_rgb(struct kk_renderer *kr,
                          const struct pl_frame *image,
                          const struct pl_render_params *params,
-                         bool use_linear, bool use_sigmoid)
+                         int dst_w, int dst_h, bool is_hdr,
+                         int *out_w, int *out_h,
+                         bool *out_linear, bool *out_sigmoid)
 {
     const struct pl_plane *luma   = &image->planes[0];
     const struct pl_plane *chroma = &image->planes[1];
@@ -360,15 +367,27 @@ static bool kk_build_rgb(struct kk_renderer *kr,
         ctex_d = kr->deband_chroma;
     }
 
-    // LUMA-INPUT-Hooks (ArtCNN/FSRCNNX) vor dem Merge. resized (aktiver 2x-CNN) ->
-    // Fallback; inert -> raw Luma. luma_src wird im Merge statt ltex gesampelt.
+    // LUMA-INPUT-Hooks (ArtCNN/FSRCNNX) vor dem Merge. Ein aktiver 2x-CNN vergrößert
+    // die Luma -> luma_src ist mw×mh (resized); inert -> raw Luma (w×h). luma_src wird
+    // im Merge statt ltex gesampelt; Chroma/Merge/rgb laufen auf mw×mh (die echte
+    // Luma-Res), die Chroma-INPUT-Math (rx/rect) bleibt bei der Original-Res w/cw.
     bool luma_resized = false;
     pl_tex luma_src = kk_luma_hooked(kr, ltex_d, w, h, image, params, &luma_resized);
     if (!luma_src)
-        return false; // resized oder Fehler -> Fallback auf Stock
+        return false; // Hook-Fehler -> Fallback auf Stock
+    const int mw = luma_src->params.w, mh = luma_src->params.h;
 
-    if (!kk_get_fbo(kr, &kr->chroma_tex, w, h, true) ||  // storable: Polar-Compute
-        !kk_get_fbo(kr, &kr->rgb_tex, w, h, false))      // raster: gl_FragCoord-Merge
+    // up/down (und damit sigmoid/linear) gegen die ECHTE Luma-Res mw×mh bestimmen —
+    // ein 2x-CNN-Resize kann die Scale-Richtung kippen (z.B. 720p->1080: vorher up,
+    // nach 2x-CNN 1440->1080 = down). Treibt das Prelinearize unten + den Scaler oben.
+    bool up = dst_w > mw || dst_h > mh;
+    bool down = dst_w < mw || dst_h < mh;
+    bool use_sigmoid = up && params->sigmoid_params && !is_hdr;
+    bool use_linear  = down;
+    *out_w = mw; *out_h = mh; *out_linear = use_linear; *out_sigmoid = use_sigmoid;
+
+    if (!kk_get_fbo(kr, &kr->chroma_tex, mw, mh, true) ||  // storable: Polar-Compute
+        !kk_get_fbo(kr, &kr->rgb_tex, mw, mh, false))      // raster: gl_FragCoord-Merge
         return false;
 
     // (1) Chroma auf Luma-Res mit params->upscaler (Stock SAMPLER_PLANE/UP,
@@ -377,10 +396,12 @@ static bool kk_build_rgb(struct kk_renderer *kr,
     const struct pl_filter_config *cf = params->upscaler;
     float rx = (float) cw / w, ry = (float) ch / h;
     float sx = chroma->shift_x, sy = chroma->shift_y;
+    // Output-Res = mw×mh (echte Luma-Res); rect bleibt in Chroma-INPUT-Koordinaten
+    // (Original-Res-Mapping cw/w + Shift) — unabhängig von der Output-Res.
     if (cf && cf->polar) {
         pl_shader csh = pl_dispatch_begin(kr->dp);
         if (!pl_shader_sample_polar(csh, pl_sample_src(
-                .tex = ctex_d, .new_w = w, .new_h = h,
+                .tex = ctex_d, .new_w = mw, .new_h = mh,
                 .rect = { (0-sx)*rx, (0-sy)*ry, (w-sx)*rx, (h-sy)*ry }),
                 pl_sample_filter_params(.filter = *cf, .lut = &kr->sampler_lut))) {
             pl_dispatch_abort(kr->dp, &csh); return false;
@@ -388,22 +409,22 @@ static bool kk_build_rgb(struct kk_renderer *kr,
         if (!pl_dispatch_finish(kr->dp, pl_dispatch_params(.shader=&csh, .target=kr->chroma_tex)))
             return false;
     } else {
-        // X-Pass: cw->w (Shift sx), Y 1:1 -> chroma_tmp (w×ch)
-        if (!kk_get_fbo(kr, &kr->chroma_tmp, w, ch, true)) return false;
+        // X-Pass: cw->mw (Shift sx), Y 1:1 -> chroma_tmp (mw×ch)
+        if (!kk_get_fbo(kr, &kr->chroma_tmp, mw, ch, true)) return false;
         pl_shader cx = pl_dispatch_begin(kr->dp);
         if (!pl_shader_sample_ortho2(cx, pl_sample_src(
-                .tex = ctex_d, .components = 2, .new_w = w, .new_h = ch,
+                .tex = ctex_d, .components = 2, .new_w = mw, .new_h = ch,
                 .rect = { (0-sx)*rx, 0, (w-sx)*rx, ch }),
                 pl_sample_filter_params(.filter = *cf, .lut = &kr->sampler_lut))) {
             pl_dispatch_abort(kr->dp, &cx); return false;
         }
         if (!pl_dispatch_finish(kr->dp, pl_dispatch_params(.shader=&cx, .target=kr->chroma_tmp)))
             return false;
-        // Y-Pass: ch->h (Shift sy), X 1:1 -> chroma_tex (w×h)
+        // Y-Pass: ch->mh (Shift sy), X 1:1 (volle chroma_tmp-Breite mw) -> chroma_tex (mw×mh)
         pl_shader cy = pl_dispatch_begin(kr->dp);
         if (!pl_shader_sample_ortho2(cy, pl_sample_src(
-                .tex = kr->chroma_tmp, .components = 2, .new_w = w, .new_h = h,
-                .rect = { 0, (0-sy)*ry, w, (h-sy)*ry }),
+                .tex = kr->chroma_tmp, .components = 2, .new_w = mw, .new_h = mh,
+                .rect = { 0, (0-sy)*ry, mw, (h-sy)*ry }),
                 pl_sample_filter_params(.filter = *cf, .lut = &kr->sampler_lut))) {
             pl_dispatch_abort(kr->dp, &cy); return false;
         }
@@ -436,7 +457,7 @@ static bool kk_build_rgb(struct kk_renderer *kr,
     // RGB/MAIN-Stage-Hooks (CAS, Anime4K-Restore) — VOR Linearize, wie Stock
     // (PL_HOOK_RGB:1959, vor pass_scale_main). Aktualisiert sh + repr/col.
     struct pl_color_space col = image->color;
-    if (!kk_apply_hooks(kr, &sh, w, h, PL_HOOK_RGB, image, &repr, &col, params))
+    if (!kk_apply_hooks(kr, &sh, mw, mh, PL_HOOK_RGB, image, &repr, &col, params))
         return false;
 
     // Linearize/Sigmoidize VOR dem Bake, falls der Scaler in Linearlicht läuft
@@ -449,7 +470,7 @@ static bool kk_build_rgb(struct kk_renderer *kr,
     // PRE_KERNEL-Stage-Hooks (Anime4K) — nach Linearize/Sigmoid, unmittelbar vor
     // dem Scaler (Stock pass_scale_main:2062). Anime4K-Mode-A resized nicht
     // (HEIGHT MAIN.h) -> rgb_tex bleibt w×h; der Main-Scaler macht den 2x-Upscale.
-    if (!kk_apply_hooks(kr, &sh, w, h, PL_HOOK_PRE_KERNEL, image, &repr, &col, params))
+    if (!kk_apply_hooks(kr, &sh, mw, mh, PL_HOOK_PRE_KERNEL, image, &repr, &col, params))
         return false;
 
     if (!pl_dispatch_finish(kr->dp, pl_dispatch_params(
@@ -472,7 +493,7 @@ static bool kk_build_rgb(struct kk_renderer *kr,
             return false; // -> Fallback (z.B. kein SSBO/Storable)
         }
         if (!pl_dispatch_compute(kr->dp, pl_dispatch_compute_params(
-                .shader = &dsh, .width = w, .height = h)))
+                .shader = &dsh, .width = mw, .height = mh)))
             return false;
     } else {
         // Keine Peak-Detection -> einen evtl. noch im State stehenden Peak (von
@@ -552,24 +573,27 @@ bool kk_render_image(struct kk_renderer *kr,
     const int src_h = (int) (image->crop.y1 - image->crop.y0);
 
     bool is_hdr = pl_color_space_is_hdr(&image->color);
-    bool up   = dst_w > src_w || dst_h > src_h;
-    bool down = dst_w < src_w || dst_h < src_h;
-    // HDR: Sigmoid aus (clippt [0,1], pass_scale_main:2038); use_linear bleibt
-    // bei Downscale, weil rgba16f float ist (pass_scale_main:2040-2041).
-    bool use_sigmoid = up && params->sigmoid_params && !is_hdr; // pass_scale_main:1997
-    bool use_linear  = down;                                     // pass_scale_main:1998
+
+    // --- Stufe 1+2: Decode (Luma+Chroma -> RGB), ggf. linearisiert. Liefert die
+    // ECHTE rgb_tex-Res zurück (rgb_w×rgb_h = resized Luma-Res bei aktivem 2x-CNN
+    // wie ArtCNN; sonst = src) + use_linear/use_sigmoid (gegen die echte Res bestimmt,
+    // weil ein Resize die Scale-Richtung kippen kann). HDR: Sigmoid aus (pass_scale
+    // _main:2038); use_linear bleibt bei Downscale (rgba16f float, :2040).
+    int rgb_w = src_w, rgb_h = src_h;
+    bool use_linear = false, use_sigmoid = false;
+    if (!kk_build_rgb(kr, image, params, dst_w, dst_h, is_hdr,
+                      &rgb_w, &rgb_h, &use_linear, &use_sigmoid))
+        return false; // -> Fallback auf Stock
     bool prelinearized = use_linear || use_sigmoid;
 
-    // --- Stufe 1+2: Decode (Luma+Chroma -> RGB), ggf. linearisiert ---------
-    if (!kk_build_rgb(kr, image, params, use_linear, use_sigmoid))
-        return false; // -> Fallback auf Stock
-
-    // --- Stufe 2b: Scale (rgb_tex -> dst). Up=upscaler, Down=downscaler; je
-    // polar (1 Pass) oder separabel-ortho (Y-dann-X) je nach filter->polar.
+    // --- Stufe 2b: Scale (rgb_tex[rgb_w×rgb_h] -> dst). Richtung gegen die echte
+    // rgb-Res (nach evtl. CNN-Resize). Up=upscaler, Down=downscaler; je polar/separabel.
+    bool up   = dst_w > rgb_w || dst_h > rgb_h;
+    bool down = dst_w < rgb_w || dst_h < rgb_h;
     const struct pl_filter_config *sf = up ? params->upscaler
                                             : (down ? params->downscaler : NULL);
     pl_shader_obj *slut = up ? &kr->main_lut : &kr->downscaler_lut;
-    pl_shader sh = kk_scale(kr, kr->rgb_tex, src_w, src_h, dst_w, dst_h,
+    pl_shader sh = kk_scale(kr, kr->rgb_tex, rgb_w, rgb_h, dst_w, dst_h,
                             sf, slut, params->antiringing_strength);
     if (!sh)
         return false;
