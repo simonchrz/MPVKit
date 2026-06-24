@@ -50,9 +50,13 @@ struct kk_renderer {
     // Zwischentexturen (bei Größenwechsel via pl_tex_recreate neu):
     //   chroma_tex: Chroma bilinear auf Luma-Auflösung hochgesampelt
     //   rgb_tex:    zusammengesetztes + decode_color-tes RGB (Source-Res)
+    pl_tex deband_luma;          // debandete Luma-Plane (native Res), falls deband an
+    pl_tex deband_chroma;        // debandete Chroma-Plane (native Res), falls deband an
+    pl_tex luma_tex;             // LUMA-Hook-Ergebnis (ArtCNN/FSRCNNX), falls aktiv
     pl_tex chroma_tex;
+    pl_tex chroma_tmp;           // X-Pass-Zwischentextur fürs ortho-Chroma-Upsample
     pl_tex rgb_tex;
-    pl_tex scale_tmp;            // Y-Pass-Zwischentextur fürs Downscale-Ping-Pong
+    pl_tex scale_tmp;            // Pass-1-Zwischentextur fürs Scale-Ortho-Ping-Pong
 
     pl_tex hook_fbos[16];        // Scratch-Pool für get_tex (Anime4K ~10 saved tex)
     int    hook_fbo_used;        // pro Frame zurückgesetzt
@@ -84,7 +88,11 @@ void kk_renderer_destroy(struct kk_renderer **pkr)
     pl_shader_obj_destroy(&kr->downscaler_lut);
     pl_shader_obj_destroy(&kr->tone_map_state);
     pl_shader_obj_destroy(&kr->dither_state);
+    pl_tex_destroy(kr->gpu, &kr->deband_luma);
+    pl_tex_destroy(kr->gpu, &kr->deband_chroma);
+    pl_tex_destroy(kr->gpu, &kr->luma_tex);
     pl_tex_destroy(kr->gpu, &kr->chroma_tex);
+    pl_tex_destroy(kr->gpu, &kr->chroma_tmp);
     pl_tex_destroy(kr->gpu, &kr->rgb_tex);
     pl_tex_destroy(kr->gpu, &kr->scale_tmp);
     for (int i = 0; i < (int)(sizeof(kr->hook_fbos)/sizeof(kr->hook_fbos[0])); i++)
@@ -109,20 +117,19 @@ static bool kk_can_handle(const struct pl_frame *image,
 {
     if (image->num_planes != 2)                 return false; // nur biplanar 4:2:0
     // SDR (BT.1886/sRGB) und HDR (PQ/HLG) — Tonemap+Peak via color_map/detect_peak.
-    // Hooks: RGB/MAIN (CAS, Anime4K-Restore) + PRE_KERNEL (Anime4K). LUMA-Hooks
-    // (FSRCNNX/ArtCNN, Plane-Stage + Resize) -> Stock.
+    // Hooks: RGB/MAIN (CAS, Anime4K) + PRE_KERNEL (Anime4K) + LUMA_INPUT
+    // (ArtCNN/FSRCNNX; aktiver 2x-CNN -> kk_luma_hooked signalisiert Resize ->
+    // Fallback zur Laufzeit). Andere Stages (CHROMA/NATIVE/OUTPUT/…) -> Stock.
     for (int n = 0; n < params->num_hooks; n++)
-        if (params->hooks[n]->stages & ~(unsigned)(PL_HOOK_RGB | PL_HOOK_PRE_KERNEL))
+        if (params->hooks[n]->stages &
+            ~(unsigned)(PL_HOOK_RGB | PL_HOOK_PRE_KERNEL | PL_HOOK_LUMA_INPUT))
             return false;
-    if (params->deband_params)                  return false;
     if (params->lut || target->lut)             return false;
     if (params->distort_params)                 return false;
     if (params->cone_params)                    return false;
-    // Chroma 2x + Haupt-Upscale brauchen einen polaren Scaler (sample_polar).
-    // Nicht-polare Upscaler (z.B. HD-Light-Lanczos) bräuchten Upscale-Ortho.
-    if (!params->upscaler || !params->upscaler->polar) return false;
-    // Downscale: separabel via ortho-Ping-Pong -> downscaler muss existieren.
-    if (!params->downscaler) return false;
+    // Up- und Downscale via polar (1 Pass) oder separabel-ortho (Ping-Pong) je
+    // nach filter->polar; beide Scaler müssen existieren (auch für Chroma-Upsample).
+    if (!params->upscaler || !params->downscaler) return false;
     return true;
 }
 
@@ -221,6 +228,103 @@ static bool kk_apply_hooks(struct kk_renderer *kr, pl_shader *psh, int w, int h,
     return true;
 }
 
+// Debandet eine Plane in *out (Stock plane_deband, renderer.c:1769): pl_shader_deband
+// mit scale=normalize (Aufrufer nutzt drepr fürs decode) + grain_neutral der Plane,
+// auf nativer Plane-Auflösung. comps=1 (Luma) bzw 2 (Chroma). Liefert *out / NULL.
+static pl_tex kk_deband(struct kk_renderer *kr, pl_tex *out, pl_tex src,
+                        int sw, int sh_, int comps, float scale,
+                        const float neutral[3], const struct pl_deband_params *dp)
+{
+    if (!kk_get_fbo(kr, out, sw, sh_, true))
+        return NULL;
+    struct pl_deband_params p = *dp;
+    p.grain_neutral[0] = neutral[0];
+    p.grain_neutral[1] = neutral[1];
+    p.grain_neutral[2] = neutral[2];
+    pl_shader dsh = pl_dispatch_begin(kr->dp);
+    pl_shader_deband(dsh, pl_sample_src( .tex = src, .components = comps, .scale = scale ), &p);
+    if (!pl_dispatch_finish(kr->dp, pl_dispatch_params(.shader = &dsh, .target = *out)))
+        return NULL;
+    return *out;
+}
+
+// LUMA-INPUT-Hooks (ArtCNN/FSRCNNX) auf die Luma-Plane anwenden. Liefert die zu
+// mergende Luma-Textur. *resized=true, wenn ein Hook die Luma vergrößert (aktiver
+// CNN-Upscale, WHEN>1.3x) -> Aufrufer fällt auf Stock zurück (Plane-Geometrie-
+// Änderung nicht migriert). Inerter Hook (WHEN false -> SIG_NONE) = raw Luma.
+static pl_tex kk_luma_hooked(struct kk_renderer *kr, pl_tex ltex, int w, int h,
+                             const struct pl_frame *image,
+                             const struct pl_render_params *params, bool *resized)
+{
+    *resized = false;
+    bool has = false;
+    for (int n = 0; n < params->num_hooks; n++)
+        if (params->hooks[n]->stages & PL_HOOK_LUMA_INPUT) has = true;
+    if (!has)
+        return ltex;
+
+    pl_shader sh = pl_dispatch_begin(kr->dp);
+    pl_shader_sample_direct(sh, pl_sample_src( .tex = ltex, .components = 1 ));
+    struct pl_color_repr repr = image->repr;
+    struct pl_color_space col = image->color;
+    bool modified = false;
+
+    for (int n = 0; n < params->num_hooks; n++) {
+        const struct pl_hook *hook = params->hooks[n];
+        if (!(hook->stages & PL_HOOK_LUMA_INPUT))
+            continue;
+        struct pl_hook_params hp = {
+            .gpu = kr->gpu, .dispatch = kr->dp, .get_tex = kk_get_hook_tex, .priv = kr,
+            .stage = PL_HOOK_LUMA_INPUT, .rect = { 0, 0, w, h }, .repr = repr, .color = col,
+            .orig_repr = &image->repr, .orig_color = &image->color, .components = 1,
+            .src_rect = { 0, 0, w, h }, .dst_rect = { 0, 0, w, h },
+        };
+        pl_tex hin = NULL;
+        if (hook->input == PL_HOOK_SIG_TEX) {
+            hin = kk_get_hook_tex(kr, w, h);
+            if (!hin || !pl_dispatch_finish(kr->dp, pl_dispatch_params(.shader = &sh, .target = hin)))
+                return NULL;
+            hp.tex = hin;
+        } else if (hook->input == PL_HOOK_SIG_COLOR) {
+            hp.sh = sh;
+        }
+        struct pl_hook_res res = hook->hook(hook->priv, &hp);
+        if (res.failed)
+            return NULL;
+        int ow = w, oh = h;
+        if (res.output == PL_HOOK_SIG_NONE) {
+            // unverändert: bei SIG_TEX-Input wurde sh in hin gebacken -> aus hin neu
+            if (hook->input == PL_HOOK_SIG_TEX) {
+                sh = pl_dispatch_begin(kr->dp);
+                pl_shader_sample_direct(sh, pl_sample_src( .tex = hin ));
+            }
+            continue;
+        } else if (res.output == PL_HOOK_SIG_TEX) {
+            ow = res.tex->params.w; oh = res.tex->params.h;
+            sh = pl_dispatch_begin(kr->dp);
+            pl_shader_sample_direct(sh, pl_sample_src( .tex = res.tex ));
+        } else { // SIG_COLOR
+            sh = res.sh;
+            if (!pl_shader_output_size(sh, &ow, &oh)) { ow = w; oh = h; }
+        }
+        repr = res.repr; col = res.color; modified = true;
+        if (ow != w || oh != h) {
+            *resized = true;
+            pl_dispatch_abort(kr->dp, &sh);
+            return NULL;
+        }
+    }
+
+    if (!modified) { // alle Hooks inert -> raw Luma direkt (kein Extra-Pass)
+        pl_dispatch_abort(kr->dp, &sh);
+        return ltex;
+    }
+    if (!kk_get_fbo(kr, &kr->luma_tex, w, h, false) ||
+        !pl_dispatch_finish(kr->dp, pl_dispatch_params(.shader = &sh, .target = kr->luma_tex)))
+        return NULL;
+    return kr->luma_tex;
+}
+
 // use_linear/use_sigmoid: wie pass_scale_main — der Scaler arbeitet in Linear-
 // licht (Downscale) bzw. Sigmoid-Linear (Upscale). Wird hier VOR dem Bake von
 // rgb_tex angewandt (= Stock linearisiert die Quelle, bevor der Scaler sie
@@ -236,30 +340,76 @@ static bool kk_build_rgb(struct kk_renderer *kr,
     const int w = ltex->params.w, h = ltex->params.h;
     const int cw = ctex->params.w, ch = ctex->params.h;
 
+    // (0) Deband pro Plane (Stock plane_deband, VOR Hooks). Normalisiert die Plane
+    // -> decode_color nutzt das angepasste drepr. neutral = grain-Neutralpunkt.
+    pl_tex ltex_d = ltex, ctex_d = ctex;
+    struct pl_color_repr decode_repr = image->repr;
+    if (params->deband_params) {
+        int bits = image->repr.bits.sample_depth;
+        float os = bits ? (float)(1ull<<bits) / ((1ull<<bits) - 1.0f) : 1.0f;
+        float nl = (pl_color_levels_guess(&image->repr) == PL_COLOR_LEVELS_LIMITED)
+                       ? 16.0f/256.0f * os : 0.0f;
+        float nc = pl_color_system_is_ycbcr_like(image->repr.sys) ? 0.5f * os : nl;
+        float dscale = pl_color_repr_normalize(&decode_repr); // passt decode_repr.bits an
+        if (!kk_deband(kr, &kr->deband_luma, ltex, w, h, 1, dscale,
+                       (float[3]){ nl, 0, 0 }, params->deband_params) ||
+            !kk_deband(kr, &kr->deband_chroma, ctex, cw, ch, 2, dscale,
+                       (float[3]){ nc, nc, 0 }, params->deband_params))
+            return false;
+        ltex_d = kr->deband_luma;
+        ctex_d = kr->deband_chroma;
+    }
+
+    // LUMA-INPUT-Hooks (ArtCNN/FSRCNNX) vor dem Merge. resized (aktiver 2x-CNN) ->
+    // Fallback; inert -> raw Luma. luma_src wird im Merge statt ltex gesampelt.
+    bool luma_resized = false;
+    pl_tex luma_src = kk_luma_hooked(kr, ltex_d, w, h, image, params, &luma_resized);
+    if (!luma_src)
+        return false; // resized oder Fehler -> Fallback auf Stock
+
     if (!kk_get_fbo(kr, &kr->chroma_tex, w, h, true) ||  // storable: Polar-Compute
         !kk_get_fbo(kr, &kr->rgb_tex, w, h, false))      // raster: gl_FragCoord-Merge
         return false;
 
-    // (1) Chroma auf Luma-Res. ratio<1 (typ. 0.5), Shift aus der Plane. Scaler =
-    // params->upscaler (ewa_lanczossharp) — exakt wie Stock für SAMPLER_PLANE/UP
-    // (renderer.c:643, plane_upscaler=NULL -> upscaler). Bilinear wäre ~0.94 SSIM.
+    // (1) Chroma auf Luma-Res mit params->upscaler (Stock SAMPLER_PLANE/UP,
+    // renderer.c:643). Shift aus der Plane. Polarer Filter (ewa) -> 1 Pass;
+    // separabler Filter (lanczos, HD-Light) -> ortho X-dann-Y (Shift aufgeteilt).
+    const struct pl_filter_config *cf = params->upscaler;
     float rx = (float) cw / w, ry = (float) ch / h;
     float sx = chroma->shift_x, sy = chroma->shift_y;
-    pl_shader csh = pl_dispatch_begin(kr->dp);
-    struct pl_sample_src csrc = {
-        .tex   = ctex,
-        .rect  = { (0 - sx) * rx, (0 - sy) * ry, (w - sx) * rx, (h - sy) * ry },
-        .new_w = w, .new_h = h,
-    };
-    if (!pl_shader_sample_polar(csh, &csrc, pl_sample_filter_params(
-            .filter = *params->upscaler,
-            .lut    = &kr->sampler_lut))) {
-        pl_dispatch_abort(kr->dp, &csh);
-        return false;
+    if (cf && cf->polar) {
+        pl_shader csh = pl_dispatch_begin(kr->dp);
+        if (!pl_shader_sample_polar(csh, pl_sample_src(
+                .tex = ctex_d, .new_w = w, .new_h = h,
+                .rect = { (0-sx)*rx, (0-sy)*ry, (w-sx)*rx, (h-sy)*ry }),
+                pl_sample_filter_params(.filter = *cf, .lut = &kr->sampler_lut))) {
+            pl_dispatch_abort(kr->dp, &csh); return false;
+        }
+        if (!pl_dispatch_finish(kr->dp, pl_dispatch_params(.shader=&csh, .target=kr->chroma_tex)))
+            return false;
+    } else {
+        // X-Pass: cw->w (Shift sx), Y 1:1 -> chroma_tmp (w×ch)
+        if (!kk_get_fbo(kr, &kr->chroma_tmp, w, ch, true)) return false;
+        pl_shader cx = pl_dispatch_begin(kr->dp);
+        if (!pl_shader_sample_ortho2(cx, pl_sample_src(
+                .tex = ctex_d, .components = 2, .new_w = w, .new_h = ch,
+                .rect = { (0-sx)*rx, 0, (w-sx)*rx, ch }),
+                pl_sample_filter_params(.filter = *cf, .lut = &kr->sampler_lut))) {
+            pl_dispatch_abort(kr->dp, &cx); return false;
+        }
+        if (!pl_dispatch_finish(kr->dp, pl_dispatch_params(.shader=&cx, .target=kr->chroma_tmp)))
+            return false;
+        // Y-Pass: ch->h (Shift sy), X 1:1 -> chroma_tex (w×h)
+        pl_shader cy = pl_dispatch_begin(kr->dp);
+        if (!pl_shader_sample_ortho2(cy, pl_sample_src(
+                .tex = kr->chroma_tmp, .components = 2, .new_w = w, .new_h = h,
+                .rect = { 0, (0-sy)*ry, w, (h-sy)*ry }),
+                pl_sample_filter_params(.filter = *cf, .lut = &kr->sampler_lut))) {
+            pl_dispatch_abort(kr->dp, &cy); return false;
+        }
+        if (!pl_dispatch_finish(kr->dp, pl_dispatch_params(.shader=&cy, .target=kr->chroma_tex)))
+            return false;
     }
-    if (!pl_dispatch_finish(kr->dp, pl_dispatch_params(
-            .shader = &csh, .target = kr->chroma_tex)))
-        return false;
 
     // (2) Merge beider Planes (beide w×h, 1:1) -> vec4(Y,Cb,Cr,1), dann decode.
     pl_shader sh = pl_dispatch_begin(kr->dp);
@@ -273,13 +423,14 @@ static bool kk_build_rgb(struct kk_renderer *kr,
         .num_descriptors = 2,
         .descriptors = (struct pl_shader_desc[]) {
             { .desc = { .name = "kk_luma",   .type = PL_DESC_SAMPLED_TEX },
-              .binding = { .object = ltex,         .sample_mode = PL_TEX_SAMPLE_NEAREST } },
+              .binding = { .object = luma_src,     .sample_mode = PL_TEX_SAMPLE_NEAREST } },
             { .desc = { .name = "kk_chroma", .type = PL_DESC_SAMPLED_TEX },
               .binding = { .object = kr->chroma_tex, .sample_mode = PL_TEX_SAMPLE_NEAREST } },
         },
     });
 
-    struct pl_color_repr repr = image->repr;
+    // decode_repr = normalisiertes repr falls deband (bits angepasst), sonst raw.
+    struct pl_color_repr repr = decode_repr;
     pl_shader_decode_color(sh, &repr, NULL);
 
     // RGB/MAIN-Stage-Hooks (CAS, Anime4K-Restore) — VOR Linearize, wie Stock
@@ -327,6 +478,49 @@ static bool kk_build_rgb(struct kk_renderer *kr,
     return true;
 }
 
+// Skaliert src_tex (voll, src_w×src_h) -> dst_w×dst_h mit filter. 1:1=direct,
+// polar=1 Pass, separabel=ortho Ping-Pong (Y in scale_tmp, X fused). Gibt die
+// finale sh zurück (Aufrufer hängt unsigmoid/colormap/dither/output an), NULL=Fehler.
+// no_compute am finalen Pass (er finished auf evtl. nicht-storable Target).
+static pl_shader kk_scale(struct kk_renderer *kr, pl_tex src_tex,
+                          int src_w, int src_h, int dst_w, int dst_h,
+                          const struct pl_filter_config *filter, pl_shader_obj *lut,
+                          float antiring)
+{
+    if (src_w == dst_w && src_h == dst_h) {
+        pl_shader sh = pl_dispatch_begin(kr->dp);
+        pl_shader_sample_direct(sh, pl_sample_src( .tex = src_tex, .new_w = dst_w, .new_h = dst_h ));
+        return sh;
+    }
+    if (filter && filter->polar) {
+        pl_shader sh = pl_dispatch_begin(kr->dp);
+        if (!pl_shader_sample_polar(sh, pl_sample_src( .tex = src_tex, .new_w = dst_w, .new_h = dst_h ),
+                pl_sample_filter_params(.filter = *filter, .lut = lut, .no_compute = true))) {
+            pl_dispatch_abort(kr->dp, &sh); return NULL;
+        }
+        return sh;
+    }
+    // separabel: Y (src_h->dst_h) in scale_tmp, dann X (src_w->dst_w) fused
+    if (!kk_get_fbo(kr, &kr->scale_tmp, src_w, dst_h, true)) return NULL;
+    pl_shader ysh = pl_dispatch_begin(kr->dp);
+    if (!pl_shader_sample_ortho2(ysh, pl_sample_src(
+            .tex = src_tex, .components = 4, .rect = { 0, 0, src_w, src_h },
+            .new_w = src_w, .new_h = dst_h ),
+            pl_sample_filter_params(.filter = *filter, .antiring = antiring, .lut = lut))) {
+        pl_dispatch_abort(kr->dp, &ysh); return NULL;
+    }
+    if (!pl_dispatch_finish(kr->dp, pl_dispatch_params(.shader = &ysh, .target = kr->scale_tmp)))
+        return NULL;
+    pl_shader sh = pl_dispatch_begin(kr->dp);
+    if (!pl_shader_sample_ortho2(sh, pl_sample_src(
+            .tex = kr->scale_tmp, .components = 4, .rect = { 0, 0, src_w, dst_h },
+            .new_w = dst_w, .new_h = dst_h ),
+            pl_sample_filter_params(.filter = *filter, .antiring = antiring, .lut = lut, .no_compute = true))) {
+        pl_dispatch_abort(kr->dp, &sh); return NULL;
+    }
+    return sh;
+}
+
 bool kk_render_image(struct kk_renderer *kr,
                      const struct pl_frame *image,
                      const struct pl_frame *target,
@@ -364,53 +558,15 @@ bool kk_render_image(struct kk_renderer *kr,
     if (!kk_build_rgb(kr, image, params, use_linear, use_sigmoid))
         return false; // -> Fallback auf Stock
 
-    // --- Stufe 2b: Scale (rgb_tex -> dst). 1:1=direct, Up=polar, Down=ortho.
-    // no_compute am fused Pass: er finished auf das (evtl. nicht-storable) Target.
-    pl_shader sh;
-    if (down) {
-        // Separables Downscale, Y zuerst dann X (renderer.c:746-771): hermite,
-        // anti-aliased (no_widening=false), beide Achsen teilen downscaler_lut.
-        if (!kk_get_fbo(kr, &kr->scale_tmp, src_w, dst_h, true)) // storable: Compute-Ortho
-            return false;
-        pl_shader ysh = pl_dispatch_begin(kr->dp);
-        struct pl_sample_src ysrc = {
-            .tex = kr->rgb_tex, .components = 4,
-            .rect = { 0, 0, src_w, src_h }, .new_w = src_w, .new_h = dst_h, // nur Y skaliert
-        };
-        if (!pl_shader_sample_ortho2(ysh, &ysrc, pl_sample_filter_params(
-                .filter = *params->downscaler, .antiring = params->antiringing_strength,
-                .lut = &kr->downscaler_lut))) {
-            pl_dispatch_abort(kr->dp, &ysh);
-            return false;
-        }
-        if (!pl_dispatch_finish(kr->dp, pl_dispatch_params(
-                .shader = &ysh, .target = kr->scale_tmp)))
-            return false;
-
-        sh = pl_dispatch_begin(kr->dp);
-        struct pl_sample_src xsrc = {
-            .tex = kr->scale_tmp, .components = 4,
-            .rect = { 0, 0, src_w, dst_h }, .new_w = dst_w, .new_h = dst_h, // nur X skaliert
-        };
-        if (!pl_shader_sample_ortho2(sh, &xsrc, pl_sample_filter_params(
-                .filter = *params->downscaler, .antiring = params->antiringing_strength,
-                .lut = &kr->downscaler_lut, .no_compute = true))) {
-            pl_dispatch_abort(kr->dp, &sh);
-            return false;
-        }
-    } else if (up) {
-        sh = pl_dispatch_begin(kr->dp);
-        struct pl_sample_src ssrc = { .tex = kr->rgb_tex, .new_w = dst_w, .new_h = dst_h };
-        if (!pl_shader_sample_polar(sh, &ssrc, pl_sample_filter_params(
-                .filter = *params->upscaler, .lut = &kr->main_lut, .no_compute = true))) {
-            pl_dispatch_abort(kr->dp, &sh);
-            return false;
-        }
-    } else {
-        sh = pl_dispatch_begin(kr->dp);
-        pl_shader_sample_direct(sh, pl_sample_src( .tex = kr->rgb_tex,
-                                                   .new_w = dst_w, .new_h = dst_h ));
-    }
+    // --- Stufe 2b: Scale (rgb_tex -> dst). Up=upscaler, Down=downscaler; je
+    // polar (1 Pass) oder separabel-ortho (Y-dann-X) je nach filter->polar.
+    const struct pl_filter_config *sf = up ? params->upscaler
+                                            : (down ? params->downscaler : NULL);
+    pl_shader_obj *slut = up ? &kr->main_lut : &kr->downscaler_lut;
+    pl_shader sh = kk_scale(kr, kr->rgb_tex, src_w, src_h, dst_w, dst_h,
+                            sf, slut, params->antiringing_strength);
+    if (!sh)
+        return false;
     if (use_sigmoid)
         pl_shader_unsigmoidize(sh, params->sigmoid_params);
 
