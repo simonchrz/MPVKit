@@ -20,6 +20,7 @@
 #include <libplacebo/dither.h>
 
 #include "render_mtl.h"   // öffentliche kuckuck_hybrid_*-Deklarationen
+#include "kk_renderer.h"  // eigener Render-Pfad (Strangler), env-gated
 
 struct hybrid_priv {
     pl_log pllog;
@@ -31,6 +32,7 @@ struct hybrid_priv {
     const struct pl_hook *user_hook;
     char *user_shader_path;
     char *deband_mode;
+    struct kk_renderer *kk; // NULL bis aktiviert; eigener schmaler Pass-Graph
 };
 
 static void hybrid_log_cb(void *priv, enum pl_log_level level, const char *msg)
@@ -287,6 +289,14 @@ void *kuckuck_hybrid_create(void *mtl_device)
     p->rparams.error_diffusion = &pl_error_diffusion_sierra_lite;
     p->rparams.peak_detect_params = NULL;
 
+    // Eigener Render-Pfad (Strangler). Nur aktiv bei KUCKUCK_KK_RENDER=1; sonst
+    // bleibt p->kk NULL und es läuft ausschließlich pl_render_image (Default).
+    {
+        const char *kkenv = getenv("KUCKUCK_KK_RENDER");
+        if (kkenv && kkenv[0] == '1')
+            p->kk = kk_renderer_create(p->pllog, p->gpu);
+    }
+
     return p;
 
 fail:
@@ -368,7 +378,10 @@ int kuckuck_hybrid_render(void *ctx, void *cv_pixbuf, void *target_texture)
             rp.deband_params   = NULL;
         }
     }
-    pl_render_image(p->rr, &img, &target, &rp);
+    // kk-Pfad übernimmt den Frame, wenn aktiv UND der Fall migriert ist;
+    // sonst Fallback auf den bewährten Stock-Renderer (kein Regressionsrisiko).
+    if (!(p->kk && kk_render_image(p->kk, &img, &target, &rp)))
+        pl_render_image(p->rr, &img, &target, &rp);
     pl_gpu_finish(p->gpu);
 
     pl_tex_destroy(p->gpu, &target_tex);
@@ -382,6 +395,8 @@ void kuckuck_hybrid_destroy(void *ctx)
     struct hybrid_priv *p = ctx;
     if (!p)
         return;
+    if (p->kk)
+        kk_renderer_destroy(&p->kk);
     if (p->user_hook)
         pl_mpv_user_shader_destroy(&p->user_hook);
     if (p->rr)
