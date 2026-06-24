@@ -54,7 +54,7 @@ struct kk_renderer {
     pl_tex rgb_tex;
     pl_tex scale_tmp;            // Y-Pass-Zwischentextur fürs Downscale-Ping-Pong
 
-    pl_tex hook_fbos[8];         // Scratch-Pool für get_tex (User-Shader-Hooks)
+    pl_tex hook_fbos[16];        // Scratch-Pool für get_tex (Anime4K ~10 saved tex)
     int    hook_fbo_used;        // pro Frame zurückgesetzt
 };
 
@@ -109,10 +109,10 @@ static bool kk_can_handle(const struct pl_frame *image,
 {
     if (image->num_planes != 2)                 return false; // nur biplanar 4:2:0
     // SDR (BT.1886/sRGB) und HDR (PQ/HLG) — Tonemap+Peak via color_map/detect_peak.
-    // Hooks: nur RGB/MAIN-Stage (CAS). Mehrstufige/LUMA-Hooks (Anime4K/FSRCNNX,
-    // mit PREKERNEL/LUMA + Resize/Mehrpass) -> Stock.
+    // Hooks: RGB/MAIN (CAS, Anime4K-Restore) + PRE_KERNEL (Anime4K). LUMA-Hooks
+    // (FSRCNNX/ArtCNN, Plane-Stage + Resize) -> Stock.
     for (int n = 0; n < params->num_hooks; n++)
-        if (params->hooks[n]->stages & ~(unsigned)PL_HOOK_RGB)
+        if (params->hooks[n]->stages & ~(unsigned)(PL_HOOK_RGB | PL_HOOK_PRE_KERNEL))
             return false;
     if (params->deband_params)                  return false;
     if (params->lut || target->lut)             return false;
@@ -166,25 +166,25 @@ static pl_tex kk_get_hook_tex(void *priv, int width, int height)
     return *slot;
 }
 
-// User-Shader-Hooks der RGB/MAIN-Stage anwenden (spiegelt pass_hook für genau
-// PL_HOOK_RGB — wohin mpvs "MAIN" mappt, custom_mpv.c:854). Deckt CAS ab
-// (single-pass, BIND HOOKED, kein Resize). Mehrstufige/LUMA-Hooks (Anime4K/
-// FSRCNNX) sind via kk_can_handle ausgeschlossen -> Stock. *psh wird durch das
-// Hook-Ergebnis ersetzt; repr/color werden auf das Hook-Ergebnis aktualisiert.
-static bool kk_apply_rgb_hooks(struct kk_renderer *kr, pl_shader *psh, int w, int h,
-                               const struct pl_frame *image,
-                               struct pl_color_repr *repr, struct pl_color_space *color,
-                               const struct pl_render_params *params)
+// User-Shader-Hooks einer Stage anwenden (spiegelt pass_hook). Genutzt für
+// PL_HOOK_RGB (mpv "MAIN", custom_mpv.c:854 — CAS, Anime4K-Restore) und
+// PL_HOOK_PRE_KERNEL (mpv "PREKERNEL" — Anime4K). Saved/Bind-Texturen managed
+// libplacebo intern via get_tex. Resize wird vom Aufrufer über die Output-Größe
+// aufgefangen. *psh wird durch das Hook-Ergebnis ersetzt; repr/color aktualisiert.
+static bool kk_apply_hooks(struct kk_renderer *kr, pl_shader *psh, int w, int h,
+                           enum pl_hook_stage stage, const struct pl_frame *image,
+                           struct pl_color_repr *repr, struct pl_color_space *color,
+                           const struct pl_render_params *params)
 {
     for (int n = 0; n < params->num_hooks; n++) {
         const struct pl_hook *hook = params->hooks[n];
-        if (!(hook->stages & PL_HOOK_RGB))
+        if (!(hook->stages & stage))
             continue;
 
         struct pl_hook_params hp = {
             .gpu = kr->gpu, .dispatch = kr->dp,
             .get_tex = kk_get_hook_tex, .priv = kr,
-            .stage = PL_HOOK_RGB,
+            .stage = stage,
             .rect = { 0, 0, w, h },
             .repr = *repr, .color = *color,
             .orig_repr = &image->repr, .orig_color = &image->color,
@@ -282,10 +282,10 @@ static bool kk_build_rgb(struct kk_renderer *kr,
     struct pl_color_repr repr = image->repr;
     pl_shader_decode_color(sh, &repr, NULL);
 
-    // RGB/MAIN-Stage-Hooks (CAS) — VOR Linearize, wie Stock (PL_HOOK_RGB:1959,
-    // vor pass_scale_main). Aktualisiert sh + repr/col.
+    // RGB/MAIN-Stage-Hooks (CAS, Anime4K-Restore) — VOR Linearize, wie Stock
+    // (PL_HOOK_RGB:1959, vor pass_scale_main). Aktualisiert sh + repr/col.
     struct pl_color_space col = image->color;
-    if (!kk_apply_rgb_hooks(kr, &sh, w, h, image, &repr, &col, params))
+    if (!kk_apply_hooks(kr, &sh, w, h, PL_HOOK_RGB, image, &repr, &col, params))
         return false;
 
     // Linearize/Sigmoidize VOR dem Bake, falls der Scaler in Linearlicht läuft
@@ -294,6 +294,12 @@ static bool kk_build_rgb(struct kk_renderer *kr,
         pl_shader_linearize(sh, &col);
     if (use_sigmoid)
         pl_shader_sigmoidize(sh, params->sigmoid_params);
+
+    // PRE_KERNEL-Stage-Hooks (Anime4K) — nach Linearize/Sigmoid, unmittelbar vor
+    // dem Scaler (Stock pass_scale_main:2062). Anime4K-Mode-A resized nicht
+    // (HEIGHT MAIN.h) -> rgb_tex bleibt w×h; der Main-Scaler macht den 2x-Upscale.
+    if (!kk_apply_hooks(kr, &sh, w, h, PL_HOOK_PRE_KERNEL, image, &repr, &col, params))
+        return false;
 
     if (!pl_dispatch_finish(kr->dp, pl_dispatch_params(
             .shader = &sh, .target = kr->rgb_tex)))
