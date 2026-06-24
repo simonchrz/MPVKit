@@ -244,6 +244,84 @@ static bool hybrid_wrap_pixbuf(struct hybrid_priv *p, CVPixelBufferRef pb,
     return true;
 }
 
+// TEMP (AOT-Schritt 4): füllt den MSL-Cache device-nativ über das volle kk-Combo-
+// Kreuzprodukt (prozeduraler Frame; Pixelinhalt egal — nur die Param-Combos
+// bestimmen die GLSL). Speichert danach den Cache. Logt die Shader-Zahl.
+static void kk_cap_planes(pl_gpu gpu, int w, int h, int hdr, struct pl_frame *out, pl_tex tx[2])
+{
+    int cw=w/2, ch=h/2;
+    if (hdr) {
+        uint16_t *yp=malloc((size_t)w*h*2), *cp=malloc((size_t)cw*ch*2*2);
+        for (int i=0;i<w*h;i++) yp[i]=(uint16_t)(((i*977)&1023)<<6);
+        for (int i=0;i<cw*ch;i++){ cp[i*2]=(uint16_t)(((i*131)&1023)<<6); cp[i*2+1]=(uint16_t)(((i*419)&1023)<<6); }
+        pl_tex ty=pl_tex_create(gpu,pl_tex_params(.w=w,.h=h,.format=pl_find_named_fmt(gpu,"r16"),.sampleable=true,.initial_data=yp));
+        pl_tex tc=pl_tex_create(gpu,pl_tex_params(.w=cw,.h=ch,.format=pl_find_named_fmt(gpu,"rg16"),.sampleable=true,.initial_data=cp));
+        free(yp);free(cp);
+        *out=(struct pl_frame){.num_planes=2,
+            .planes[0]={.texture=ty,.components=1,.component_mapping={PL_CHANNEL_Y}},
+            .planes[1]={.texture=tc,.components=2,.component_mapping={PL_CHANNEL_CB,PL_CHANNEL_CR}},
+            .repr={.sys=PL_COLOR_SYSTEM_BT_2020_NC,.levels=PL_COLOR_LEVELS_LIMITED,.bits={16,10,6}},
+            .color={.primaries=PL_COLOR_PRIM_BT_2020,.transfer=PL_COLOR_TRC_PQ},.crop={0,0,w,h}};
+        tx[0]=ty;tx[1]=tc;
+    } else {
+        unsigned char *yp=malloc((size_t)w*h), *cp=malloc((size_t)cw*ch*2);
+        for (int i=0;i<w*h;i++) yp[i]=(unsigned char)(i*7);
+        for (int i=0;i<cw*ch;i++){ cp[i*2]=(unsigned char)(i*3); cp[i*2+1]=(unsigned char)(i*5); }
+        pl_tex ty=pl_tex_create(gpu,pl_tex_params(.w=w,.h=h,.format=pl_find_named_fmt(gpu,"r8"),.sampleable=true,.initial_data=yp));
+        pl_tex tc=pl_tex_create(gpu,pl_tex_params(.w=cw,.h=ch,.format=pl_find_named_fmt(gpu,"rg8"),.sampleable=true,.initial_data=cp));
+        free(yp);free(cp);
+        *out=(struct pl_frame){.num_planes=2,
+            .planes[0]={.texture=ty,.components=1,.component_mapping={PL_CHANNEL_Y}},
+            .planes[1]={.texture=tc,.components=2,.component_mapping={PL_CHANNEL_CB,PL_CHANNEL_CR}},
+            .repr={.sys=PL_COLOR_SYSTEM_BT_709,.levels=PL_COLOR_LEVELS_LIMITED},
+            .color={.primaries=PL_COLOR_PRIM_BT_709,.transfer=PL_COLOR_TRC_BT_1886},.crop={0,0,w,h}};
+        tx[0]=ty;tx[1]=tc;
+    }
+    pl_frame_set_chroma_location(out, PL_CHROMA_LEFT);
+}
+
+static void kk_capture_all(struct hybrid_priv *p)
+{
+    const char *shdir = getenv("KUCKUCK_KK_CAPTURE_SHADERS");
+    if (!shdir) { fprintf(stderr, "[kk-capture] KUCKUCK_KK_CAPTURE_SHADERS fehlt\n"); return; }
+    const char *shaders[]={ NULL,"cas.glsl","anime4k_mode_a_mobile.glsl","anime4k_mode_a_m.glsl",
+                            "ArtCNN_C4F16.glsl","artcnn_ds_cas.glsl","fsrcnnx_x2_8.glsl" };
+    double scales[]={0.25,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0,1.2,1.5,2.0,3.0};
+    static const struct pl_deband_params dbp={.iterations=2,.threshold=4,.radius=16,.grain=0};
+    int W=640,H=360, renders=0;
+    pl_fmt rgba8=pl_find_named_fmt(p->gpu,"rgba8"), rgba16f=pl_find_named_fmt(p->gpu,"rgba16f");
+    for (int hdr=0;hdr<2;hdr++)
+    for (int si=0; si<(int)(sizeof(shaders)/sizeof(*shaders)); si++)
+    for (int oi=0; oi<2; oi++)
+    for (int di=0; di<2; di++)
+    for (int sc=0; sc<(int)(sizeof(scales)/sizeof(*scales)); sc++) {
+        struct pl_frame img; pl_tex tx[2]; kk_cap_planes(p->gpu, W, H, hdr, &img, tx);
+        int ow=(int)(W*scales[sc]), oh=(int)(H*scales[sc]);
+        pl_tex out=pl_tex_create(p->gpu,pl_tex_params(.w=ow,.h=oh,.format=hdr?rgba16f:rgba8,.renderable=true,.storable=true));
+        struct pl_frame target={.num_planes=1,.planes[0]={.texture=out,.components=4,.component_mapping={0,1,2,3}},
+            .repr=pl_color_repr_rgb,.color=hdr?pl_color_space_hdr10:pl_color_space_srgb,.crop={0,0,ow,oh}};
+        struct pl_render_params rp=pl_render_high_quality_params;
+        rp.error_diffusion=&pl_error_diffusion_sierra_lite;
+        rp.deband_params = di ? &dbp : NULL;
+        rp.peak_detect_params = hdr ? &pl_peak_detect_high_quality_params : NULL;
+        if (oi) rp.upscaler=&pl_filter_lanczos;
+        const struct pl_hook *hook=NULL;
+        if (shaders[si]) { char path[1024]; snprintf(path,sizeof path,"%s/%s",shdir,shaders[si]);
+            FILE *f=fopen(path,"rb"); if(f){fseek(f,0,SEEK_END);long n=ftell(f);fseek(f,0,SEEK_SET);
+                char *b=malloc(n+1);size_t r=fread(b,1,n,f);b[r]=0;fclose(f);
+                hook=pl_mpv_user_shader_parse(p->gpu,b,r);free(b); if(hook){rp.hooks=&hook;rp.num_hooks=1;}}}
+        if (!(p->kk && kk_render_image(p->kk,&img,&target,&rp)))
+            pl_render_image(p->rr,&img,&target,&rp);
+        pl_gpu_finish(p->gpu);
+        renders++;
+        if (hook) pl_mpv_user_shader_destroy(&hook);
+        pl_tex_destroy(p->gpu,&out); pl_tex_destroy(p->gpu,&tx[0]); pl_tex_destroy(p->gpu,&tx[1]);
+    }
+    if (p->cache) { char path[PATH_MAX]; if (kk_cache_file_path(path,sizeof path)) {
+        FILE *f=fopen(path,"wb"); if(f){pl_cache_save_file(p->cache,f);fclose(f);} } }
+    fprintf(stderr, "[kk-capture] %d renders fertig, Cache gespeichert\n", renders);
+}
+
 void *kuckuck_hybrid_create(void *mtl_device)
 {
     if (!mtl_device)
@@ -296,6 +374,12 @@ void *kuckuck_hybrid_create(void *mtl_device)
         if (kkenv && kkenv[0] == '1')
             p->kk = kk_renderer_create(p->pllog, p->gpu);
     }
+
+    // TEMP (AOT-Schritt 4): On-Device-Shader-Capture. KUCKUCK_KK_CAPTURE=1 +
+    // KUCKUCK_KK_CAPTURE_SHADERS=<Resources-Dir> -> rendert das volle Combo-
+    // Kreuzprodukt durch kk, füllt den (persistenten) MSL-Cache device-nativ.
+    if (p->kk && getenv("KUCKUCK_KK_CAPTURE"))
+        kk_capture_all(p);
 
     return p;
 

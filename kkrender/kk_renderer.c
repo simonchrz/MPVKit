@@ -474,6 +474,12 @@ static bool kk_build_rgb(struct kk_renderer *kr,
         if (!pl_dispatch_compute(kr->dp, pl_dispatch_compute_params(
                 .shader = &dsh, .width = w, .height = h)))
             return false;
+    } else {
+        // Keine Peak-Detection -> einen evtl. noch im State stehenden Peak (von
+        // einem früheren HDR-Frame / Capture) löschen, sonst biast er das SDR-
+        // color_map (-> zu dunkel). Stock: hdr_update_peak cleanup-Label.
+        if (kr->tone_map_state)
+            pl_reset_detected_peak(kr->tone_map_state);
     }
     return true;
 }
