@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 
 #include <libplacebo/dispatch.h>
 #include <libplacebo/gpu.h>
@@ -34,6 +35,23 @@
 #include <libplacebo/shaders/custom.h>
 
 #include "kk_renderer.h"
+
+// TEMP Pass-Timing (env KUCKUCK_PASS_TIMING): isoliert pro Pass via pl_gpu_finish
+// + CPU-Monotonic-Clock (Metal-pl_timer misst nur CB-Ebene -> chroma==rgb). Das
+// Finish serialisiert -> Lap-Summe > echter pipelined Total, aber die Pass-AUFTEILUNG
+// ist exakt (echten Total misst hybrid.log ohne Laps). g_timing: -1 ungeprüft, 0/1.
+static int g_timing = -1;
+static uint64_t g_last_ns, g_acc_luma, g_acc_chroma, g_acc_rgb, g_acc_scale;
+static int g_lap_n;
+static uint64_t kk_mono_ns(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000000ull + ts.tv_nsec;
+}
+static void kk_lap(pl_gpu gpu, uint64_t *acc) {
+    if (g_timing != 1) return;
+    pl_gpu_finish(gpu);
+    uint64_t now = kk_mono_ns(); *acc += now - g_last_ns; g_last_ns = now;
+}
 
 struct kk_renderer {
     pl_gpu gpu;
@@ -346,6 +364,7 @@ static bool kk_build_rgb(struct kk_renderer *kr,
     pl_tex ltex = luma->texture, ctex = chroma->texture;
     const int w = ltex->params.w, h = ltex->params.h;
     const int cw = ctex->params.w, ch = ctex->params.h;
+    if (g_timing == 1) g_last_ns = kk_mono_ns(); // Pass-Timing-Startmarke
 
     // (0) Deband pro Plane (Stock plane_deband, VOR Hooks). Normalisiert die Plane
     // -> decode_color nutzt das angepasste drepr. neutral = grain-Neutralpunkt.
@@ -376,6 +395,7 @@ static bool kk_build_rgb(struct kk_renderer *kr,
     if (!luma_src)
         return false; // Hook-Fehler -> Fallback auf Stock
     const int mw = luma_src->params.w, mh = luma_src->params.h;
+    kk_lap(kr->gpu, &g_acc_luma); // = Deband + LUMA-Hooks (ArtCNN/FSRCNNX)
 
     // up/down (und damit sigmoid/linear) gegen die ECHTE Luma-Res mw×mh bestimmen —
     // ein 2x-CNN-Resize kann die Scale-Richtung kippen (z.B. 720p->1080: vorher up,
@@ -393,7 +413,13 @@ static bool kk_build_rgb(struct kk_renderer *kr,
     // (1) Chroma auf Luma-Res mit params->upscaler (Stock SAMPLER_PLANE/UP,
     // renderer.c:643). Shift aus der Plane. Polarer Filter (ewa) -> 1 Pass;
     // separabler Filter (lanczos, HD-Light) -> ortho X-dann-Y (Shift aufgeteilt).
-    const struct pl_filter_config *cf = params->upscaler;
+    // CHROMA-LIGHT (Default AN, env KUCKUCK_CHROMA_LIGHT=0 -> voller ewa-Upscaler):
+    // Chroma mit pl_filter_bilinear (separabel, 2-Tap-Triangle) statt dem teuren
+    // polaren ewa_lanczossharp. Läuft über den bewährten ortho-Pfad (X+Y). Chroma
+    // ist halbaufgelöst + perzeptuell tolerant -> ~4ms -> ~1-1.5ms, kaum sichtbar.
+    const char *clenv = getenv("KUCKUCK_CHROMA_LIGHT");
+    bool chroma_light = !clenv || clenv[0] != '0';
+    const struct pl_filter_config *cf = chroma_light ? &pl_filter_bilinear : params->upscaler;
     float rx = (float) cw / w, ry = (float) ch / h;
     float sx = chroma->shift_x, sy = chroma->shift_y;
     // Output-Res = mw×mh (echte Luma-Res); rect bleibt in Chroma-INPUT-Koordinaten
@@ -431,6 +457,7 @@ static bool kk_build_rgb(struct kk_renderer *kr,
         if (!pl_dispatch_finish(kr->dp, pl_dispatch_params(.shader=&cy, .target=kr->chroma_tex)))
             return false;
     }
+    kk_lap(kr->gpu, &g_acc_chroma); // = Chroma-Upscale auf Luma-Res
 
     // (2) Merge beider Planes (beide w×h, 1:1) -> vec4(Y,Cb,Cr,1), dann decode.
     pl_shader sh = pl_dispatch_begin(kr->dp);
@@ -476,6 +503,7 @@ static bool kk_build_rgb(struct kk_renderer *kr,
     if (!pl_dispatch_finish(kr->dp, pl_dispatch_params(
             .shader = &sh, .target = kr->rgb_tex)))
         return false;
+    kk_lap(kr->gpu, &g_acc_rgb); // = Merge + decode_color + RGB/PRE_KERNEL-Hooks (CAS/Anime4K)
 
     // HDR-Peak-Detection (Stock hdr_update_peak): Compute-Side-Effect schreibt
     // in tone_map_state, das color_map_ex liest. allow_delayed=false -> muss vor
@@ -558,6 +586,18 @@ bool kk_render_image(struct kk_renderer *kr,
 
     kr->hook_fbo_used = 0; // Hook-Scratch-Pool pro Frame zurücksetzen
 
+    if (g_timing < 0)
+        g_timing = getenv("KUCKUCK_PASS_TIMING") ? 1 : 0;
+    if (g_timing == 1 && ++g_lap_n >= 120) { // alle 120 Frames mitteln + reset
+        const char *h = getenv("HOME");
+        if (h) { char p[1024]; snprintf(p, sizeof p, "%s/Documents/kk-passtiming.log", h);
+            FILE *f = fopen(p, "a"); if (f) {
+                fprintf(f, "luma-cnn=%.2f chroma=%.2f rgb+merge+hooks=%.2f scale+colormap=%.2f ms (avg/%d)\n",
+                        g_acc_luma/1e6/g_lap_n, g_acc_chroma/1e6/g_lap_n,
+                        g_acc_rgb/1e6/g_lap_n, g_acc_scale/1e6/g_lap_n, g_lap_n); fclose(f); } }
+        g_acc_luma = g_acc_chroma = g_acc_rgb = g_acc_scale = 0; g_lap_n = 0;
+    }
+
     pl_tex target_tex = target->planes[0].texture;
     const int tw = target_tex->params.w, th = target_tex->params.h;
 
@@ -616,10 +656,12 @@ bool kk_render_image(struct kk_renderer *kr,
     }
 
     // --- Stufe 5: Output -> Swapchain (aspect-fit crop, blend) ------------
-    return pl_dispatch_finish(kr->dp, pl_dispatch_params(
+    bool ok = pl_dispatch_finish(kr->dp, pl_dispatch_params(
         .shader       = &sh,
         .target       = target_tex,
         .rect         = rc,
         .blend_params = params->blend_params,
     ));
+    kk_lap(kr->gpu, &g_acc_scale); // = Main-Scale + color_map + dither + output
+    return ok;
 }
