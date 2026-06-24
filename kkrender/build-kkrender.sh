@@ -13,13 +13,19 @@ build_slice() {  # build_slice <sdk> <min-flag> <plinc> <spvcdir> <outdir>
   local sysroot; sysroot="$(xcrun --sdk "$sdk" --show-sdk-path)"
   for src in hybrid_render kk_renderer; do
     "$CLANG" -c "$ROOT/$src.c" -o "$od/$src.o" \
-      -arch arm64 -isysroot "$sysroot" "$min" \
+      -arch arm64 -isysroot "$sysroot" "$min" ${KK_AOT:+-DKK_AOT} \
       -I"$plinc" -I"$ROOT" -Wall -O2 -fno-common
   done
   # hybrid_render.o + kk_renderer.o + spirv-cross (libplacebo-Metal braucht spvc_*
   # zur Laufzeit; früher in libmpv.a gemergt → jetzt hier, da libmpv wegfällt).
-  "$LIBTOOL" -static -o "$od/libkkrender.a" \
-    "$od/hybrid_render.o" "$od/kk_renderer.o" "$spvc"/*.a
+  # KK_AOT=1: kein Runtime-Compiler -> spirv-cross NICHT mergen (~Größen-Schnitt).
+  if [ -n "${KK_AOT:-}" ]; then
+    "$LIBTOOL" -static -o "$od/libkkrender.a" \
+      "$od/hybrid_render.o" "$od/kk_renderer.o"
+  else
+    "$LIBTOOL" -static -o "$od/libkkrender.a" \
+      "$od/hybrid_render.o" "$od/kk_renderer.o" "$spvc"/*.a
+  fi
   echo "built $od/libkkrender.a (hybrid=$(nm "$od/libkkrender.a" 2>/dev/null | grep -c ' T _kuckuck_hybrid') spvc=$(nm "$od/libkkrender.a" 2>/dev/null | grep -c ' T _spvc_'))"
 }
 

@@ -286,7 +286,14 @@ static void kk_capture_all(struct hybrid_priv *p)
     if (!shdir) { fprintf(stderr, "[kk-capture] KUCKUCK_KK_CAPTURE_SHADERS fehlt\n"); return; }
     const char *shaders[]={ NULL,"cas.glsl","anime4k_mode_a_mobile.glsl","anime4k_mode_a_m.glsl",
                             "ArtCNN_C4F16.glsl","artcnn_ds_cas.glsl","fsrcnnx_x2_8.glsl" };
-    double scales[]={0.25,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0,1.2,1.5,2.0,3.0};
+    // DICHTER Downscale-Sweep (0.30..1.0 in 0.02-Schritten): der Polar-/Ortho-
+    // Downscaler unrollt die Tap-Schleife je Ratio (ceil(radius/scale)) -> jeder
+    // Tap-Bound = eigener Shader; grobe Sweeps lassen Lücken (-> KK_AOT-Schwarz).
+    // + Upscale-Punkte >1.3 aktivieren die WHEN-geguardeten LUMA-Hook-CNNs.
+    double scales[64]; int ns=0;
+    for (double s=0.30; s<=1.001; s+=0.02) scales[ns++]=s;
+    double up[]={1.1,1.2,1.3,1.5,1.8,2.0,2.3,2.6,3.0,3.5,4.0};
+    for (int i=0;i<(int)(sizeof(up)/sizeof(*up));i++) scales[ns++]=up[i];
     static const struct pl_deband_params dbp={.iterations=2,.threshold=4,.radius=16,.grain=0};
     int W=640,H=360, renders=0;
     pl_fmt rgba8=pl_find_named_fmt(p->gpu,"rgba8"), rgba16f=pl_find_named_fmt(p->gpu,"rgba16f");
@@ -294,7 +301,7 @@ static void kk_capture_all(struct hybrid_priv *p)
     for (int si=0; si<(int)(sizeof(shaders)/sizeof(*shaders)); si++)
     for (int oi=0; oi<2; oi++)
     for (int di=0; di<2; di++)
-    for (int sc=0; sc<(int)(sizeof(scales)/sizeof(*scales)); sc++) {
+    for (int sc=0; sc<ns; sc++) {
         struct pl_frame img; pl_tex tx[2]; kk_cap_planes(p->gpu, W, H, hdr, &img, tx);
         int ow=(int)(W*scales[sc]), oh=(int)(H*scales[sc]);
         pl_tex out=pl_tex_create(p->gpu,pl_tex_params(.w=ow,.h=oh,.format=hdr?rgba16f:rgba8,.renderable=true,.storable=true));
@@ -352,6 +359,18 @@ void *kuckuck_hybrid_create(void *mtl_device)
     ));
     if (p->cache) {
         char path[PATH_MAX];
+        // 1) Geshippter Bundle-Cache (eviction-immun) als Basis. PFLICHT unter
+        //    KK_AOT: Library/Caches kann von iOS geräumt werden -> ohne Bundle-
+        //    Cache + ohne Compiler = schwarz. Bundle-Pfad via App-Env (resourcePath).
+        const char *res = getenv("KUCKUCK_KK_CAPTURE_SHADERS");
+        if (res) {
+            char bp[PATH_MAX];
+            if (snprintf(bp, sizeof(bp), "%s/render_pl_msl.cache", res) < (int) sizeof(bp)) {
+                FILE *bf = fopen(bp, "rb");
+                if (bf) { pl_cache_load_file(p->cache, bf); fclose(bf); }
+            }
+        }
+        // 2) Akkumulierter Caches-Cache obendrauf (merge; nicht-AOT-Warm-Launch).
         if (kk_cache_file_path(path, sizeof(path))) {
             FILE *f = fopen(path, "rb");
             if (f) { pl_cache_load_file(p->cache, f); fclose(f); }
