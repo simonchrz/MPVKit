@@ -23,7 +23,11 @@ let package = Package(
                 // Video läuft komplett über den AVPlayer-Hybrid (Decode = AVPlayer,
                 // Render = kuckuck_hybrid_render aus Libkkrender → libplacebo). Nur
                 // der GPU-Render-Stack bleibt.
-                "Libkkrender", "Libplacebo", "Libshaderc_combined", "lcms2", "Libdovi", "MoltenVK",
+                // KK_AOT: Libshaderc_combined (shaderc+glslang) ENTFERNT — der AOT-
+                // Render-Pfad hat keinen Runtime-GLSL→SPIR-V→MSL-Compiler mehr
+                // (libplacebo -Dkk-aot=true + Libkkrender ohne spvc-Merge); gerendert
+                // wird nur aus dem gebündelten MSL-Cache. ~8,6 MB Code gespart.
+                "Libkkrender", "Libplacebo", "lcms2", "Libdovi", "MoltenVK",
             ],
             path: "Sources/_MPVKit",
             linkerSettings: [
@@ -260,8 +264,11 @@ let package = Package(
             // renderpl.40 = kuckuck-prod-6: prod-5 hatte die Picks VERLOREN
             // (von metal-pr-series getaggt) → !861 upstream-final (2d0979fb)
             // + !859-Re-Pick wiederhergestellt. apiver 365 unverändert.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.40/Libplacebo.xcframework.zip",
-            checksum: "91a5c712ffddedb124a63bc720dbabf3bcfd7907ea8bac4a54ebd76b38b9850f"
+            // renderpl.58 = kuckuck-prod-7 (= prod-6 + KK_AOT, HDR-Picks erhalten)
+            // mit -Dkk-aot=true: shaderc/SPIRV-Cross gedroppt, rendert nur aus dem
+            // gebündelten MSL-Cache. apiver 365 unverändert.
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.58/Libplacebo.xcframework.zip",
+            checksum: "c4c8a1437603d24e28ad2bb97d2fb0df44183e30b4e8f7fdce113a43e23bdb74"
         ),
         .binaryTarget(
             name: "Libkkrender",
@@ -269,8 +276,10 @@ let package = Package(
             // extrahiert aus libmpvs render_pl.c + spirv-cross reingemergt (libplacebo-
             // Metal braucht spvc_* zur Laufzeit). Ersetzt Libmpv für den App-Render →
             // libmpv/FFmpeg/libcurl fallen weg. Gebaut von kkrender/build-kkrender.sh.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.57/Libkkrender.xcframework.zip",
-            checksum: "40e7a1040d6a88b70c4b3b1aa5adcdede49dcf795a6e7fa24d3e88fdcf6a7171"
+            // renderpl.58 = KK_AOT=1: OHNE spirv-cross-Merge (30K), Render aus dem
+            // gebündelten MSL-Cache — passt zur AOT-libplacebo derselben Version.
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.58/Libkkrender.xcframework.zip",
+            checksum: "7bf97e6d811e9c89d39966c31e1bd9af968dcad130339084cfda35ca09ecef10"
         ),
 
         .binaryTarget(

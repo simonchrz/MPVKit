@@ -115,7 +115,11 @@ enum Library: String, CaseIterable {
             // + upstream-FINAL von !861 (2d0979fb, gemerged 2026-06-10, ersetzt
             // unsere v1) + !859-Re-Pick. Lehre: Tags von prod-N schneiden, nie
             // von metal-pr-series direkt.
-            return "kuckuck-prod-6"
+            // prod-7 = prod-6 + KK_AOT (cherry-pick der 2 AOT-Commits AUF prod-6,
+            // damit die HDR-Picks erhalten bleiben — NICHT von metal-pr-series!):
+            // -Dkk-aot droppt shaderc/SPIRV-Cross, Cache-Key = nur GLSL-Hash.
+            // Nur mit KK_AOT=1 im Env baut der AOT-Pfad (sonst prod-6-identisch).
+            return "kuckuck-prod-7"
         case .libdovi:
             return "3.3.2"
         case .vulkan:
@@ -951,12 +955,19 @@ private class BuildPlacebo: BaseBuild {
     // spirv-cross (both discovered via the platform pkg-config path). Other
     // GPU backends and optional deps are off to keep the static lib lean.
     override func arguments(platform: PlatformType, arch: ArchType) -> [String] {
-        [
+        var array = [
             "-Dmetal=enabled",
             "-Dvulkan=disabled", "-Dopengl=disabled", "-Dd3d11=disabled",
             "-Dlcms=disabled", "-Ddovi=disabled", "-Dxxhash=disabled",
             "-Dunwind=disabled", "-Ddemos=false", "-Dtests=false",
         ]
+        // KK_AOT=1 (Kuckuck): drop the runtime GLSL->SPIR-V->MSL toolchain
+        // (shaderc + SPIRV-Cross). Renders solely from the shipped MSL cache.
+        // Same switch as build-kkrender.sh (spvc-merge drop). See [[kk_renderer_strangler]].
+        if ProcessInfo.processInfo.environment["KK_AOT"] != nil {
+            array.append("-Dkk-aot=true")
+        }
+        return array
     }
 
     // vulkan_stubs.c #includes <vulkan/vulkan.h> for ABI even when the Vulkan
