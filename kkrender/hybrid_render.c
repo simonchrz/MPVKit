@@ -381,6 +381,17 @@ int kuckuck_hybrid_render(void *ctx, void *cv_pixbuf, void *target_texture)
         return -1;
     CVPixelBufferRef pb = (CVPixelBufferRef) cv_pixbuf;
 
+    // Gated kk_gpu-Render-Pfad (libplacebo-Ablösung, Strangler). Default AUS
+    // (KUCKUCK_KK_GPU=1). Handhabt SDR-NV12 nativ + zero-copy ins Target; sonst false
+    // -> Fallback auf den libplacebo-Pfad unten. On-Device-A/B gegen pl_render_image.
+    {
+        extern bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture);
+        static int kkgpu = -1;
+        if (kkgpu < 0) { const char *e = getenv("KUCKUCK_KK_GPU"); kkgpu = (e && e[0] == '1') ? 1 : 0; }
+        if (kkgpu && p->metal && kk_gpu_render(p->metal->device, cv_pixbuf, target_texture))
+            return 0;
+    }
+
     kk_apply_user_shader(p->gpu, &p->rparams, &p->user_hook, &p->user_shader_path);
     kk_apply_deband(&p->rparams, &p->deband_mode);
 

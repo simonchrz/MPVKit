@@ -106,6 +106,20 @@ void kk_gpu_finish(kk_gpu *g) {
     }
 }
 
+// Texture->Texture-Copy (z.B. eigener Render-Output -> Display-Target ohne ShaderWrite).
+void kk_gpu_blit(kk_gpu *g, kk_tex *src, kk_tex *dst) {
+    @autoreleasepool {
+        if (!g->cb) { g->cb = [g->queue commandBuffer]; CFRetain((__bridge CFTypeRef) g->cb); }
+        if (g->enc) { [g->enc endEncoding]; CFRelease((__bridge CFTypeRef) g->enc); g->enc = nil; }
+        id<MTLBlitCommandEncoder> be = [g->cb blitCommandEncoder];
+        int w = src->w < dst->w ? src->w : dst->w, h = src->h < dst->h ? src->h : dst->h;
+        [be copyFromTexture:src->tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+                 sourceSize:MTLSizeMake(w,h,1) toTexture:dst->tex destinationSlice:0
+           destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+        [be endEncoding];
+    }
+}
+
 kk_tex *kk_tex_create(kk_gpu *g, int w, int h, kk_fmt fmt, uint32_t usage,
                       const void *initial_data) {
     @autoreleasepool {

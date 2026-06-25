@@ -41,6 +41,7 @@ kk_gpu *kk_gpu_create(void *mtl_device);
 void    kk_gpu_destroy(kk_gpu **pgpu);
 void   *kk_gpu_mtl_device(kk_gpu *gpu);   // id<MTLDevice> für Interop
 void    kk_gpu_finish(kk_gpu *gpu);       // blockt bis GPU fertig (Bench/Download)
+void    kk_gpu_blit(kk_gpu *gpu, kk_tex *src, kk_tex *dst); // Texture-Copy (Render-Out -> Target)
 
 // --- Texturen -------------------------------------------------------------
 kk_tex *kk_tex_create(kk_gpu *gpu, int w, int h, kk_fmt fmt, uint32_t usage,

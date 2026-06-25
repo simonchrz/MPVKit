@@ -1,0 +1,95 @@
+// kk_gpu_render.c — GATED Prod-SDR-Render-Pfad auf kk_gpu (libplacebo-frei).
+// Strangler-Einstieg: kuckuck_hybrid_render ruft kk_gpu_render() bei KUCKUCK_KK_GPU=1;
+// handhabt NUR SDR-NV12 (sonst false -> Fallback auf pl_render_image). Pipeline (alle
+// Pässe headless gegen libplacebo verifiziert): YUV-Decode(709 limited) -> linearize
+// (BT.1886) -> Lanczos-Scale-in-Linear -> delinearize(sRGB) -> eigener BGRA-Output ->
+// Blit zum Display-Target (umgeht ShaderWrite-Usage-Frage).
+//
+// ⚠️ STARTCODE — ON-DEVICE ZU VALIDIEREN + ERWEITERN. Default AUS (Env-gated).
+// Offen für Voll-Deckung: echte Color-Params (hybrid_trc/prim/matrix statt 709/1886/sRGB
+// hartcodiert) · Sigmoid-Upscale · Deband · HDR (P010 -> IPT-color_map) · CNN-Hooks ·
+// EWA statt Lanczos. Alle als verifizierte Bausteine vorhanden (iq-harness/kk_*_ab).
+#include "kk_gpu.h"
+#include <CoreVideo/CoreVideo.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+static const char *DECLIN_MSL =
+"#include <metal_stdlib>\nusing namespace metal;\n"
+"kernel void dec(texture2d<float> luma [[texture(0)]], texture2d<float> chroma [[texture(1)]],\n"
+"  texture2d<float,access::write> dst [[texture(2)]], sampler near [[sampler(0)]], sampler lin [[sampler(1)]],\n"
+"  constant float2& ab [[buffer(0)]], uint2 id [[thread_position_in_grid]]){ uint w=dst.get_width(),h=dst.get_height(); if(id.x>=w||id.y>=h)return;\n"
+"  float2 uv=(float2(id)+0.5)/float2(w,h); float Yr=luma.read(id).r; float2 C=chroma.sample(lin,uv).rg;\n"
+"  float Y=(Yr*255.0-16.0)/219.0,Cb=(C.r*255.0-128.0)/224.0,Cr=(C.g*255.0-128.0)/224.0;\n" // BT.709 limited
+"  float3 rgb=max(float3(Y+1.5748*Cr,Y-0.1873*Cb-0.4681*Cr,Y+1.8556*Cb),0.0);\n"
+"  dst.write(float4(ab.x*pow(rgb+ab.y,float3(2.4)),1.0),id);}\n"; // BT.1886 a*pow(c+b,2.4)
+static const char *LANCZOS_MSL =
+"#include <metal_stdlib>\nusing namespace metal;\nstruct P{float scale;uint axis;};\n"
+"static inline float sinc(float x){if(x==0.0)return 1.0;x*=M_PI_F;return sin(x)/x;}\n"
+"static inline float l3(float x){x=abs(x);if(x>=3.0)return 0.0;return sinc(x)*sinc(x/3.0);}\n"
+"kernel void lanczos(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
+"  constant P& p [[buffer(0)]], uint2 id [[thread_position_in_grid]]){ uint W=dst.get_width(),H=dst.get_height(); if(id.x>=W||id.y>=H)return;\n"
+"  int sw=int(src.get_width()),sh=int(src.get_height()); float coord=(p.axis==0u?float(id.x):float(id.y));\n"
+"  float s=(coord+0.5)/p.scale-0.5; int base=int(floor(s)); float4 acc=float4(0.0); float wsum=0.0;\n"
+"  for(int t=-3;t<=4;t++){ int tap=base+t; float w=l3(s-float(tap));\n"
+"    int cx=(p.axis==0u)?clamp(tap,0,sw-1):int(id.x); int cy=(p.axis==1u)?clamp(tap,0,sh-1):int(id.y);\n"
+"    acc+=w*src.read(uint2(cx,cy)); wsum+=w; } dst.write(acc/wsum,id);}\n";
+static const char *DELIN_MSL =
+"#include <metal_stdlib>\nusing namespace metal;\n"
+"static inline float srgb(float c){ return c<=0.0031308 ? 12.92*c : 1.055*pow(c,1.0/2.4)-0.055; }\n"
+"kernel void delin(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
+"  uint2 id [[thread_position_in_grid]]){ uint w=dst.get_width(),h=dst.get_height(); if(id.x>=w||id.y>=h)return;\n"
+"  float3 c=clamp(src.read(id).rgb,0.0,1.0); dst.write(float4(srgb(c.r),srgb(c.g),srgb(c.b),1.0),id);}\n";
+
+static kk_gpu *g_kk = NULL;  // lazy, teilt libplacebos Device
+
+// true = von kk_gpu gerendert; false = Fallback auf pl_render_image.
+bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture) {
+    CVPixelBufferRef pb = (CVPixelBufferRef) cv_pixbuf;
+    if (!pb || !target_texture) return false;
+    OSType pf = CVPixelBufferGetPixelFormatType(pb);
+    // Nur SDR-NV12 (8-bit biplanar). P010/HDR + andere -> Fallback.
+    if (pf != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange &&
+        pf != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+        return false;
+    IOSurfaceRef surf = CVPixelBufferGetIOSurface(pb);
+    if (!surf) return false;
+
+    if (!g_kk) g_kk = kk_gpu_create(metal_device);  // geteiltes Device
+    if (!g_kk) return false;
+    kk_gpu *g = g_kk;
+
+    kk_tex *luma   = kk_tex_wrap_iosurface(g, (void*)surf, 0, KK_FMT_R8,  KK_TEX_SAMPLE);
+    kk_tex *chroma = kk_tex_wrap_iosurface(g, (void*)surf, 1, KK_FMT_RG8, KK_TEX_SAMPLE);
+    kk_tex *tgt    = kk_tex_wrap_mtltexture(g, target_texture);
+    if (!luma || !chroma || !tgt) {
+        kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt);
+        return false;
+    }
+    int W = kk_tex_w(luma), H = kk_tex_h(luma);
+    int OW = kk_tex_w(tgt), OH = kk_tex_h(tgt);
+    if (W<=0||H<=0||OW<=0||OH<=0) { kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt); return false; }
+
+    kk_tex *lin  = kk_tex_create(g, W,  H,  KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
+    kk_tex *tmpx = kk_tex_create(g, OW, H,  KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
+    kk_tex *liny = kk_tex_create(g, OW, OH, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
+    kk_tex *out  = kk_tex_create(g, OW, OH, KK_FMT_BGRA8,   KK_TEX_STORAGE, NULL); // eigener Output
+
+    float ab[2] = { 0.8704f, 0.0595f };  // BT.1886, csp_min=0.001 -> a=(1-lb)^2.4, b=lb/(1-lb)
+    struct { float scale; uint32_t axis; } px = { (float)OW/W, 0 }, py = { (float)OH/H, 1 };
+    kk_compute_args da = { .out=lin, .in={luma,chroma}, .n_in=2, .linear={false,true}, .uniforms=ab, .uniforms_size=sizeof ab };
+    kk_gpu_compute(g, DECLIN_MSL, "dec", &da);
+    kk_compute_args xa = { .out=tmpx, .in={lin},  .n_in=1, .uniforms=&px, .uniforms_size=sizeof px };
+    kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &xa);
+    kk_compute_args ya = { .out=liny, .in={tmpx}, .n_in=1, .uniforms=&py, .uniforms_size=sizeof py };
+    kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &ya);
+    kk_compute_args la = { .out=out, .in={liny}, .n_in=1 };
+    kk_gpu_compute(g, DELIN_MSL, "delin", &la);
+    kk_gpu_blit(g, out, tgt);            // eigener Output -> Display-Target
+    kk_gpu_finish(g);
+
+    kk_tex_destroy(g,&lin); kk_tex_destroy(g,&tmpx); kk_tex_destroy(g,&liny); kk_tex_destroy(g,&out);
+    kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt);
+    return true;
+}
