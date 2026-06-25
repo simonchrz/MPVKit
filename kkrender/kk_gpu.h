@@ -71,4 +71,12 @@ typedef struct {
 bool kk_gpu_compute(kk_gpu *gpu, const char *msl_source, const char *entry,
                     const kk_compute_args *args);
 
+// HDR-IPT-color_map-Parameter (vom Hook via libplacebo erzeugt, an kk_gpu_render_hdr).
+// 4 Matrizen (rgb2lms[2020], lms2ipt, ipt2lms, lms2rgb[2020]) + Tone-Range + bt2390-LUT.
+typedef struct {
+    float rgb2lms[9], lms2ipt[9], ipt2lms[9], lms2rgb[9];
+    float in_min, in_max, out_min, out_max;   // PQ-skalierte Tonemap-Range
+    float tone_lut[256];                       // bt2390-Tonemap-LUT (I-Werte)
+} kk_hdr_params;
+
 #endif // KK_GPU_H

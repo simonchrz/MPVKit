@@ -18,9 +18,11 @@
 #include <libplacebo/cache.h>
 #include <libplacebo/shaders/custom.h>
 #include <libplacebo/dither.h>
+#include <libplacebo/tone_mapping.h>
 
 #include "render_mtl.h"   // öffentliche kuckuck_hybrid_*-Deklarationen
 #include "kk_renderer.h"  // eigener Render-Pfad (Strangler), env-gated
+#include "kk_gpu.h"       // kk_hdr_params für den HDR-Pfad
 
 struct hybrid_priv {
     pl_log pllog;
@@ -386,11 +388,45 @@ int kuckuck_hybrid_render(void *ctx, void *cv_pixbuf, void *target_texture)
     // -> Fallback auf den libplacebo-Pfad unten. On-Device-A/B gegen pl_render_image.
     {
         extern bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture, const float *yuv2rgb, const float *prim2disp);
+        extern bool kk_gpu_render_hdr(void *metal_device, void *cv_pixbuf, void *target_texture, const kk_hdr_params *hp);
         static int kkgpu = -1;
         if (kkgpu < 0) { const char *e = getenv("KUCKUCK_KK_GPU"); kkgpu = (e && e[0] == '1') ? 1 : 0; }
-        if (kkgpu && p->metal) {
+        OSType pfmt = kkgpu ? CVPixelBufferGetPixelFormatType(pb) : 0;
+        bool isHDR = (pfmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
+                      pfmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange);
+        if (kkgpu && p->metal && isHDR) {
+            // HDR (P010): IPT-Tonemap zum EDR-Peak -> PQ/2020. LUT-Gen gecacht (teuer).
+            static kk_hdr_params hp; static float cached_peak = -1.0f;
+            const char *nits = getenv("KUCKUCK_HDR_TARGET_NITS");
+            float peak = nits ? (float)atof(nits) : 203.0f; if (peak < 1.0f) peak = 203.0f;
+            if (peak != cached_peak) {
+                struct pl_color_space hsrc = { .primaries = PL_COLOR_PRIM_BT_2020, .transfer = PL_COLOR_TRC_PQ,
+                    .hdr = { .max_luma = 1000.0f, .min_luma = 0.005f } };
+                struct pl_color_space hdst = { .primaries = PL_COLOR_PRIM_BT_2020, .transfer = PL_COLOR_TRC_PQ,
+                    .hdr = { .max_luma = peak, .min_luma = 0.005f } };
+                struct pl_color_space si = hsrc, di = hdst; pl_color_space_infer_map(&si, &di);
+                pl_matrix3x3 r2l = pl_ipt_rgb2lms(pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020));
+                pl_matrix3x3 l2r = pl_ipt_lms2rgb(pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020));
+                for (int r=0;r<3;r++) for (int c=0;c<3;c++) { hp.rgb2lms[r*3+c]=r2l.m[r][c];
+                    hp.lms2ipt[r*3+c]=pl_ipt_lms2ipt.m[r][c]; hp.ipt2lms[r*3+c]=pl_ipt_ipt2lms.m[r][c]; hp.lms2rgb[r*3+c]=l2r.m[r][c]; }
+                struct pl_tone_map_params tone = { .function = &pl_tone_map_bt2390, .input_scaling = PL_HDR_PQ,
+                    .output_scaling = PL_HDR_PQ, .lut_size = 256, .hdr = si.hdr };
+                tone.constants = pl_color_map_default_params.tone_constants;
+                pl_color_space_nominal_luma_ex(pl_nominal_luma_params(.color=&si, .metadata=PL_HDR_METADATA_ANY,
+                    .scaling=PL_HDR_PQ, .out_min=&tone.input_min, .out_max=&tone.input_max, .out_avg=&tone.input_avg));
+                pl_color_space_nominal_luma_ex(pl_nominal_luma_params(.color=&di, .metadata=PL_HDR_METADATA_HDR10,
+                    .scaling=PL_HDR_PQ, .out_min=&tone.output_min, .out_max=&tone.output_max));
+                pl_tone_map_params_infer(&tone);
+                hp.in_min=tone.input_min; hp.in_max=tone.input_max; hp.out_min=tone.output_min; hp.out_max=tone.output_max;
+                pl_tone_map_generate(hp.tone_lut, &tone);
+                cached_peak = peak;
+            }
+            if (kk_gpu_render_hdr(p->metal->device, cv_pixbuf, target_texture, &hp))
+                return 0;
+        }
+        if (kkgpu && p->metal && !isHDR) {
             // Echte YUV->RGB-Decode-Matrix aus dem Pixbuf (601/709/2020 + Range) via libplacebo.
-            OSType pf = CVPixelBufferGetPixelFormatType(pb);
+            OSType pf = pfmt;
             bool full = (pf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
             struct pl_color_repr repr = { .sys = hybrid_matrix(pb),
                 .levels = full ? PL_COLOR_LEVELS_FULL : PL_COLOR_LEVELS_LIMITED,

@@ -134,6 +134,39 @@ static const char *DELINU_MSL =
 "  float3 c=src.read(id).rgb; c=1.20778572/(1.0+exp(6.5*(0.75-c)))-0.00914634; c=clamp(c,0.0,1.0);\n"
 "  dst.write(float4(srgb(c.r),srgb(c.g),srgb(c.b),1.0),id);}\n";
 
+// ===== HDR (P010 -> IPT-Tonemap -> PQ/2020-Output) =====
+// MKPQ: BT.2020-limited-10bit-Decode (Y r16 + Chroma rg16) -> PQ-RGB -> PQ-EOTF ->
+// linear (10000-norm). Aus kk_hdr_render_ab (verifiziert).
+static const char *MKPQ_MSL =
+"#include <metal_stdlib>\nusing namespace metal;\n"
+"static inline float3 pqe(float3 e){ const float m1=0.1593017578125,m2=78.84375,c1=0.8359375,c2=18.8515625,c3=18.6875;\n"
+"  float3 ep=pow(max(e,0.0),float3(1.0/m2)); float3 n=max(ep-c1,0.0); float3 d=c2-c3*ep; return pow(n/d,float3(1.0/m1)); }\n"
+"kernel void mk(texture2d<float> y [[texture(0)]],texture2d<float> c [[texture(1)]],texture2d<float,access::write> o [[texture(2)]],\n"
+" sampler near [[sampler(0)]], sampler lin [[sampler(1)]], uint2 id [[thread_position_in_grid]]){uint w=o.get_width(),h=o.get_height();if(id.x>=w||id.y>=h)return;\n"
+" float2 uv=(float2(id)+0.5)/float2(w,h); float Yc=y.read(id).r*65535.0/64.0; float2 C=c.sample(lin,uv).rg*65535.0/64.0;\n"
+" float Y=(Yc-64.0)/876.0, Cb=(C.r-512.0)/896.0, Cr=(C.g-512.0)/896.0;\n"
+" float3 rgb=clamp(float3(Y+1.4746*Cr, Y-0.16455*Cb-0.57135*Cr, Y+1.8814*Cb),0.0,1.0);\n"
+" o.write(float4(pqe(rgb),1.0),id);}\n";
+// CMHDR: IPT-color_map -> PQ/2020-Output (statt sRGB). Tone-Map I via LUT + Chroma-Hull;
+// 3D-Gamut-LUT weggelassen (HDR->HDR, 2020->2020 = in-gamut; Hull+Clip). lms2rgb=2020,
+// KEIN ×10000/SDRW (PQ-absolut), pq_oetf-Output. IPT-Machinerie aus kk_colormap_ab (verifiziert).
+static const char *CMHDR_MSL =
+"#include <metal_stdlib>\nusing namespace metal;\n"
+"struct CM{float rgb2lms[9],lms2ipt[9],ipt2lms[9],lms2rgb[9];float in_min,in_max,out_min,out_max;float lut[256];};\n"
+"#define M1 0.1593017578125\n#define M2 78.84375\n#define C1 0.8359375\n#define C2 18.8515625\n#define C3 18.6875\n"
+"static inline float3 mul3(constant float* m, float3 v){return float3(m[0]*v.x+m[1]*v.y+m[2]*v.z, m[3]*v.x+m[4]*v.y+m[5]*v.z, m[6]*v.x+m[7]*v.y+m[8]*v.z);}\n"
+"static inline float3 pq_oetf3(float3 l){ float3 lm=pow(max(l,0.0),float3(M1)); return pow((C1+C2*lm)/(1.0+C3*lm),float3(M2)); }\n"
+"static inline float3 pq_eotf3(float3 e){ float3 ep=pow(max(e,0.0),float3(1.0/M2)); float3 num=max(ep-C1,0.0); float3 den=C2-C3*ep; return pow(num/den,float3(1.0/M1)); }\n"
+"kernel void cmh(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
+"  constant CM& p [[buffer(0)]], uint2 id [[thread_position_in_grid]]){ uint w=dst.get_width(),h=dst.get_height(); if(id.x>=w||id.y>=h)return;\n"
+"  float3 linr=src.read(id).rgb;\n"
+"  float3 lms=mul3(p.rgb2lms,linr); float3 lmspq=pq_oetf3(lms); float3 ipt=mul3(p.lms2ipt,lmspq); float i_orig=ipt.x;\n"
+"  float ipos=clamp((ipt.x-p.in_min)/(p.in_max-p.in_min),0.0,1.0);\n"
+"  float fidx=clamp(ipos*256.0-0.5,0.0,255.0); int i0=int(fidx); float fr=fidx-float(i0); ipt.x=mix(p.lut[i0],p.lut[min(i0+1,255)],fr);\n"
+"  float ix=max(ipt.x,1e-6); float2 hull=float2(i_orig,ix); hull=((hull-6.0)*hull+9.0)*hull; ipt.yz *= min(i_orig/ix, hull.y/hull.x);\n"
+"  float3 lmspq2=mul3(p.ipt2lms,ipt); float3 lms2=pq_eotf3(lmspq2);\n"     // 10000-norm, KEIN SDRW-Scale
+"  float3 o=clamp(mul3(p.lms2rgb,lms2),0.0,1.0); dst.write(float4(pq_oetf3(o),1.0),id);}\n"; // PQ/2020-Output
+
 static kk_gpu *g_kk = NULL;  // lazy, teilt libplacebos Device
 // Gecachte Intermediates (über Frames wiederverwendet — KEIN Per-Frame-Alloc, sonst
 // Jetsam-OOM durch Allok-Churn in Ziel-Auflösung). Re-create nur bei Dim-Wechsel.
@@ -313,5 +346,59 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
     kk_gpu_finish(g);
 
     kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt); // nur die billigen Wraps
+    return true;
+}
+
+// HDR-Render (P010 -> PQ/2020): MKPQ(2020-10bit-Decode+PQ-EOTF) -> EWA -> CMHDR
+// (IPT-Tonemap zum EDR-Peak + Chroma-Hull -> PQ-Output) -> Blit. hp vom Hook (libplacebo).
+static kk_tex *h_pq = NULL, *h_ewa = NULL, *h_out = NULL;
+static int h_W = 0, h_H = 0, h_OW = 0, h_OH = 0;
+
+bool kk_gpu_render_hdr(void *metal_device, void *cv_pixbuf, void *target_texture,
+                       const kk_hdr_params *hp) {
+    CVPixelBufferRef pb = (CVPixelBufferRef) cv_pixbuf;
+    if (!pb || !target_texture || !hp) return false;
+    OSType pf = CVPixelBufferGetPixelFormatType(pb);
+    if (pf != kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange &&
+        pf != kCVPixelFormatType_420YpCbCr10BiPlanarFullRange)
+        return false;
+    IOSurfaceRef surf = CVPixelBufferGetIOSurface(pb);
+    if (!surf) return false;
+    if (!g_kk) g_kk = kk_gpu_create(metal_device);
+    if (!g_kk) return false;
+    kk_gpu *g = g_kk;
+
+    kk_tex *luma   = kk_tex_wrap_iosurface(g, (void*)surf, 0, KK_FMT_R16,  KK_TEX_SAMPLE);
+    kk_tex *chroma = kk_tex_wrap_iosurface(g, (void*)surf, 1, KK_FMT_RG16, KK_TEX_SAMPLE);
+    kk_tex *tgt    = kk_tex_wrap_mtltexture(g, target_texture);
+    if (!luma || !chroma || !tgt) {
+        kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt); return false;
+    }
+    int W = kk_tex_w(luma), H = kk_tex_h(luma), OW = kk_tex_w(tgt), OH = kk_tex_h(tgt);
+    if (W<=0||H<=0||OW<=0||OH<=0) { kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt); return false; }
+
+    if (W != h_W || H != h_H || OW != h_OW || OH != h_OH) {
+        kk_tex_destroy(g,&h_pq); kk_tex_destroy(g,&h_ewa); kk_tex_destroy(g,&h_out);
+        h_pq  = kk_tex_create(g, W,  H,  KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
+        h_ewa = kk_tex_create(g, OW, OH, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
+        h_out = kk_tex_create(g, OW, OH, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL); // PQ-Float
+        h_W=W; h_H=H; h_OW=OW; h_OH=OH;
+    }
+    if (!h_pq || !h_ewa || !h_out) {
+        kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt); return false;
+    }
+
+    kk_compute_args mk = { .out=h_pq, .in={luma,chroma}, .n_in=2, .linear={false,true} };
+    kk_gpu_compute(g, MKPQ_MSL, "mk", &mk);                           // P010 -> linear 2020 (10000-norm)
+    struct { float scale; uint32_t lutn; float radius; float lut[64]; } ew;
+    ew.scale=(float)OW/W; ew.lutn=64; ew.radius=KK_EWA_RADIUS; for(int i=0;i<64;i++) ew.lut[i]=KK_EWA_LUT[i];
+    kk_compute_args ea = { .out=h_ewa, .in={h_pq}, .n_in=1, .uniforms=&ew, .uniforms_size=sizeof ew };
+    kk_gpu_compute(g, EWA_MSL, "ewa", &ea);                           // EWA-Scale in Linear
+    kk_compute_args ca = { .out=h_out, .in={h_ewa}, .n_in=1, .uniforms=hp, .uniforms_size=sizeof(kk_hdr_params) };
+    kk_gpu_compute(g, CMHDR_MSL, "cmh", &ca);                         // IPT-Tonemap -> PQ/2020
+    kk_gpu_blit(g, h_out, tgt);
+    kk_gpu_finish(g);
+
+    kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt);
     return true;
 }
