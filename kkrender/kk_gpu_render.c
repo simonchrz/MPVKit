@@ -273,9 +273,10 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
             kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &axa);            // X: 2W -> OW
             kk_compute_args aya = { .out=c_liny, .in={c_atmpx}, .n_in=1, .uniforms=&apy, .uniforms_size=sizeof apy };
             kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &aya);            // Y: 2H -> OH
-            kk_compute_args ala = { .out=c_out, .in={c_liny}, .n_in=1 };
+            bool dw = kk_tex_can_write(tgt);   // Target ShaderWrite-fähig -> Blit sparen
+            kk_compute_args ala = { .out=dw?tgt:c_out, .in={c_liny}, .n_in=1 };
             kk_gpu_compute(g, DELIN_MSL, "delin", &ala);
-            kk_gpu_blit(g, c_out, tgt);
+            if (!dw) kk_gpu_blit(g, c_out, tgt);
             kk_gpu_finish(g);
             kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt);
             return true;
@@ -308,9 +309,10 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
             kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &axa);
             kk_compute_args aya = { .out=c_liny, .in={c_atmpx}, .n_in=1, .uniforms=&apy, .uniforms_size=sizeof apy };
             kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &aya);
-            kk_compute_args ala = { .out=c_out, .in={c_liny}, .n_in=1 };
+            bool dw = kk_tex_can_write(tgt);   // Target ShaderWrite-fähig -> Blit sparen
+            kk_compute_args ala = { .out=dw?tgt:c_out, .in={c_liny}, .n_in=1 };
             kk_gpu_compute(g, DELIN_MSL, "delin", &ala);
-            kk_gpu_blit(g, c_out, tgt);
+            if (!dw) kk_gpu_blit(g, c_out, tgt);
             kk_gpu_finish(g);
             kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt);
             return true;
@@ -334,15 +336,17 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
     kk_compute_args ea = { .out=c_liny, .in={escin}, .n_in=1, .uniforms=&ew, .uniforms_size=sizeof ew };
     kk_gpu_compute(g, EWA_MSL, "ewa", &ea);
     // CAS-Sharpen (HD/Tuner, gated ~cas): [unsig+]delin -> c_srgb -> CAS -> c_out; sonst -> c_out.
+    bool dw = kk_tex_can_write(tgt);     // Target ShaderWrite-fähig -> direkt rein, Blit sparen
+    kk_tex *fin = dw ? tgt : c_out;
     bool cas = glsl && strcasestr(glsl, "cas") && c_srgb;
-    kk_tex *dout = cas ? c_srgb : c_out;
+    kk_tex *dout = cas ? c_srgb : fin;
     kk_compute_args la = { .out=dout, .in={c_liny}, .n_in=1 };
     kk_gpu_compute(g, up ? DELINU_MSL : DELIN_MSL, up ? "delinu" : "delin", &la);
     if (cas) {
-        kk_compute_args ca = { .out=c_out, .in={c_srgb}, .n_in=1 };
+        kk_compute_args ca = { .out=fin, .in={c_srgb}, .n_in=1 };
         kk_gpu_compute(g, CAS_MSL, "cas", &ca);
     }
-    kk_gpu_blit(g, c_out, tgt);          // eigener Output -> Display-Target
+    if (!dw) kk_gpu_blit(g, c_out, tgt); // nur falls Target nicht direkt beschreibbar
     kk_gpu_finish(g);
 
     kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt); // nur die billigen Wraps
@@ -394,9 +398,10 @@ bool kk_gpu_render_hdr(void *metal_device, void *cv_pixbuf, void *target_texture
     ew.scale=(float)OW/W; ew.lutn=64; ew.radius=KK_EWA_RADIUS; for(int i=0;i<64;i++) ew.lut[i]=KK_EWA_LUT[i];
     kk_compute_args ea = { .out=h_ewa, .in={h_pq}, .n_in=1, .uniforms=&ew, .uniforms_size=sizeof ew };
     kk_gpu_compute(g, EWA_MSL, "ewa", &ea);                           // EWA-Scale in Linear
-    kk_compute_args ca = { .out=h_out, .in={h_ewa}, .n_in=1, .uniforms=hp, .uniforms_size=sizeof(kk_hdr_params) };
+    bool dw = kk_tex_can_write(tgt);     // Target ShaderWrite-fähig -> direkt rein, Blit sparen
+    kk_compute_args ca = { .out=dw?tgt:h_out, .in={h_ewa}, .n_in=1, .uniforms=hp, .uniforms_size=sizeof(kk_hdr_params) };
     kk_gpu_compute(g, CMHDR_MSL, "cmh", &ca);                         // IPT-Tonemap -> PQ/2020
-    kk_gpu_blit(g, h_out, tgt);
+    if (!dw) kk_gpu_blit(g, h_out, tgt);
     kk_gpu_finish(g);
 
     kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt);

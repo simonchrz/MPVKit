@@ -216,6 +216,9 @@ void kk_tex_destroy(kk_gpu *g, kk_tex **ptex) {
 }
 int kk_tex_w(const kk_tex *t) { return t->w; }
 int kk_tex_h(const kk_tex *t) { return t->h; }
+bool kk_tex_can_write(const kk_tex *t) {
+    return t && t->tex && (t->tex.usage & MTLTextureUsageShaderWrite) != 0;
+}
 
 bool kk_tex_download(kk_gpu *g, kk_tex *t, void *dst) {
     if (!t->downloadable) return false;

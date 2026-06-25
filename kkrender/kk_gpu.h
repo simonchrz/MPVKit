@@ -54,6 +54,7 @@ kk_tex *kk_tex_wrap_mtltexture(kk_gpu *gpu, void *mtltexture); // existierende M
 void    kk_tex_destroy(kk_gpu *gpu, kk_tex **ptex);
 int     kk_tex_w(const kk_tex *t);
 int     kk_tex_h(const kk_tex *t);
+bool    kk_tex_can_write(const kk_tex *t);  // ShaderWrite-Usage? -> direkt ins Target schreiben (Blit sparen)
 bool    kk_tex_download(kk_gpu *gpu, kk_tex *t, void *dst); // nach kk_gpu_finish
 
 // --- Compute-Pass ---------------------------------------------------------
