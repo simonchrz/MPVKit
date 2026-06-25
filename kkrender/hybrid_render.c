@@ -385,11 +385,23 @@ int kuckuck_hybrid_render(void *ctx, void *cv_pixbuf, void *target_texture)
     // (KUCKUCK_KK_GPU=1). Handhabt SDR-NV12 nativ + zero-copy ins Target; sonst false
     // -> Fallback auf den libplacebo-Pfad unten. On-Device-A/B gegen pl_render_image.
     {
-        extern bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture);
+        extern bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture, const float *yuv2rgb);
         static int kkgpu = -1;
         if (kkgpu < 0) { const char *e = getenv("KUCKUCK_KK_GPU"); kkgpu = (e && e[0] == '1') ? 1 : 0; }
-        if (kkgpu && p->metal && kk_gpu_render(p->metal->device, cv_pixbuf, target_texture))
-            return 0;
+        if (kkgpu && p->metal) {
+            // Echte YUV->RGB-Decode-Matrix aus dem Pixbuf (601/709/2020 + Range) via libplacebo.
+            OSType pf = CVPixelBufferGetPixelFormatType(pb);
+            bool full = (pf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
+            struct pl_color_repr repr = { .sys = hybrid_matrix(pb),
+                .levels = full ? PL_COLOR_LEVELS_FULL : PL_COLOR_LEVELS_LIMITED,
+                .bits = { .sample_depth = 8, .color_depth = 8, .bit_shift = 0 } };
+            pl_transform3x3 ts = pl_color_repr_decode(&repr, NULL);
+            float yuv2rgb[12];
+            for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) yuv2rgb[r*3+c] = ts.mat.m[r][c];
+            yuv2rgb[9] = ts.c[0]; yuv2rgb[10] = ts.c[1]; yuv2rgb[11] = ts.c[2];
+            if (kk_gpu_render(p->metal->device, cv_pixbuf, target_texture, yuv2rgb))
+                return 0;
+        }
     }
 
     kk_apply_user_shader(p->gpu, &p->rparams, &p->user_hook, &p->user_shader_path);
