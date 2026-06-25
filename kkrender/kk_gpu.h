@@ -24,6 +24,7 @@ typedef enum {
     KK_FMT_R16,       // Luma 10/16-bit
     KK_FMT_RG16,      // Chroma 10/16-bit
     KK_FMT_RGBA8,     // SDR-Output / Zwischentextur
+    KK_FMT_BGRA8,     // Display-IOSurface-Output (AVSampleBufferDisplayLayer ist BGRA)
     KK_FMT_RGBA16F,   // HDR/Linearlicht-Zwischentextur
 } kk_fmt;
 
@@ -47,7 +48,7 @@ kk_tex *kk_tex_create(kk_gpu *gpu, int w, int h, kk_fmt fmt, uint32_t usage,
 kk_tex *kk_tex_create_3d(kk_gpu *gpu, int w, int h, int d, kk_fmt fmt,
                          const void *initial_data); // 3D-LUT (z.B. Gamut-Map), texture3d
 kk_tex *kk_tex_wrap_iosurface(kk_gpu *gpu, void *iosurface, int plane,
-                              kk_fmt fmt);         // Decoder-CVPixelBuffer-Plane, zero-copy
+                              kk_fmt fmt, uint32_t usage); // zero-copy In(SAMPLE)/Out(STORAGE)
 void    kk_tex_destroy(kk_gpu *gpu, kk_tex **ptex);
 int     kk_tex_w(const kk_tex *t);
 int     kk_tex_h(const kk_tex *t);

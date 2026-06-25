@@ -28,6 +28,7 @@ static MTLPixelFormat mtl_fmt(kk_fmt f) {
         case KK_FMT_R16:     return MTLPixelFormatR16Unorm;
         case KK_FMT_RG16:    return MTLPixelFormatRG16Unorm;
         case KK_FMT_RGBA8:   return MTLPixelFormatRGBA8Unorm;
+        case KK_FMT_BGRA8:   return MTLPixelFormatBGRA8Unorm;
         case KK_FMT_RGBA16F: return MTLPixelFormatRGBA16Float;
     }
     return MTLPixelFormatRGBA8Unorm;
@@ -39,6 +40,7 @@ static int fmt_bytes(kk_fmt f) {
         case KK_FMT_R16:     return 2;
         case KK_FMT_RG16:    return 4;
         case KK_FMT_RGBA8:   return 4;
+        case KK_FMT_BGRA8:   return 4;
         case KK_FMT_RGBA16F: return 8;
     }
     return 4;
@@ -154,7 +156,8 @@ kk_tex *kk_tex_create_3d(kk_gpu *g, int w, int h, int d, kk_fmt fmt,
     }
 }
 
-kk_tex *kk_tex_wrap_iosurface(kk_gpu *g, void *iosurface, int plane, kk_fmt fmt) {
+kk_tex *kk_tex_wrap_iosurface(kk_gpu *g, void *iosurface, int plane, kk_fmt fmt,
+                              uint32_t usage) {
     @autoreleasepool {
         IOSurfaceRef surf = (IOSurfaceRef) iosurface;
         int w = (int) IOSurfaceGetWidthOfPlane(surf, plane);
@@ -164,7 +167,11 @@ kk_tex *kk_tex_wrap_iosurface(kk_gpu *g, void *iosurface, int plane, kk_fmt fmt)
         t->w = w; t->h = h;
         MTLTextureDescriptor *d = [MTLTextureDescriptor
             texture2DDescriptorWithPixelFormat:mtl_fmt(fmt) width:w height:h mipmapped:NO];
-        d.usage = MTLTextureUsageShaderRead;
+        MTLTextureUsage u = 0;
+        if (usage & KK_TEX_SAMPLE)  u |= MTLTextureUsageShaderRead;
+        if (usage & KK_TEX_STORAGE) u |= MTLTextureUsageShaderWrite;   // Output: in Display-IOSurface schreiben
+        if (usage & KK_TEX_RENDER)  u |= MTLTextureUsageRenderTarget;
+        d.usage = u ? u : MTLTextureUsageShaderRead;
         d.storageMode = MTLStorageModeShared;
         t->tex = [g->dev newTextureWithDescriptor:d iosurface:surf plane:plane];
         if (!t->tex) { free(t); return NULL; }
