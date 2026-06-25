@@ -11,7 +11,7 @@ CLANG="$(xcrun -f clang)"; LIBTOOL="$(xcrun -f libtool)"
 build_slice() {  # build_slice <sdk> <min-flag> <plinc> <spvcdir> <outdir>
   local sdk="$1" min="$2" plinc="$3" spvc="$4" od="$5"
   local sysroot; sysroot="$(xcrun --sdk "$sdk" --show-sdk-path)"
-  for src in hybrid_render kk_renderer kk_gpu_render kk_gpu_cnn kk_gpu_genparams; do
+  for src in hybrid_render kk_gpu_render kk_gpu_cnn kk_gpu_genparams; do
     "$CLANG" -c "$ROOT/$src.c" -o "$od/$src.o" \
       -arch arm64 -isysroot "$sysroot" "$min" ${KK_AOT:+-DKK_AOT} \
       -I"$plinc" -I"$ROOT" -Wall -O2 -fno-common
@@ -25,10 +25,10 @@ build_slice() {  # build_slice <sdk> <min-flag> <plinc> <spvcdir> <outdir>
   # KK_AOT=1: kein Runtime-Compiler -> spirv-cross NICHT mergen (~Größen-Schnitt).
   if [ -n "${KK_AOT:-}" ]; then
     "$LIBTOOL" -static -o "$od/libkkrender.a" \
-      "$od/hybrid_render.o" "$od/kk_renderer.o" "$od/kk_gpu_render.o" "$od/kk_gpu_cnn.o" "$od/kk_gpu_genparams.o" "$od/kk_gpu.o"
+      "$od/hybrid_render.o" "$od/kk_gpu_render.o" "$od/kk_gpu_cnn.o" "$od/kk_gpu_genparams.o" "$od/kk_gpu.o"
   else
     "$LIBTOOL" -static -o "$od/libkkrender.a" \
-      "$od/hybrid_render.o" "$od/kk_renderer.o" "$od/kk_gpu_render.o" "$od/kk_gpu_cnn.o" "$od/kk_gpu_genparams.o" "$od/kk_gpu.o" "$spvc"/*.a
+      "$od/hybrid_render.o" "$od/kk_gpu_render.o" "$od/kk_gpu_cnn.o" "$od/kk_gpu_genparams.o" "$od/kk_gpu.o" "$spvc"/*.a
   fi
   echo "built $od/libkkrender.a (hybrid=$(nm "$od/libkkrender.a" 2>/dev/null | grep -c ' T _kuckuck_hybrid') spvc=$(nm "$od/libkkrender.a" 2>/dev/null | grep -c ' T _spvc_'))"
 }
