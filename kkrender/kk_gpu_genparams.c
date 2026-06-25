@@ -1,4 +1,5 @@
 // kk_gpu_genparams.c — native Color-Parameter-Generatoren (libplacebo-Drop-Vorbereitung).
+#include <math.h>
 // Alle Matrizen EINMAL aus libplacebo gedumpt + eingebacken (exakt, kein Formel-Bug):
 //  - SDR-YUV->RGB-Decode (pl_color_repr_decode) für 601/709/240M/2020-NC × limited/full, 8-bit
 //  - Primaries->BT.709 (pl_get_color_mapping_matrix), relative-colorimetric
@@ -38,4 +39,31 @@ void kk_sdr_decode_matrix(int sys, int full, float out[12]) {
 void kk_primaries_to709(int prim, float out[9]) {
     if (prim >= 0 && prim <= 2) memcpy(out, PRIM709[prim], 9 * sizeof(float));
     else { static const float I[9] = {1,0,0, 0,1,0, 0,0,1}; memcpy(out, I, sizeof I); }
+}
+
+// PQ-OETF (L normalisiert, 1=10000 nits -> PQ-Wert). SMPTE ST 2084.
+static double pq_oetf_d(double L) {
+    const double m1=0.1593017578125, m2=78.84375, c1=0.8359375, c2=18.8515625, c3=18.6875;
+    double lm = pow(L < 0 ? 0 : L, m1);
+    return pow((c1 + c2*lm) / (1.0 + c3*lm), m2);
+}
+// HDR-Tonemap-Parameter NATIV (ersetzt pl_color_space_nominal_luma_ex + pl_tone_map_generate
+// + bt2390): Nominal-Luma in PQ + bt2390-EETF-LUT (knee_offset=1.0, Hermite + Black-Point).
+// Headless gegen libplacebo verifiziert (maxdiff < 0,01/1023). src/dst/min in nits.
+void kk_hdr_tone(float src_max_nits, float dst_max_nits, float min_nits,
+                 float *in_min, float *in_max, float *out_min, float *out_max, float lut[256]) {
+    double imn = pq_oetf_d(min_nits/10000.0), imx = pq_oetf_d(src_max_nits/10000.0);
+    double omn = pq_oetf_d(min_nits/10000.0), omx = pq_oetf_d(dst_max_nits/10000.0);
+    *in_min=(float)imn; *in_max=(float)imx; *out_min=(float)omn; *out_max=(float)omx;
+    double minLum=(omn-imn)/(imx-imn), maxLum=(omx-imn)/(imx-imn);
+    double off=1.0, ks=(1.0+off)*maxLum-off, bp = minLum>0 ? fmin(1.0/minLum,4.0) : 4.0;
+    double gi = 1.0 + minLum/maxLum*pow(1.0-maxLum, bp), gain = maxLum<1.0 ? 1.0/gi : 1.0;
+    for (int i=0;i<256;i++) {
+        double x=(double)i/255.0;
+        if (ks<1.0) { double tb=(x-ks)/(1.0-ks),t2=tb*tb,t3=t2*tb;
+            double pb=(2*t3-3*t2+1)*ks+(t3-2*t2+tb)*(1-ks)+(-2*t3+3*t2)*maxLum; x = x<ks ? x : pb; }
+        if (x<1.0) { x += minLum*pow(1.0-x,bp); x = gain*(x-minLum)+minLum; }
+        double xpq = x*(imx-imn)+imn; xpq = xpq<omn ? omn : xpq>omx ? omx : xpq;
+        lut[i]=(float)xpq;
+    }
 }

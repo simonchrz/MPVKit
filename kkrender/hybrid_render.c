@@ -400,27 +400,16 @@ int kuckuck_hybrid_render(void *ctx, void *cv_pixbuf, void *target_texture)
             const char *nits = getenv("KUCKUCK_HDR_TARGET_NITS");
             float peak = nits ? (float)atof(nits) : 203.0f; if (peak < 1.0f) peak = 203.0f;
             if (peak != cached_peak) {
-                struct pl_color_space hsrc = { .primaries = PL_COLOR_PRIM_BT_2020, .transfer = PL_COLOR_TRC_PQ,
-                    .hdr = { .max_luma = 1000.0f, .min_luma = 0.005f } };
-                struct pl_color_space hdst = { .primaries = PL_COLOR_PRIM_BT_2020, .transfer = PL_COLOR_TRC_PQ,
-                    .hdr = { .max_luma = peak, .min_luma = 0.005f } };
-                struct pl_color_space si = hsrc, di = hdst; pl_color_space_infer_map(&si, &di);
                 // NATIV (eingebackene IPT-Matrizen für BT.2020) statt pl_ipt_*.
                 extern const float KK_IPT_RGB2LMS_2020[9], KK_IPT_LMS2RGB_2020[9], KK_IPT_LMS2IPT[9], KK_IPT_IPT2LMS[9];
                 memcpy(hp.rgb2lms, KK_IPT_RGB2LMS_2020, 9*sizeof(float));
                 memcpy(hp.lms2rgb, KK_IPT_LMS2RGB_2020, 9*sizeof(float));
                 memcpy(hp.lms2ipt, KK_IPT_LMS2IPT, 9*sizeof(float));
                 memcpy(hp.ipt2lms, KK_IPT_IPT2LMS, 9*sizeof(float));
-                struct pl_tone_map_params tone = { .function = &pl_tone_map_bt2390, .input_scaling = PL_HDR_PQ,
-                    .output_scaling = PL_HDR_PQ, .lut_size = 256, .hdr = si.hdr };
-                tone.constants = pl_color_map_default_params.tone_constants;
-                pl_color_space_nominal_luma_ex(pl_nominal_luma_params(.color=&si, .metadata=PL_HDR_METADATA_ANY,
-                    .scaling=PL_HDR_PQ, .out_min=&tone.input_min, .out_max=&tone.input_max, .out_avg=&tone.input_avg));
-                pl_color_space_nominal_luma_ex(pl_nominal_luma_params(.color=&di, .metadata=PL_HDR_METADATA_HDR10,
-                    .scaling=PL_HDR_PQ, .out_min=&tone.output_min, .out_max=&tone.output_max));
-                pl_tone_map_params_infer(&tone);
-                hp.in_min=tone.input_min; hp.in_max=tone.input_max; hp.out_min=tone.output_min; hp.out_max=tone.output_max;
-                pl_tone_map_generate(hp.tone_lut, &tone);
+                // NATIV (bt2390-EETF + Nominal-Luma) statt pl_tone_map_generate/pl_color_space_*.
+                // Quell-Peak 1000 nits (statisch, kein Peak-Detect), Ziel = EDR-Peak.
+                extern void kk_hdr_tone(float, float, float, float*, float*, float*, float*, float[256]);
+                kk_hdr_tone(1000.0f, peak, 0.005f, &hp.in_min, &hp.in_max, &hp.out_min, &hp.out_max, hp.tone_lut);
                 cached_peak = peak;
             }
             if (kk_gpu_render_hdr(p->metal->device, cv_pixbuf, target_texture, &hp))
