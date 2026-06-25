@@ -72,12 +72,27 @@ static const char *DELIN_MSL =
 "kernel void delin(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
 "  uint2 id [[thread_position_in_grid]]){ uint w=dst.get_width(),h=dst.get_height(); if(id.x>=w||id.y>=h)return;\n"
 "  float3 c=clamp(src.read(id).rgb,0.0,1.0); dst.write(float4(srgb(c.r),srgb(c.g),srgb(c.b),1.0),id);}\n";
+// CAS (FidelityFX Contrast-Adaptive-Sharpening, cas.glsl-Port, headless gegen libplacebo
+// maxerr≤3) auf der encodeten sRGB-Ausgabe (HD/Tuner-Sharpener, gated via ~cas).
+static const char *CAS_MSL =
+"#include <metal_stdlib>\nusing namespace metal;\n#define SHARP 0.5\n"
+"kernel void cas(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
+"  uint2 id [[thread_position_in_grid]]){ uint W=dst.get_width(),H=dst.get_height(); if(id.x>=W||id.y>=H)return;\n"
+"  int sw=int(W),sh=int(H); int2 p=int2(id);\n"
+"#define T(dx,dy) src.read(uint2(clamp(p.x+(dx),0,sw-1),clamp(p.y+(dy),0,sh-1))).rgb\n"
+"  float3 a=T(-1,-1),b=T(0,-1),c=T(1,-1),d=T(-1,0),e=T(0,0),f=T(1,0),g=T(-1,1),h=T(0,1),i=T(1,1);\n"
+"  float3 mn=min(min(min(d,e),min(f,b)),h); float3 mn2=min(mn,min(min(a,c),min(g,i))); mn+=mn2;\n"
+"  float3 mx=max(max(max(d,e),max(f,b)),h); float3 mx2=max(mx,max(max(a,c),max(g,i))); mx+=mx2;\n"
+"  float3 rcpM=1.0/max(mx,float3(1e-5)); float3 amp=clamp(min(mn,2.0-mx)*rcpM,0.0,1.0); amp=rsqrt(max(amp,float3(1e-5)));\n"
+"  float peak=-3.0*SHARP+8.0; float3 w=-1.0/(amp*peak); float3 rcpW=1.0/(1.0+4.0*w);\n"
+"  float3 win=(b+d)+(f+h); float3 o=clamp((win*w+e)*rcpW,0.0,1.0); dst.write(float4(o,1.0),id);}\n";
 
 static kk_gpu *g_kk = NULL;  // lazy, teilt libplacebos Device
 // Gecachte Intermediates (über Frames wiederverwendet — KEIN Per-Frame-Alloc, sonst
 // Jetsam-OOM durch Allok-Churn in Ziel-Auflösung). Re-create nur bei Dim-Wechsel.
 static kk_tex *c_dec = NULL, *c_deb = NULL, *c_lin = NULL, *c_tmpx = NULL, *c_liny = NULL, *c_out = NULL;
 static kk_tex *c_alin = NULL, *c_atmpx = NULL;   // Anime4K-Post (2×-Input -> Ziel)
+static kk_tex *c_srgb = NULL;                    // CAS-Input (sRGB-Ausgabe vor Sharpen)
 static int c_W = 0, c_H = 0, c_OW = 0, c_OH = 0;
 static unsigned g_frame = 0;   // temporaler Grain-Index (Deband)
 
@@ -123,6 +138,8 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
         kk_tex_destroy(g,&c_alin); kk_tex_destroy(g,&c_atmpx);
         c_alin  = kk_tex_create(g, W*2, H*2, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL); // linearisierter Anime4K-2×
         c_atmpx = kk_tex_create(g, OW,  H*2, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL); // X-skaliert (2H)
+        kk_tex_destroy(g,&c_srgb);
+        c_srgb  = kk_tex_create(g, OW, OH, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);   // CAS-Input
         c_W=W; c_H=H; c_OW=OW; c_OH=OH;
     }
     if (!c_dec || !c_deb || !c_lin || !c_tmpx || !c_liny || !c_out) {
@@ -184,8 +201,14 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
     kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &xa);
     kk_compute_args ya = { .out=c_liny, .in={c_tmpx}, .n_in=1, .uniforms=&py, .uniforms_size=sizeof py };
     kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &ya);
-    kk_compute_args la = { .out=c_out, .in={c_liny}, .n_in=1 };
+    // CAS-Sharpen (HD/Tuner, gated via ~cas): delin -> c_srgb -> CAS -> c_out; sonst delin -> c_out.
+    bool cas = glsl && strstr(glsl, "cas") && c_srgb;
+    kk_compute_args la = { .out = cas ? c_srgb : c_out, .in={c_liny}, .n_in=1 };
     kk_gpu_compute(g, DELIN_MSL, "delin", &la);
+    if (cas) {
+        kk_compute_args ca = { .out=c_out, .in={c_srgb}, .n_in=1 };
+        kk_gpu_compute(g, CAS_MSL, "cas", &ca);
+    }
     kk_gpu_blit(g, c_out, tgt);          // eigener Output -> Display-Target
     kk_gpu_finish(g);
 
