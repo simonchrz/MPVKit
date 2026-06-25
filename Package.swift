@@ -282,10 +282,10 @@ let package = Package(
             // extrahiert aus libmpvs render_pl.c + spirv-cross reingemergt (libplacebo-
             // Metal braucht spvc_* zur Laufzeit). Ersetzt Libmpv für den App-Render →
             // libmpv/FFmpeg/libcurl fallen weg. Gebaut von kkrender/build-kkrender.sh.
-            // renderpl.58 = KK_AOT=1: OHNE spirv-cross-Merge (30K), Render aus dem
-            // gebündelten MSL-Cache — passt zur AOT-libplacebo derselben Version.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.59/Libkkrender.xcframework.zip",
-            checksum: "0c423ed5ada66ef5fd29258315514749024a22a587b189b7a4ce01003d715ab1"
+            // renderpl.60 = libplacebo-DROP: eigener Metal-Renderer kk_gpu (SDR+HDR nativ),
+            // self-contained (0 undefined pl_ + 0 spvc), kein spirv-cross-Merge mehr.
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.60/Libkkrender.xcframework.zip",
+            checksum: "e891ef5372f4dd59b0f144b5c6e8e28af3b9d7b72d3163f08b5214919319e967"
         ),
 
         .binaryTarget(
