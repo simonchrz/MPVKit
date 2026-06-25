@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 
 #include <CoreVideo/CoreVideo.h>
 
@@ -76,6 +77,34 @@ static float hybrid_src_peak(CVPixelBufferRef pb)
     return 1000.0f;
 }
 
+// Dynamischer Frame-Peak (nits): max-Luma per CPU-Grid-Sample der P010-Luma-Plane
+// (Plane 0, 16-bit, PQ-limited) -> PQ-EOTF -> nits. Grob (~48×48-Grid) aber + EMA-Glättung
+// im Aufrufer = per-Szene-Peak. -1 bei Fehler. Läuft auf der Render-Queue (off-main),
+// VOR dem GPU-Render (kein Concurrency mit dem IOSurface-GPU-Read).
+static float hybrid_frame_peak_nits(CVPixelBufferRef pb)
+{
+    if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return -1;
+    int w = (int) CVPixelBufferGetWidthOfPlane(pb, 0), h = (int) CVPixelBufferGetHeightOfPlane(pb, 0);
+    size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+    const uint8_t *base = (const uint8_t *) CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+    uint16_t mx = 0;
+    if (base && w > 0 && h > 0) {
+        int sy = h > 48 ? h / 48 : 1, sx = w > 48 ? w / 48 : 1;
+        for (int y = 0; y < h; y += sy) {
+            const uint16_t *row = (const uint16_t *)(base + (size_t) y * bpr);
+            for (int x = 0; x < w; x += sx) { uint16_t v = row[x]; if (v > mx) mx = v; }
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    if (mx == 0) return -1;
+    float y10 = (float)(mx >> 6);                         // 16-bit P010 -> 10-bit
+    float ypq = (y10 - 64.0f) / 876.0f;                   // BT.2020-limited (wie MKPQ)
+    if (ypq < 0) ypq = 0; if (ypq > 1) ypq = 1;
+    const float m1=0.1593017578125f, m2=78.84375f, c1=0.8359375f, c2=18.8515625f, c3=18.6875f;
+    float ep = powf(ypq, 1.0f/m2); float num = ep - c1; if (num < 0) num = 0; float den = c2 - c3*ep;
+    return powf(num/den, 1.0f/m1) * 10000.0f;             // PQ-EOTF -> nits
+}
+
 void *kuckuck_hybrid_create(void *mtl_device)
 {
     if (!mtl_device)
@@ -99,9 +128,22 @@ int kuckuck_hybrid_render(void *ctx, void *cv_pixbuf, void *target_texture)
     if (pfmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
         pfmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange) {
         static kk_hdr_params hp; static float cached_dst = -1.0f, cached_src = -1.0f;
+        static float smoothPeak = -1.0f; static unsigned hdrFrame = 0;
         const char *nits = getenv("KUCKUCK_HDR_TARGET_NITS");
         float dst_peak = nits ? (float) atof(nits) : 203.0f; if (dst_peak < 1.0f) dst_peak = 203.0f;
-        float src_peak = hybrid_src_peak(pb);   // echter Quell-Peak aus Mastering/MaxCLL (statt statisch 1000)
+        float mastering = hybrid_src_peak(pb);   // Mastering/MaxCLL = Obergrenze (Master nicht überschreitbar)
+        // Dynamischer Peak: jeden 4. Frame den echten Frame-Peak messen, EMA-glätten,
+        // durch Mastering deckeln → per-Szene-Tonemapping (dunkle Szenen nutzen EDR besser).
+        if ((hdrFrame++ & 3) == 0) {
+            float fp = hybrid_frame_peak_nits(pb);
+            if (fp > 0) {
+                if (fp > mastering) fp = mastering;
+                smoothPeak = (smoothPeak < 0) ? fp : smoothPeak + 0.15f * (fp - smoothPeak);
+            }
+        }
+        float src_peak = (smoothPeak > 0) ? smoothPeak : mastering;
+        if (src_peak < 100.0f) src_peak = 100.0f;                 // Floor (nicht über-abdunkeln)
+        src_peak = roundf(src_peak / 25.0f) * 25.0f;              // 25-nit-quantisiert → LUT-Regen nur bei echter Änderung
         if (dst_peak != cached_dst || src_peak != cached_src) {
             memcpy(hp.rgb2lms, KK_IPT_RGB2LMS_2020, 9 * sizeof(float));
             memcpy(hp.lms2rgb, KK_IPT_LMS2RGB_2020, 9 * sizeof(float));
