@@ -87,6 +87,49 @@ static const char *CAS_MSL =
 "  float3 rcpM=1.0/max(mx,float3(1e-5)); float3 amp=clamp(min(mn,2.0-mx)*rcpM,0.0,1.0); amp=rsqrt(max(amp,float3(1e-5)));\n"
 "  float peak=-3.0*SHARP+8.0; float3 w=-1.0/(amp*peak); float3 rcpW=1.0/(1.0+4.0*w);\n"
 "  float3 win=(b+d)+(f+h); float3 o=clamp((win*w+e)*rcpW,0.0,1.0); dst.write(float4(o,1.0),id);}\n";
+// EWA-lanczossharp (libplacebos Default-Upscaler) — radiale Filter-LUT (pl_filter_generate,
+// 64 Einträge) EINGEBACKEN (konstant, kein Runtime-libplacebo). Headless vs libplacebo verifiziert.
+#define KK_EWA_RADIUS 3.17759895f
+static const float KK_EWA_LUT[64]={
+ 1.00000000f,0.99628311f,0.98519361f,0.96691382f,0.94174308f,0.91009110f,0.87246895f,0.82947797f,
+ 0.78179675f,0.73016614f,0.67537409f,0.61823839f,0.55959070f,0.50025868f,0.44105068f,0.38273951f,
+ 0.32604882f,0.27163979f,0.22010081f,0.17193846f,0.12757106f,0.08732384f,0.05142748f,0.02001836f,
+ -0.00685941f,-0.02924910f,-0.04727522f,-0.06113534f,-0.07109106f,-0.07745767f,-0.08059313f,-0.08088668f,
+ -0.07874756f,-0.07459370f,-0.06884123f,-0.06189458f,-0.05413772f,-0.04592650f,-0.03758239f,-0.02938765f,
+ -0.02158188f,-0.01436004f,-0.00787209f,-0.00222358f,0.00252217f,0.00634110f,0.00924443f,0.01127407f,
+ 0.01249739f,0.01300187f,0.01288953f,0.01227151f,0.01126289f,0.00997788f,0.00852562f,0.00700655f,
+ 0.00550949f,0.00410946f,0.00286628f,0.00182385f,0.00101015f,0.00043793f,0.00010582f,-0.00000000f};
+// Sigmoidize (center=0.75 slope=6.5, libplacebos Default-Upscale-Pre): in Linear-Light.
+static const char *SIG_MSL =
+"#include <metal_stdlib>\nusing namespace metal;\n"
+"kernel void sig(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
+"  uint2 id [[thread_position_in_grid]]){ uint w=dst.get_width(),h=dst.get_height(); if(id.x>=w||id.y>=h)return;\n"
+"  float3 c=clamp(src.read(id).rgb,0.0,1.0);\n"
+"  c=0.75-(1.0/6.5)*log(1.0/(c*0.82796854+0.00757286)-1.0); dst.write(float4(c,1.0),id);}\n";
+// EWA-polar-Gather (eingebackene LUT als Uniform).
+static const char *EWA_MSL =
+"#include <metal_stdlib>\nusing namespace metal;\nstruct P{float scale;uint lutn;float radius;float lut[64];};\n"
+"kernel void ewa(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
+"  constant P& p [[buffer(0)]], uint2 id [[thread_position_in_grid]]){ uint W=dst.get_width(),H=dst.get_height(); if(id.x>=W||id.y>=H)return;\n"
+"  int sw=int(src.get_width()),sh=int(src.get_height());\n"
+"  float2 sc=(float2(id)+0.5)/p.scale-0.5;\n"
+"  float sf=min(p.scale,1.0); float Rsrc=p.radius/sf;\n"
+"  int2 lo=int2(floor(sc-Rsrc)), hi=int2(ceil(sc+Rsrc));\n"
+"  float4 acc=float4(0.0); float wsum=0.0;\n"
+"  for(int sy=lo.y;sy<=hi.y;sy++)for(int sx=lo.x;sx<=hi.x;sx++){\n"
+"    float2 dv=(float2(sx,sy)-sc)*sf; float d=length(dv); if(d>=p.radius)continue;\n"
+"    float fidx=d/p.radius*float(p.lutn-1); int i0=int(fidx); float fr=fidx-float(i0);\n"
+"    float w=mix(p.lut[i0], p.lut[min(i0+1,int(p.lutn)-1)], fr);\n"
+"    int cx=clamp(sx,0,sw-1),cy=clamp(sy,0,sh-1); acc+=w*src.read(uint2(cx,cy)); wsum+=w; }\n"
+"  dst.write(wsum>0.0?acc/wsum:float4(0.0),id);}\n";
+// Unsigmoidize + sRGB-Delin fusioniert (Upscale-Post).
+static const char *DELINU_MSL =
+"#include <metal_stdlib>\nusing namespace metal;\n"
+"static inline float srgb(float c){ return c<=0.0031308 ? 12.92*c : 1.055*pow(c,1.0/2.4)-0.055; }\n"
+"kernel void delinu(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
+"  uint2 id [[thread_position_in_grid]]){ uint w=dst.get_width(),h=dst.get_height(); if(id.x>=w||id.y>=h)return;\n"
+"  float3 c=src.read(id).rgb; c=1.20778572/(1.0+exp(6.5*(0.75-c)))-0.00914634; c=clamp(c,0.0,1.0);\n"
+"  dst.write(float4(srgb(c.r),srgb(c.g),srgb(c.b),1.0),id);}\n";
 
 static kk_gpu *g_kk = NULL;  // lazy, teilt libplacebos Device
 // Gecachte Intermediates (über Frames wiederverwendet — KEIN Per-Frame-Alloc, sonst
@@ -95,6 +138,7 @@ static kk_tex *c_dec = NULL, *c_deb = NULL, *c_lin = NULL, *c_tmpx = NULL, *c_li
 static kk_tex *c_alin = NULL, *c_atmpx = NULL;   // Anime4K-Post (2×-Input -> Ziel)
 static kk_tex *c_srgb = NULL;                    // CAS-Input (sRGB-Ausgabe vor Sharpen)
 static kk_tex *c_a2rgb = NULL;                   // ArtCNN: 2×-Luma decodet zu encodeter RGB
+static kk_tex *c_sig = NULL;                     // sigmoidiertes Linear (EWA-Upscale-Pre)
 static int c_W = 0, c_H = 0, c_OW = 0, c_OH = 0;
 static unsigned g_frame = 0;   // temporaler Grain-Index (Deband)
 
@@ -143,6 +187,8 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
         kk_tex_destroy(g,&c_srgb); kk_tex_destroy(g,&c_a2rgb);
         c_srgb  = kk_tex_create(g, OW, OH, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);   // CAS-Input
         c_a2rgb = kk_tex_create(g, W*2, H*2, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL); // ArtCNN-2×-RGB
+        kk_tex_destroy(g,&c_sig);
+        c_sig   = kk_tex_create(g, W, H, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);     // Sigmoid-Pre
         c_W=W; c_H=H; c_OW=OW; c_OH=OH;
     }
     if (!c_dec || !c_deb || !c_lin || !c_tmpx || !c_liny || !c_out) {
@@ -221,18 +267,27 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
         }
     }
 
-    // Linearize -> Lanczos X/Y -> delinearize(sRGB) -> Blit ins Target.
+    // Default-Scaler: Linearize -> [Sigmoid bei Upscale] -> EWA-lanczossharp -> [Unsig+]Delin
+    // -> [CAS] -> Blit (= libplacebos pl_render_high_quality-Default).
     kk_compute_args la0 = { .out=c_lin, .in={src_lin}, .n_in=1, .uniforms=&L, .uniforms_size=sizeof L };
     kk_gpu_compute(g, LIN_MSL, "lin", &la0);
-    struct { float scale; uint32_t axis; } px = { (float)OW/W, 0 }, py = { (float)OH/H, 1 };
-    kk_compute_args xa = { .out=c_tmpx, .in={c_lin},  .n_in=1, .uniforms=&px, .uniforms_size=sizeof px };
-    kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &xa);
-    kk_compute_args ya = { .out=c_liny, .in={c_tmpx}, .n_in=1, .uniforms=&py, .uniforms_size=sizeof py };
-    kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &ya);
-    // CAS-Sharpen (HD/Tuner, gated via ~cas): delin -> c_srgb -> CAS -> c_out; sonst delin -> c_out.
+    bool up = (OW > W) && c_sig;   // Sigmoid nur bei Upscale (wie libplacebo)
+    kk_tex *escin = c_lin;
+    if (up) {
+        kk_compute_args sa = { .out=c_sig, .in={c_lin}, .n_in=1 };
+        kk_gpu_compute(g, SIG_MSL, "sig", &sa);
+        escin = c_sig;
+    }
+    struct { float scale; uint32_t lutn; float radius; float lut[64]; } ew;
+    ew.scale = (float)OW/W; ew.lutn = 64; ew.radius = KK_EWA_RADIUS;
+    for (int i=0;i<64;i++) ew.lut[i]=KK_EWA_LUT[i];
+    kk_compute_args ea = { .out=c_liny, .in={escin}, .n_in=1, .uniforms=&ew, .uniforms_size=sizeof ew };
+    kk_gpu_compute(g, EWA_MSL, "ewa", &ea);
+    // CAS-Sharpen (HD/Tuner, gated ~cas): [unsig+]delin -> c_srgb -> CAS -> c_out; sonst -> c_out.
     bool cas = glsl && strcasestr(glsl, "cas") && c_srgb;
-    kk_compute_args la = { .out = cas ? c_srgb : c_out, .in={c_liny}, .n_in=1 };
-    kk_gpu_compute(g, DELIN_MSL, "delin", &la);
+    kk_tex *dout = cas ? c_srgb : c_out;
+    kk_compute_args la = { .out=dout, .in={c_liny}, .n_in=1 };
+    kk_gpu_compute(g, up ? DELINU_MSL : DELIN_MSL, up ? "delinu" : "delin", &la);
     if (cas) {
         kk_compute_args ca = { .out=c_out, .in={c_srgb}, .n_in=1 };
         kk_gpu_compute(g, CAS_MSL, "cas", &ca);
