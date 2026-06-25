@@ -45,8 +45,7 @@ let package = Package(
                 .linkedFramework("Metal"),
                 .linkedFramework("IOSurface"),
                 .linkedFramework("QuartzCore"),
-                .linkedLibrary("c++"),
-                .linkedLibrary("z"),
+                // c++/z (spirv-cross/libplacebo) entfernt — kk_gpu ist reines ObjC/C + Metal.
             ]
         ),
         .target(
