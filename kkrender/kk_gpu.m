@@ -156,6 +156,19 @@ kk_tex *kk_tex_create_3d(kk_gpu *g, int w, int h, int d, kk_fmt fmt,
     }
 }
 
+kk_tex *kk_tex_wrap_mtltexture(kk_gpu *g, void *mtltexture) {
+    @autoreleasepool {
+        id<MTLTexture> mt = (__bridge id<MTLTexture>) mtltexture;
+        if (!mt) return NULL;
+        struct kk_tex *t = calloc(1, sizeof(*t));
+        if (!t) return NULL;
+        t->w = (int) mt.width; t->h = (int) mt.height;
+        t->tex = mt;                       // existierende Textur (geteiltes Device, z.B. Display-Target)
+        CFRetain((__bridge CFTypeRef) t->tex);
+        return t;                          // Usage-Flags kommen von der Quell-Textur
+    }
+}
+
 kk_tex *kk_tex_wrap_iosurface(kk_gpu *g, void *iosurface, int plane, kk_fmt fmt,
                               uint32_t usage) {
     @autoreleasepool {
