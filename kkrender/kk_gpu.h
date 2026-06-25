@@ -44,6 +44,8 @@ void    kk_gpu_finish(kk_gpu *gpu);       // blockt bis GPU fertig (Bench/Downlo
 // --- Texturen -------------------------------------------------------------
 kk_tex *kk_tex_create(kk_gpu *gpu, int w, int h, kk_fmt fmt, uint32_t usage,
                       const void *initial_data); // initial_data optional (Upload)
+kk_tex *kk_tex_create_3d(kk_gpu *gpu, int w, int h, int d, kk_fmt fmt,
+                         const void *initial_data); // 3D-LUT (z.B. Gamut-Map), texture3d
 kk_tex *kk_tex_wrap_iosurface(kk_gpu *gpu, void *iosurface, int plane,
                               kk_fmt fmt);         // Decoder-CVPixelBuffer-Plane, zero-copy
 void    kk_tex_destroy(kk_gpu *gpu, kk_tex **ptex);

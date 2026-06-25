@@ -130,6 +130,30 @@ kk_tex *kk_tex_create(kk_gpu *g, int w, int h, kk_fmt fmt, uint32_t usage,
     }
 }
 
+kk_tex *kk_tex_create_3d(kk_gpu *g, int w, int h, int d, kk_fmt fmt,
+                         const void *initial_data) {
+    @autoreleasepool {
+        struct kk_tex *t = calloc(1, sizeof(*t));
+        if (!t) return NULL;
+        t->w = w; t->h = h;
+        MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
+        desc.textureType = MTLTextureType3D;
+        desc.pixelFormat = mtl_fmt(fmt);
+        desc.width = w; desc.height = h; desc.depth = d;
+        desc.usage = MTLTextureUsageShaderRead;
+        desc.storageMode = MTLStorageModeShared;
+        t->tex = [g->dev newTextureWithDescriptor:desc];
+        if (!t->tex) { free(t); return NULL; }
+        CFRetain((__bridge CFTypeRef) t->tex);
+        if (initial_data) {
+            NSUInteger bpr = (NSUInteger) w * fmt_bytes(fmt);
+            [t->tex replaceRegion:MTLRegionMake3D(0, 0, 0, w, h, d) mipmapLevel:0 slice:0
+                        withBytes:initial_data bytesPerRow:bpr bytesPerImage:bpr * h];
+        }
+        return t;
+    }
+}
+
 kk_tex *kk_tex_wrap_iosurface(kk_gpu *g, void *iosurface, int plane, kk_fmt fmt) {
     @autoreleasepool {
         IOSurfaceRef surf = (IOSurfaceRef) iosurface;
