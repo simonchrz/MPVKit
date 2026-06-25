@@ -3,13 +3,12 @@
 import PackageDescription
 import Foundation
 
-// KK_AOT-Zwei-Config: der Capture-Build (KK_AOT_CAPTURE=1) braucht den Runtime-
-// Compiler (Libshaderc/shaderc) zum Erzeugen des MSL-Cache; der Ship-Build (AOT)
-// linkt ihn NICHT (= die ~8,6 MB Ersparnis). Eine Package.swift, env-getoggelt.
-var mpvkitDeps: [Target.Dependency] = ["Libkkrender", "Libplacebo", "lcms2", "Libdovi", "MoltenVK"]
-if ProcessInfo.processInfo.environment["KK_AOT_CAPTURE"] != nil {
-    mpvkitDeps.append("Libshaderc_combined")
-}
+// libplacebo-DROP (kk_gpu deckt SDR+HDR komplett nativ, on-device verifiziert):
+// _MPVKit linkt NUR noch Libkkrender (eigener Metal-Renderer) + System-Frameworks.
+// Libplacebo/Libshaderc/lcms2/Libdovi/MoltenVK ENTFERNT — kk_gpu nutzt Metal direkt
+// (newLibraryWithSource statt shaderc/spirv-cross; keine Vulkan/lcms/dovi-Deps).
+// (Die binaryTarget-Defs bleiben für das App-ungenutzte _MPVKit-GPL-Target stehen.)
+var mpvkitDeps: [Target.Dependency] = ["Libkkrender"]
 
 let package = Package(
     name: "MPVKit",
