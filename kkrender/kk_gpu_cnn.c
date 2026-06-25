@@ -157,3 +157,17 @@ kk_tex *kk_gpu_artcnn(kk_gpu *g, kk_tex *luma, const char *weights_path) {
     kk_gpu_compute(g,A_KD2S,"ad2s",&(kk_compute_args){.out=acOut,.in={ac6},.n_in=1});
     return acOut;
 }
+
+// Cache-Freigabe (Speicher): nur der aktive Render-Pfad soll resident sein — die CNN-Caches
+// sind groß (Anime4K ~20 Texturen, ArtCNN 6× 2×-Texturen). nil-safe + idempotent. Weights
+// (g_w/g_aw, klein) bleiben geladen. Reset der Dim-Tracker → lazy Re-Alloc bei nächster Nutzung.
+void kk_gpu_anime4k_release(kk_gpu *g) {
+    kk_tex_destroy(g,&s1); kk_tex_destroy(g,&s2); kk_tex_destroy(g,&dering);
+    kk_tex_destroy(g,&restored); kk_tex_destroy(g,&lastT); kk_tex_destroy(g,&a4kOut);
+    for (int i=0;i<7;i++) { kk_tex_destroy(g,&cv[i]); kk_tex_destroy(g,&cv2[i]); }
+    cW=0; cH=0;
+}
+void kk_gpu_artcnn_release(kk_gpu *g) {
+    for (int i=0;i<6;i++) kk_tex_destroy(g,&ac[i]);
+    kk_tex_destroy(g,&ac6); kk_tex_destroy(g,&acOut); acW=0; acH=0;
+}

@@ -18,6 +18,12 @@
 #include <stdio.h>
 extern kk_tex *kk_gpu_anime4k(kk_gpu *gpu, kk_tex *in, const char *weights_path);
 extern kk_tex *kk_gpu_artcnn(kk_gpu *gpu, kk_tex *luma, const char *weights_path);
+// CNN-Cache-Freigabe (kk_gpu_cnn.c) — nicht-aktive Pfade freigeben (Speicher).
+extern void kk_gpu_anime4k_release(kk_gpu *gpu);
+extern void kk_gpu_artcnn_release(kk_gpu *gpu);
+// Cache-Freigabe pro Domäne (Def. am Dateiende) — nur der aktive Pfad bleibt resident.
+static void kk_gpu_sdr_release(kk_gpu *g);
+static void kk_gpu_hdr_release(kk_gpu *g);
 
 // DEC: YUV -> encodete RGB (exakte Matrix via pl_color_repr_decode, 9+3). KEIN linearize
 // (Deband sitzt auf der encodeten Quelle, wie libplacebos source-deband).
@@ -233,6 +239,14 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
         kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt); return false;
     }
 
+    // Speicher: nur der aktive Pfad resident. SDR-Pfad → HDR-Caches frei; nicht-aktiven
+    // CNN-Cache frei (idempotent, nil-safe). Hält die RAM-Baseline niedrig (kein Akkumulieren
+    // über Content-/Pfad-Wechsel → Jetsam-Schutz).
+    kk_gpu_hdr_release(g);
+    { const char *gl = getenv("KUCKUCK_GLSL_SHADER");
+      if (!(gl && strcasestr(gl, "anime4k"))) kk_gpu_anime4k_release(g);
+      if (!(gl && strcasestr(gl, "artcnn")))  kk_gpu_artcnn_release(g); }
+
     // Decode -> encodete RGB (echte YUV->RGB-Matrix vom Hook, Fallback BT.709 limited).
     struct { float m[12]; } D;
     if (yuv2rgb) { for (int i=0;i<12;i++) D.m[i]=yuv2rgb[i]; }
@@ -391,6 +405,8 @@ bool kk_gpu_render_hdr(void *metal_device, void *cv_pixbuf, void *target_texture
     if (!h_pq || !h_ewa || !h_out) {
         kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt); return false;
     }
+    // Speicher: HDR-Pfad nutzt nur h_* → SDR- + CNN-Caches freigeben (idempotent).
+    kk_gpu_sdr_release(g); kk_gpu_anime4k_release(g); kk_gpu_artcnn_release(g);
 
     kk_compute_args mk = { .out=h_pq, .in={luma,chroma}, .n_in=2, .linear={false,true} };
     kk_gpu_compute(g, MKPQ_MSL, "mk", &mk);                           // P010 -> linear 2020 (10000-norm)
@@ -406,4 +422,25 @@ bool kk_gpu_render_hdr(void *metal_device, void *cv_pixbuf, void *target_texture
 
     kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt);
     return true;
+}
+
+// --- Cache-Freigabe (Speicher / Jetsam-Schutz) ---
+// SDR-Pfad-Caches (common + pfad-spezifisch). Reset c_W → lazy Re-Alloc bei nächstem SDR-Frame.
+static void kk_gpu_sdr_release(kk_gpu *g) {
+    kk_tex_destroy(g,&c_dec); kk_tex_destroy(g,&c_deb); kk_tex_destroy(g,&c_lin);
+    kk_tex_destroy(g,&c_tmpx); kk_tex_destroy(g,&c_liny); kk_tex_destroy(g,&c_out);
+    kk_tex_destroy(g,&c_alin); kk_tex_destroy(g,&c_atmpx); kk_tex_destroy(g,&c_srgb);
+    kk_tex_destroy(g,&c_a2rgb); kk_tex_destroy(g,&c_sig);
+    c_W = c_H = c_OW = c_OH = 0;
+}
+// HDR-Pfad-Caches. Reset h_W → lazy Re-Alloc bei nächstem HDR-Frame.
+static void kk_gpu_hdr_release(kk_gpu *g) {
+    kk_tex_destroy(g,&h_pq); kk_tex_destroy(g,&h_ewa); kk_tex_destroy(g,&h_out);
+    h_W = h_H = h_OW = h_OH = 0;
+}
+// Alle kk_gpu-Caches freigeben (Teardown / Player-Close): SDR + HDR + beide CNN. g_kk bleibt.
+void kk_gpu_release_all(void) {
+    if (!g_kk) return;
+    kk_gpu_sdr_release(g_kk); kk_gpu_hdr_release(g_kk);
+    kk_gpu_anime4k_release(g_kk); kk_gpu_artcnn_release(g_kk);
 }

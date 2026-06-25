@@ -169,5 +169,7 @@ int kuckuck_hybrid_render(void *ctx, void *cv_pixbuf, void *target_texture)
 
 void kuckuck_hybrid_destroy(void *ctx)
 {
+    extern void kk_gpu_release_all(void);
+    kk_gpu_release_all();   // alle kk_gpu-Render-Caches freigeben (Speicher beim Player-Close)
     free(ctx);
 }
