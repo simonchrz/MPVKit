@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #include <CoreVideo/CoreVideo.h>
 
@@ -54,6 +55,27 @@ static int hybrid_primidx(CVPixelBufferRef pb)
     return -1;
 }
 
+// Quell-Peak (nits) aus den HDR-Metadaten: Mastering-Display-Max (ST 2086) bevorzugt,
+// sonst MaxCLL (CEA-861.3), sonst 1000 (statischer Fallback). Range-Guard [1,10000]
+// fängt fehlende/fehl-interpretierte Blobs ab.
+static float hybrid_src_peak(CVPixelBufferRef pb)
+{
+    CFTypeRef md = CVBufferGetAttachment(pb, kCVImageBufferMasteringDisplayColorVolumeKey, NULL);
+    if (md && CFGetTypeID(md) == CFDataGetTypeID() && CFDataGetLength((CFDataRef) md) >= 24) {
+        const uint8_t *b = CFDataGetBytePtr((CFDataRef) md);
+        uint32_t maxlum = ((uint32_t)b[16]<<24)|((uint32_t)b[17]<<16)|((uint32_t)b[18]<<8)|b[19]; // 0.0001 cd/m²
+        float n = maxlum / 10000.0f;
+        if (n >= 1.0f && n <= 10000.0f) return n;
+    }
+    CFTypeRef cll = CVBufferGetAttachment(pb, kCVImageBufferContentLightLevelInfoKey, NULL);
+    if (cll && CFGetTypeID(cll) == CFDataGetTypeID() && CFDataGetLength((CFDataRef) cll) >= 2) {
+        const uint8_t *b = CFDataGetBytePtr((CFDataRef) cll);
+        uint32_t maxcll = ((uint32_t)b[0]<<8)|b[1];   // MaxCLL (nits, big-endian)
+        if (maxcll >= 1 && maxcll <= 10000) return (float) maxcll;
+    }
+    return 1000.0f;
+}
+
 void *kuckuck_hybrid_create(void *mtl_device)
 {
     if (!mtl_device)
@@ -76,16 +98,17 @@ int kuckuck_hybrid_render(void *ctx, void *cv_pixbuf, void *target_texture)
     // HDR (P010): IPT-Tonemap zum EDR-Peak -> PQ/2020. LUT-Gen gecacht (teuer).
     if (pfmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
         pfmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange) {
-        static kk_hdr_params hp; static float cached_peak = -1.0f;
+        static kk_hdr_params hp; static float cached_dst = -1.0f, cached_src = -1.0f;
         const char *nits = getenv("KUCKUCK_HDR_TARGET_NITS");
-        float peak = nits ? (float) atof(nits) : 203.0f; if (peak < 1.0f) peak = 203.0f;
-        if (peak != cached_peak) {
+        float dst_peak = nits ? (float) atof(nits) : 203.0f; if (dst_peak < 1.0f) dst_peak = 203.0f;
+        float src_peak = hybrid_src_peak(pb);   // echter Quell-Peak aus Mastering/MaxCLL (statt statisch 1000)
+        if (dst_peak != cached_dst || src_peak != cached_src) {
             memcpy(hp.rgb2lms, KK_IPT_RGB2LMS_2020, 9 * sizeof(float));
             memcpy(hp.lms2rgb, KK_IPT_LMS2RGB_2020, 9 * sizeof(float));
             memcpy(hp.lms2ipt, KK_IPT_LMS2IPT, 9 * sizeof(float));
             memcpy(hp.ipt2lms, KK_IPT_IPT2LMS, 9 * sizeof(float));
-            kk_hdr_tone(1000.0f, peak, 0.005f, &hp.in_min, &hp.in_max, &hp.out_min, &hp.out_max, hp.tone_lut);
-            cached_peak = peak;
+            kk_hdr_tone(src_peak, dst_peak, 0.005f, &hp.in_min, &hp.in_max, &hp.out_min, &hp.out_max, hp.tone_lut);
+            cached_dst = dst_peak; cached_src = src_peak;
         }
         return kk_gpu_render_hdr(p->device, cv_pixbuf, target_texture, &hp) ? 0 : -2;
     }
