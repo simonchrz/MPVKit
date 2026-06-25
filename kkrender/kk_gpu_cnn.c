@@ -90,3 +90,70 @@ kk_tex *kk_gpu_anime4k(kk_gpu *g, kk_tex *in, const char *weights_path) {
     kk_gpu_compute(g,D2S,"d2s",&(kk_compute_args){.out=a4kOut,.in={lastT,restored},.n_in=2,.linear={false,true}});
     return a4kOut;
 }
+
+// ===== ArtCNN_C4F16 (Realfilm-SD-Luma-Upscaler, HOOK LUMA) =====
+// 9-Pass-Kette aus headless kk_artcnn_full (maxerr 1 vs CPU): LUMA -> [P0 1ch-vec4-Conv,
+// 16feat-2×2] -> [P1-5 16ch-mat4-Conv+ReLU]×5 -> [P6 Skip(conv2d_5+conv2d) 16->4] ->
+// Depth-to-Space -> 2×-LUMA. Input = R8-Luma (W×H), Output = 2×-Luma (RGBA16F, .r).
+static const char *A_K0=
+"#include <metal_stdlib>\nusing namespace metal;\nstruct W{float w[144];float b[16];};\n"
+"kernel void ak0(texture2d<float> luma [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
+" constant W& wb [[buffer(0)]], uint2 gid [[thread_position_in_grid]]){ uint lw=luma.get_width(),lh=luma.get_height(); if(gid.x>=lw||gid.y>=lh)return;\n"
+" float4 r[4]; for(int k=0;k<4;k++) r[k]=float4(wb.b[k*4],wb.b[k*4+1],wb.b[k*4+2],wb.b[k*4+3]);\n"
+" for(int X=0;X<3;X++)for(int Y=0;Y<3;Y++){ int2 lp=clamp(int2(gid)+int2(X-1,Y-1),int2(0),int2(int(lw)-1,int(lh)-1));\n"
+"   float v=luma.read(uint2(lp)).x; int sp=Y*3+X;\n"
+"   for(int k=0;k<4;k++){ int b=(k*9+sp)*4; r[k]+=float4(wb.w[b],wb.w[b+1],wb.w[b+2],wb.w[b+3])*v; } }\n"
+" uint2 o=gid*2; dst.write(r[0],o); dst.write(r[1],o+uint2(1,0)); dst.write(r[2],o+uint2(0,1)); dst.write(r[3],o+uint2(1,1));}\n";
+static const char *A_K16=
+"#include <metal_stdlib>\nusing namespace metal;\nstruct W{float w[2304];float b[16];};\n"
+"kernel void ak16(texture2d<float> in0 [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
+" constant W& wb [[buffer(0)]], uint2 gid [[thread_position_in_grid]]){ uint lw=dst.get_width()/2,lh=dst.get_height()/2; if(gid.x>=lw||gid.y>=lh)return;\n"
+" int iw=int(in0.get_width()),ih=int(in0.get_height()); int2 sub[4]={int2(0,0),int2(1,0),int2(0,1),int2(1,1)};\n"
+" float4 r[4]; for(int k=0;k<4;k++) r[k]=float4(wb.b[k*4],wb.b[k*4+1],wb.b[k*4+2],wb.b[k*4+3]);\n"
+" for(int C=0;C<4;C++)for(int X=0;X<3;X++)for(int Y=0;Y<3;Y++){ int2 ip=clamp(int2((int(gid.x)+X-1)*2+sub[C].x,(int(gid.y)+Y-1)*2+sub[C].y),int2(0),int2(iw-1,ih-1));\n"
+"   float4 v=in0.read(uint2(ip)); int sp=Y*3+X;\n"
+"   for(int k=0;k<4;k++){ int b=((k*4+C)*9+sp)*16; float4x4 M=float4x4(wb.w[b],wb.w[b+1],wb.w[b+2],wb.w[b+3],wb.w[b+4],wb.w[b+5],wb.w[b+6],wb.w[b+7],wb.w[b+8],wb.w[b+9],wb.w[b+10],wb.w[b+11],wb.w[b+12],wb.w[b+13],wb.w[b+14],wb.w[b+15]); r[k]+=M*v; } }\n"
+" uint2 o=gid*2; dst.write(max(r[0],0.0),o); dst.write(max(r[1],0.0),o+uint2(1,0)); dst.write(max(r[2],0.0),o+uint2(0,1)); dst.write(max(r[3],0.0),o+uint2(1,1));}\n";
+static const char *A_K6=
+"#include <metal_stdlib>\nusing namespace metal;\nstruct W{float w[576];float b[4];};\n"
+"kernel void ak6(texture2d<float> in5 [[texture(0)]], texture2d<float> inS [[texture(1)]], texture2d<float,access::write> dst [[texture(2)]],\n"
+" constant W& wb [[buffer(0)]], uint2 gid [[thread_position_in_grid]]){ uint lw=dst.get_width(),lh=dst.get_height(); if(gid.x>=lw||gid.y>=lh)return;\n"
+" int iw=int(in5.get_width()),ih=int(in5.get_height()); int2 sub[4]={int2(0,0),int2(1,0),int2(0,1),int2(1,1)};\n"
+" float4 r=float4(wb.b[0],wb.b[1],wb.b[2],wb.b[3]);\n"
+" for(int C=0;C<4;C++)for(int X=0;X<3;X++)for(int Y=0;Y<3;Y++){ int2 ip=clamp(int2((int(gid.x)+X-1)*2+sub[C].x,(int(gid.y)+Y-1)*2+sub[C].y),int2(0),int2(iw-1,ih-1));\n"
+"   float4 v=in5.read(uint2(ip))+inS.read(uint2(ip)); int sp=Y*3+X; int b=(C*9+sp)*16;\n"
+"   float4x4 M=float4x4(wb.w[b],wb.w[b+1],wb.w[b+2],wb.w[b+3],wb.w[b+4],wb.w[b+5],wb.w[b+6],wb.w[b+7],wb.w[b+8],wb.w[b+9],wb.w[b+10],wb.w[b+11],wb.w[b+12],wb.w[b+13],wb.w[b+14],wb.w[b+15]); r+=M*v; }\n"
+" dst.write(r,gid);}\n";
+static const char *A_KD2S=
+"#include <metal_stdlib>\nusing namespace metal;\n"
+"kernel void ad2s(texture2d<float> c6 [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]], uint2 gid [[thread_position_in_grid]]){\n"
+" uint w=dst.get_width(),h=dst.get_height(); if(gid.x>=w||gid.y>=h)return;\n"
+" uint2 t=gid/2; uint comp=(gid.y%2)*2+(gid.x%2); float4 v=c6.read(t); float l=clamp(v[comp],0.0,1.0); dst.write(float4(l,l,l,1.0),gid);}\n";
+
+static float *g_aw = NULL;   // 12340 floats
+static kk_tex *ac[6]={0}, *ac6=NULL, *acOut=NULL;
+static int acW=0, acH=0;
+
+// ArtCNN auf R8-Luma (W×H) -> 2×-Luma (RGBA16F, .r). NULL bei Fehler.
+kk_tex *kk_gpu_artcnn(kk_gpu *g, kk_tex *luma, const char *weights_path) {
+    if (!g_aw) {
+        FILE *f=fopen(weights_path,"rb"); if(!f) return NULL;
+        g_aw=malloc(12340*4); if(fread(g_aw,4,12340,f)!=12340){fclose(f);free(g_aw);g_aw=NULL;return NULL;} fclose(f);
+    }
+    int W=kk_tex_w(luma), H=kk_tex_h(luma), IW=W*2, IH=H*2;
+    if (W!=acW || H!=acH) {
+        for(int i=0;i<6;i++) kk_tex_destroy(g,&ac[i]);
+        kk_tex_destroy(g,&ac6); kk_tex_destroy(g,&acOut);
+        for(int i=0;i<6;i++) ac[i]=kk_tex_create(g,IW,IH,KK_FMT_RGBA16F,KK_TEX_SAMPLE|KK_TEX_STORAGE,NULL);
+        ac6=kk_tex_create(g,W,H,KK_FMT_RGBA16F,KK_TEX_SAMPLE|KK_TEX_STORAGE,NULL);
+        acOut=kk_tex_create(g,IW,IH,KK_FMT_RGBA16F,KK_TEX_SAMPLE|KK_TEX_STORAGE,NULL);
+        acW=W; acH=H;
+    }
+    if (!acOut) return NULL;
+    int OFF[7]={0,160,2480,4800,7120,9440,11760};
+    kk_gpu_compute(g,A_K0,"ak0",&(kk_compute_args){.out=ac[0],.in={luma},.n_in=1,.uniforms=g_aw+OFF[0],.uniforms_size=160*4});
+    for(int p=1;p<=5;p++) kk_gpu_compute(g,A_K16,"ak16",&(kk_compute_args){.out=ac[p],.in={ac[p-1]},.n_in=1,.uniforms=g_aw+OFF[p],.uniforms_size=2320*4});
+    kk_gpu_compute(g,A_K6,"ak6",&(kk_compute_args){.out=ac6,.in={ac[5],ac[0]},.n_in=2,.uniforms=g_aw+OFF[6],.uniforms_size=580*4});
+    kk_gpu_compute(g,A_KD2S,"ad2s",&(kk_compute_args){.out=acOut,.in={ac6},.n_in=1});
+    return acOut;
+}

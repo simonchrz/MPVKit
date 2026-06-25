@@ -17,6 +17,7 @@
 #include <string.h>
 #include <stdio.h>
 extern kk_tex *kk_gpu_anime4k(kk_gpu *gpu, kk_tex *in, const char *weights_path);
+extern kk_tex *kk_gpu_artcnn(kk_gpu *gpu, kk_tex *luma, const char *weights_path);
 
 // DEC: YUV -> encodete RGB (exakte Matrix via pl_color_repr_decode, 9+3). KEIN linearize
 // (Deband sitzt auf der encodeten Quelle, wie libplacebos source-deband).
@@ -93,6 +94,7 @@ static kk_gpu *g_kk = NULL;  // lazy, teilt libplacebos Device
 static kk_tex *c_dec = NULL, *c_deb = NULL, *c_lin = NULL, *c_tmpx = NULL, *c_liny = NULL, *c_out = NULL;
 static kk_tex *c_alin = NULL, *c_atmpx = NULL;   // Anime4K-Post (2×-Input -> Ziel)
 static kk_tex *c_srgb = NULL;                    // CAS-Input (sRGB-Ausgabe vor Sharpen)
+static kk_tex *c_a2rgb = NULL;                   // ArtCNN: 2×-Luma decodet zu encodeter RGB
 static int c_W = 0, c_H = 0, c_OW = 0, c_OH = 0;
 static unsigned g_frame = 0;   // temporaler Grain-Index (Deband)
 
@@ -138,8 +140,9 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
         kk_tex_destroy(g,&c_alin); kk_tex_destroy(g,&c_atmpx);
         c_alin  = kk_tex_create(g, W*2, H*2, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL); // linearisierter Anime4K-2×
         c_atmpx = kk_tex_create(g, OW,  H*2, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL); // X-skaliert (2H)
-        kk_tex_destroy(g,&c_srgb);
+        kk_tex_destroy(g,&c_srgb); kk_tex_destroy(g,&c_a2rgb);
         c_srgb  = kk_tex_create(g, OW, OH, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);   // CAS-Input
+        c_a2rgb = kk_tex_create(g, W*2, H*2, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL); // ArtCNN-2×-RGB
         c_W=W; c_H=H; c_OW=OW; c_OH=OH;
     }
     if (!c_dec || !c_deb || !c_lin || !c_tmpx || !c_liny || !c_out) {
@@ -172,7 +175,7 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
     // Anime4K-Cartoon-Upscaler (gated via KUCKUCK_GLSL_SHADER~anime4k). Eigener Post-Scale
     // (2×-Output -> Ziel). Bei Fehler (Weights/Alloc) Fallback auf den Lanczos-Pfad unten.
     const char *glsl = getenv("KUCKUCK_GLSL_SHADER");
-    if (glsl && strstr(glsl, "anime4k") && c_alin && c_atmpx) {
+    if (glsl && strcasestr(glsl, "anime4k") && c_alin && c_atmpx) {
         const char *res = getenv("KUCKUCK_KK_CAPTURE_SHADERS");
         char wp[1200]; snprintf(wp, sizeof wp, "%s/anime4k_a_m.weights", res ? res : ".");
         kk_tex *a = kk_gpu_anime4k(g, src_lin, wp);   // 2W×2H encodete RGB
@@ -193,6 +196,31 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
         }
     }
 
+    // ArtCNN-Realfilm-SD-Luma-Upscaler (gated ~artcnn): luma -> 2×-Luma -> DEC(+chroma) ->
+    // 2× encodete RGB -> geteilter 2×-Post (linearize -> Lanczos-to-Ziel -> sRGB).
+    if (glsl && strcasestr(glsl, "artcnn") && c_a2rgb && c_alin && c_atmpx) {
+        const char *res = getenv("KUCKUCK_KK_CAPTURE_SHADERS");
+        char wp[1200]; snprintf(wp, sizeof wp, "%s/artcnn_c4f16.weights", res ? res : ".");
+        kk_tex *luma2 = kk_gpu_artcnn(g, luma, wp);   // 2W×2H Luma (.r)
+        if (luma2) {
+            kk_compute_args ad = { .out=c_a2rgb, .in={luma2, chroma}, .n_in=2, .linear={false,true}, .uniforms=&D, .uniforms_size=sizeof D };
+            kk_gpu_compute(g, DEC_MSL, "dec", &ad);   // 2×-Luma + chroma -> encodete RGB
+            kk_compute_args alz = { .out=c_alin, .in={c_a2rgb}, .n_in=1, .uniforms=&L, .uniforms_size=sizeof L };
+            kk_gpu_compute(g, LIN_MSL, "lin", &alz);
+            struct { float scale; uint32_t axis; } apx = { (float)OW/(W*2), 0 }, apy = { (float)OH/(H*2), 1 };
+            kk_compute_args axa = { .out=c_atmpx, .in={c_alin}, .n_in=1, .uniforms=&apx, .uniforms_size=sizeof apx };
+            kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &axa);
+            kk_compute_args aya = { .out=c_liny, .in={c_atmpx}, .n_in=1, .uniforms=&apy, .uniforms_size=sizeof apy };
+            kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &aya);
+            kk_compute_args ala = { .out=c_out, .in={c_liny}, .n_in=1 };
+            kk_gpu_compute(g, DELIN_MSL, "delin", &ala);
+            kk_gpu_blit(g, c_out, tgt);
+            kk_gpu_finish(g);
+            kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt);
+            return true;
+        }
+    }
+
     // Linearize -> Lanczos X/Y -> delinearize(sRGB) -> Blit ins Target.
     kk_compute_args la0 = { .out=c_lin, .in={src_lin}, .n_in=1, .uniforms=&L, .uniforms_size=sizeof L };
     kk_gpu_compute(g, LIN_MSL, "lin", &la0);
@@ -202,7 +230,7 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
     kk_compute_args ya = { .out=c_liny, .in={c_tmpx}, .n_in=1, .uniforms=&py, .uniforms_size=sizeof py };
     kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &ya);
     // CAS-Sharpen (HD/Tuner, gated via ~cas): delin -> c_srgb -> CAS -> c_out; sonst delin -> c_out.
-    bool cas = glsl && strstr(glsl, "cas") && c_srgb;
+    bool cas = glsl && strcasestr(glsl, "cas") && c_srgb;
     kk_compute_args la = { .out = cas ? c_srgb : c_out, .in={c_liny}, .n_in=1 };
     kk_gpu_compute(g, DELIN_MSL, "delin", &la);
     if (cas) {
