@@ -43,6 +43,10 @@ static const char *DELIN_MSL =
 "  float3 c=clamp(src.read(id).rgb,0.0,1.0); dst.write(float4(srgb(c.r),srgb(c.g),srgb(c.b),1.0),id);}\n";
 
 static kk_gpu *g_kk = NULL;  // lazy, teilt libplacebos Device
+// Gecachte Intermediates (über Frames wiederverwendet — KEIN Per-Frame-Alloc, sonst
+// Jetsam-OOM durch Allok-Churn in Ziel-Auflösung). Re-create nur bei Dim-Wechsel.
+static kk_tex *c_lin = NULL, *c_tmpx = NULL, *c_liny = NULL, *c_out = NULL;
+static int c_W = 0, c_H = 0, c_OW = 0, c_OH = 0;
 
 // true = von kk_gpu gerendert; false = Fallback auf pl_render_image.
 bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture) {
@@ -71,25 +75,32 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture) {
     int OW = kk_tex_w(tgt), OH = kk_tex_h(tgt);
     if (W<=0||H<=0||OW<=0||OH<=0) { kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt); return false; }
 
-    kk_tex *lin  = kk_tex_create(g, W,  H,  KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
-    kk_tex *tmpx = kk_tex_create(g, OW, H,  KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
-    kk_tex *liny = kk_tex_create(g, OW, OH, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
-    kk_tex *out  = kk_tex_create(g, OW, OH, KK_FMT_BGRA8,   KK_TEX_STORAGE, NULL); // eigener Output
+    // Intermediates nur bei Dim-Wechsel (neu)allozieren — sonst über Frames wiederverwenden.
+    if (W != c_W || H != c_H || OW != c_OW || OH != c_OH) {
+        kk_tex_destroy(g,&c_lin); kk_tex_destroy(g,&c_tmpx); kk_tex_destroy(g,&c_liny); kk_tex_destroy(g,&c_out);
+        c_lin  = kk_tex_create(g, W,  H,  KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
+        c_tmpx = kk_tex_create(g, OW, H,  KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
+        c_liny = kk_tex_create(g, OW, OH, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
+        c_out  = kk_tex_create(g, OW, OH, KK_FMT_BGRA8,   KK_TEX_STORAGE, NULL);
+        c_W=W; c_H=H; c_OW=OW; c_OH=OH;
+    }
+    if (!c_lin || !c_tmpx || !c_liny || !c_out) {
+        kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt); return false;
+    }
 
     float ab[2] = { 0.8704f, 0.0595f };  // BT.1886, csp_min=0.001 -> a=(1-lb)^2.4, b=lb/(1-lb)
     struct { float scale; uint32_t axis; } px = { (float)OW/W, 0 }, py = { (float)OH/H, 1 };
-    kk_compute_args da = { .out=lin, .in={luma,chroma}, .n_in=2, .linear={false,true}, .uniforms=ab, .uniforms_size=sizeof ab };
+    kk_compute_args da = { .out=c_lin, .in={luma,chroma}, .n_in=2, .linear={false,true}, .uniforms=ab, .uniforms_size=sizeof ab };
     kk_gpu_compute(g, DECLIN_MSL, "dec", &da);
-    kk_compute_args xa = { .out=tmpx, .in={lin},  .n_in=1, .uniforms=&px, .uniforms_size=sizeof px };
+    kk_compute_args xa = { .out=c_tmpx, .in={c_lin},  .n_in=1, .uniforms=&px, .uniforms_size=sizeof px };
     kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &xa);
-    kk_compute_args ya = { .out=liny, .in={tmpx}, .n_in=1, .uniforms=&py, .uniforms_size=sizeof py };
+    kk_compute_args ya = { .out=c_liny, .in={c_tmpx}, .n_in=1, .uniforms=&py, .uniforms_size=sizeof py };
     kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &ya);
-    kk_compute_args la = { .out=out, .in={liny}, .n_in=1 };
+    kk_compute_args la = { .out=c_out, .in={c_liny}, .n_in=1 };
     kk_gpu_compute(g, DELIN_MSL, "delin", &la);
-    kk_gpu_blit(g, out, tgt);            // eigener Output -> Display-Target
+    kk_gpu_blit(g, c_out, tgt);          // eigener Output -> Display-Target
     kk_gpu_finish(g);
 
-    kk_tex_destroy(g,&lin); kk_tex_destroy(g,&tmpx); kk_tex_destroy(g,&liny); kk_tex_destroy(g,&out);
-    kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt);
+    kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt); // nur die billigen Wraps
     return true;
 }
