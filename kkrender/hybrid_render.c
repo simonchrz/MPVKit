@@ -405,10 +405,12 @@ int kuckuck_hybrid_render(void *ctx, void *cv_pixbuf, void *target_texture)
                 struct pl_color_space hdst = { .primaries = PL_COLOR_PRIM_BT_2020, .transfer = PL_COLOR_TRC_PQ,
                     .hdr = { .max_luma = peak, .min_luma = 0.005f } };
                 struct pl_color_space si = hsrc, di = hdst; pl_color_space_infer_map(&si, &di);
-                pl_matrix3x3 r2l = pl_ipt_rgb2lms(pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020));
-                pl_matrix3x3 l2r = pl_ipt_lms2rgb(pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020));
-                for (int r=0;r<3;r++) for (int c=0;c<3;c++) { hp.rgb2lms[r*3+c]=r2l.m[r][c];
-                    hp.lms2ipt[r*3+c]=pl_ipt_lms2ipt.m[r][c]; hp.ipt2lms[r*3+c]=pl_ipt_ipt2lms.m[r][c]; hp.lms2rgb[r*3+c]=l2r.m[r][c]; }
+                // NATIV (eingebackene IPT-Matrizen für BT.2020) statt pl_ipt_*.
+                extern const float KK_IPT_RGB2LMS_2020[9], KK_IPT_LMS2RGB_2020[9], KK_IPT_LMS2IPT[9], KK_IPT_IPT2LMS[9];
+                memcpy(hp.rgb2lms, KK_IPT_RGB2LMS_2020, 9*sizeof(float));
+                memcpy(hp.lms2rgb, KK_IPT_LMS2RGB_2020, 9*sizeof(float));
+                memcpy(hp.lms2ipt, KK_IPT_LMS2IPT, 9*sizeof(float));
+                memcpy(hp.ipt2lms, KK_IPT_IPT2LMS, 9*sizeof(float));
                 struct pl_tone_map_params tone = { .function = &pl_tone_map_bt2390, .input_scaling = PL_HDR_PQ,
                     .output_scaling = PL_HDR_PQ, .lut_size = 256, .hdr = si.hdr };
                 tone.constants = pl_color_map_default_params.tone_constants;
@@ -425,21 +427,16 @@ int kuckuck_hybrid_render(void *ctx, void *cv_pixbuf, void *target_texture)
                 return 0;
         }
         if (kkgpu && p->metal && !isHDR) {
-            // Echte YUV->RGB-Decode-Matrix aus dem Pixbuf (601/709/2020 + Range) via libplacebo.
-            OSType pf = pfmt;
-            bool full = (pf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
-            struct pl_color_repr repr = { .sys = hybrid_matrix(pb),
-                .levels = full ? PL_COLOR_LEVELS_FULL : PL_COLOR_LEVELS_LIMITED,
-                .bits = { .sample_depth = 8, .color_depth = 8, .bit_shift = 0 } };
-            pl_transform3x3 ts = pl_color_repr_decode(&repr, NULL);
-            float yuv2rgb[12];
-            for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) yuv2rgb[r*3+c] = ts.mat.m[r][c];
-            yuv2rgb[9] = ts.c[0]; yuv2rgb[10] = ts.c[1]; yuv2rgb[11] = ts.c[2];
-            // Primaries-Gamut: Quell-Primaries -> BT.709-Display (RGB-RGB, Linear-Light; 709->identity).
-            pl_matrix3x3 pm = pl_get_color_mapping_matrix(pl_raw_primaries_get(hybrid_prim(pb)),
-                pl_raw_primaries_get(PL_COLOR_PRIM_BT_709), PL_INTENT_RELATIVE_COLORIMETRIC);
-            float prim2disp[9];
-            for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) prim2disp[r*3+c] = pm.m[r][c];
+            // NATIV (eingebackene Matrizen) statt pl_color_repr_decode / pl_get_color_mapping_matrix.
+            extern void kk_sdr_decode_matrix(int sys, int full, float out[12]);
+            extern void kk_primaries_to709(int prim, float out[9]);
+            bool full = (pfmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
+            enum pl_color_system sys = hybrid_matrix(pb);
+            int sysidx = (sys==PL_COLOR_SYSTEM_BT_601)?0 : (sys==PL_COLOR_SYSTEM_SMPTE_240M)?2 : (sys==PL_COLOR_SYSTEM_BT_2020_NC)?3 : 1;
+            float yuv2rgb[12]; kk_sdr_decode_matrix(sysidx, full?1:0, yuv2rgb);
+            enum pl_color_primaries prm = hybrid_prim(pb);
+            int primidx = (prm==PL_COLOR_PRIM_BT_601_525)?0 : (prm==PL_COLOR_PRIM_BT_601_625)?1 : (prm==PL_COLOR_PRIM_BT_2020)?2 : -1;
+            float prim2disp[9]; kk_primaries_to709(primidx, prim2disp);
             if (kk_gpu_render(p->metal->device, cv_pixbuf, target_texture, yuv2rgb, prim2disp))
                 return 0;
         }
