@@ -385,7 +385,7 @@ int kuckuck_hybrid_render(void *ctx, void *cv_pixbuf, void *target_texture)
     // (KUCKUCK_KK_GPU=1). Handhabt SDR-NV12 nativ + zero-copy ins Target; sonst false
     // -> Fallback auf den libplacebo-Pfad unten. On-Device-A/B gegen pl_render_image.
     {
-        extern bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture, const float *yuv2rgb);
+        extern bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture, const float *yuv2rgb, const float *prim2disp);
         static int kkgpu = -1;
         if (kkgpu < 0) { const char *e = getenv("KUCKUCK_KK_GPU"); kkgpu = (e && e[0] == '1') ? 1 : 0; }
         if (kkgpu && p->metal) {
@@ -399,7 +399,12 @@ int kuckuck_hybrid_render(void *ctx, void *cv_pixbuf, void *target_texture)
             float yuv2rgb[12];
             for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) yuv2rgb[r*3+c] = ts.mat.m[r][c];
             yuv2rgb[9] = ts.c[0]; yuv2rgb[10] = ts.c[1]; yuv2rgb[11] = ts.c[2];
-            if (kk_gpu_render(p->metal->device, cv_pixbuf, target_texture, yuv2rgb))
+            // Primaries-Gamut: Quell-Primaries -> BT.709-Display (RGB-RGB, Linear-Light; 709->identity).
+            pl_matrix3x3 pm = pl_get_color_mapping_matrix(pl_raw_primaries_get(hybrid_prim(pb)),
+                pl_raw_primaries_get(PL_COLOR_PRIM_BT_709), PL_INTENT_RELATIVE_COLORIMETRIC);
+            float prim2disp[9];
+            for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) prim2disp[r*3+c] = pm.m[r][c];
+            if (kk_gpu_render(p->metal->device, cv_pixbuf, target_texture, yuv2rgb, prim2disp))
                 return 0;
         }
     }

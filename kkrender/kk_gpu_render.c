@@ -50,12 +50,15 @@ static const char *DEBAND_MSL =
 "    float3 diff=abs(res-avg); float bound=p.threshold/float(i); res=select(avg,res,diff>float3(bound)); }\n"
 "  if(p.grain>0.0){ float3 r2=rnd(s); float3 st=min(abs(res),float3(p.grain)); res+=st*(r2-0.5); }\n"
 "  dst.write(float4(res,1.0),id);}\n";
-// LIN: BT.1886 a*pow(c+b,2.4) (encoded -> linear).
+// LIN: BT.1886 a*pow(c+b,2.4) (encoded -> linear) + Primaries-Gamut (601/2020 -> 709,
+// RGB-RGB-Matrix in Linear-Light; identity bei 709-Quelle = no-op).
 static const char *LIN_MSL =
-"#include <metal_stdlib>\nusing namespace metal;\nstruct L{float a,b;};\n"
+"#include <metal_stdlib>\nusing namespace metal;\nstruct L{float a,b;float m[9];};\n"
 "kernel void lin(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
 "  constant L& l [[buffer(0)]], uint2 id [[thread_position_in_grid]]){ uint w=dst.get_width(),h=dst.get_height(); if(id.x>=w||id.y>=h)return;\n"
-"  float3 c=max(src.read(id).rgb,0.0); dst.write(float4(l.a*pow(c+l.b,float3(2.4)),1.0),id);}\n";
+"  float3 c=max(src.read(id).rgb,0.0); float3 v=l.a*pow(c+l.b,float3(2.4));\n"
+"  float3 o=float3(l.m[0]*v.x+l.m[1]*v.y+l.m[2]*v.z, l.m[3]*v.x+l.m[4]*v.y+l.m[5]*v.z, l.m[6]*v.x+l.m[7]*v.y+l.m[8]*v.z);\n"
+"  dst.write(float4(o,1.0),id);}\n";
 static const char *LANCZOS_MSL =
 "#include <metal_stdlib>\nusing namespace metal;\nstruct P{float scale;uint axis;};\n"
 "static inline float sinc(float x){if(x==0.0)return 1.0;x*=M_PI_F;return sin(x)/x;}\n"
@@ -139,13 +142,14 @@ static kk_tex *c_alin = NULL, *c_atmpx = NULL;   // Anime4K-Post (2×-Input -> Z
 static kk_tex *c_srgb = NULL;                    // CAS-Input (sRGB-Ausgabe vor Sharpen)
 static kk_tex *c_a2rgb = NULL;                   // ArtCNN: 2×-Luma decodet zu encodeter RGB
 static kk_tex *c_sig = NULL;                     // sigmoidiertes Linear (EWA-Upscale-Pre)
+static kk_tex *c_adeb = NULL;                    // ArtCNN-Pfad: entbandete 2×-RGB
 static int c_W = 0, c_H = 0, c_OW = 0, c_OH = 0;
 static unsigned g_frame = 0;   // temporaler Grain-Index (Deband)
 
 // yuv2rgb = 12 floats (9 Matrix row-major + 3 Offset) aus libplacebos pl_color_repr_decode
 // (vom Hook übergeben — echte 601/709/2020-Matrix + Range). true = von kk_gpu gerendert.
 bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
-                   const float *yuv2rgb) {
+                   const float *yuv2rgb, const float *prim2disp) {
     CVPixelBufferRef pb = (CVPixelBufferRef) cv_pixbuf;
     if (!pb || !target_texture) return false;
     OSType pf = CVPixelBufferGetPixelFormatType(pb);
@@ -187,8 +191,9 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
         kk_tex_destroy(g,&c_srgb); kk_tex_destroy(g,&c_a2rgb);
         c_srgb  = kk_tex_create(g, OW, OH, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);   // CAS-Input
         c_a2rgb = kk_tex_create(g, W*2, H*2, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL); // ArtCNN-2×-RGB
-        kk_tex_destroy(g,&c_sig);
+        kk_tex_destroy(g,&c_sig); kk_tex_destroy(g,&c_adeb);
         c_sig   = kk_tex_create(g, W, H, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);     // Sigmoid-Pre
+        c_adeb  = kk_tex_create(g, W*2, H*2, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL); // ArtCNN-Deband-2×
         c_W=W; c_H=H; c_OW=OW; c_OH=OH;
     }
     if (!c_dec || !c_deb || !c_lin || !c_tmpx || !c_liny || !c_out) {
@@ -216,7 +221,9 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
         src_lin = c_deb;
     }
 
-    struct { float a, b; } L = { 0.8704f, 0.0595f };  // BT.1886, csp_min=0.001
+    // BT.1886 a/b + Primaries-Matrix (vom Hook; identity-Fallback bei 709/NULL).
+    struct { float a, b; float m[9]; } L = { 0.8704f, 0.0595f, {1,0,0, 0,1,0, 0,0,1} };
+    if (prim2disp) for (int i=0;i<9;i++) L.m[i]=prim2disp[i];
 
     // Anime4K-Cartoon-Upscaler (gated via KUCKUCK_GLSL_SHADER~anime4k). Eigener Post-Scale
     // (2×-Output -> Ziel). Bei Fehler (Weights/Alloc) Fallback auf den Lanczos-Pfad unten.
@@ -251,7 +258,17 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
         if (luma2) {
             kk_compute_args ad = { .out=c_a2rgb, .in={luma2, chroma}, .n_in=2, .linear={false,true}, .uniforms=&D, .uniforms_size=sizeof D };
             kk_gpu_compute(g, DEC_MSL, "dec", &ad);   // 2×-Luma + chroma -> encodete RGB
-            kk_compute_args alz = { .out=c_alin, .in={c_a2rgb}, .n_in=1, .uniforms=&L, .uniforms_size=sizeof L };
+            kk_tex *asrc = c_a2rgb;                    // Deband-mild (Realfilm) auf der 2×-Quelle
+            if (dbenv && (dbenv[0]=='m' || dbenv[0]=='s') && c_adeb) {
+                struct { float radius, threshold, grain; uint32_t iters, index; } db;
+                db.radius=16.0f; db.index=g_frame;
+                if (dbenv[0]=='s') { db.iters=2; db.threshold=4.0f/1000.0f; db.grain=1.0f/1000.0f; }
+                else               { db.iters=1; db.threshold=3.0f/1000.0f; db.grain=1.0f/1000.0f; }
+                kk_compute_args adb = { .out=c_adeb, .in={c_a2rgb}, .n_in=1, .linear={true}, .uniforms=&db, .uniforms_size=sizeof db };
+                kk_gpu_compute(g, DEBAND_MSL, "deband", &adb);
+                asrc = c_adeb;
+            }
+            kk_compute_args alz = { .out=c_alin, .in={asrc}, .n_in=1, .uniforms=&L, .uniforms_size=sizeof L };
             kk_gpu_compute(g, LIN_MSL, "lin", &alz);
             struct { float scale; uint32_t axis; } apx = { (float)OW/(W*2), 0 }, apy = { (float)OH/(H*2), 1 };
             kk_compute_args axa = { .out=c_atmpx, .in={c_alin}, .n_in=1, .uniforms=&apx, .uniforms_size=sizeof apx };
