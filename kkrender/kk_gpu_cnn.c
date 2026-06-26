@@ -25,16 +25,16 @@ static const char *CONV_RGB=
 "  float4x4 M=float4x4(wb.m[b],wb.m[b+1],wb.m[b+2],wb.m[b+3],wb.m[b+4],wb.m[b+5],wb.m[b+6],wb.m[b+7],wb.m[b+8],wb.m[b+9],wb.m[b+10],wb.m[b+11],wb.m[b+12],wb.m[b+13],wb.m[b+14],wb.m[b+15]); r+=M*v;} d.write(r,id);}\n";
 static const char *CONV_CRELU=
 "#include <metal_stdlib>\nusing namespace metal;\nstruct W{float m[288];float b[4];};\n"
-"kernel void ccr(texture2d<float> in0 [[texture(0)]], texture2d<float,access::write> d [[texture(1)]], constant W& wb [[buffer(0)]], uint2 id [[thread_position_in_grid]]){uint w=d.get_width(),h=d.get_height();if(id.x>=w||id.y>=h)return;int iw=int(w),ih=int(h);float4 r=float4(wb.b[0],wb.b[1],wb.b[2],wb.b[3]);\n"
-" for(int X=0;X<3;X++)for(int Y=0;Y<3;Y++){int2 p=clamp(int2(id)+int2(X-1,Y-1),int2(0),int2(iw-1,ih-1));float4 v=in0.read(uint2(p));float4 g0=max(v,0.0),g1=max(-v,0.0);int sp=Y*3+X;\n"
-"  for(int a=0;a<2;a++){int b=(a*9+sp)*16;float4x4 M=float4x4(wb.m[b],wb.m[b+1],wb.m[b+2],wb.m[b+3],wb.m[b+4],wb.m[b+5],wb.m[b+6],wb.m[b+7],wb.m[b+8],wb.m[b+9],wb.m[b+10],wb.m[b+11],wb.m[b+12],wb.m[b+13],wb.m[b+14],wb.m[b+15]); r+=M*(a==0?g0:g1);}} d.write(r,id);}\n";
+"kernel void ccr(texture2d<half> in0 [[texture(0)]], texture2d<half,access::write> d [[texture(1)]], constant W& wb [[buffer(0)]], uint2 id [[thread_position_in_grid]]){uint w=d.get_width(),h=d.get_height();if(id.x>=w||id.y>=h)return;int iw=int(w),ih=int(h);half4 r=half4(wb.b[0],wb.b[1],wb.b[2],wb.b[3]);\n"
+" for(int X=0;X<3;X++)for(int Y=0;Y<3;Y++){int2 p=clamp(int2(id)+int2(X-1,Y-1),int2(0),int2(iw-1,ih-1));half4 v=in0.read(uint2(p));half4 g0=max(v,0.0h),g1=max(-v,0.0h);int sp=Y*3+X;\n"
+"  for(int a=0;a<2;a++){int b=(a*9+sp)*16;half4x4 M=half4x4(half(wb.m[b]),half(wb.m[b+1]),half(wb.m[b+2]),half(wb.m[b+3]),half(wb.m[b+4]),half(wb.m[b+5]),half(wb.m[b+6]),half(wb.m[b+7]),half(wb.m[b+8]),half(wb.m[b+9]),half(wb.m[b+10]),half(wb.m[b+11]),half(wb.m[b+12]),half(wb.m[b+13]),half(wb.m[b+14]),half(wb.m[b+15])); r+=M*(a==0?g0:g1);}} d.write(r,id);}\n";
 static const char *COMBINE=
 "#include <metal_stdlib>\nusing namespace metal;\nstruct W{float m[224];float b[4];uint resid;};\n"
-"kernel void comb(texture2d<float> c0 [[texture(0)]],texture2d<float> c1 [[texture(1)]],texture2d<float> c2 [[texture(2)]],texture2d<float> c3 [[texture(3)]],texture2d<float> c4 [[texture(4)]],texture2d<float> c5 [[texture(5)]],texture2d<float> c6 [[texture(6)]],texture2d<float> mn [[texture(7)]], texture2d<float,access::write> d [[texture(8)]], constant W& wb [[buffer(0)]], uint2 id [[thread_position_in_grid]]){uint w=d.get_width(),h=d.get_height();if(id.x>=w||id.y>=h)return;\n"
-" float4 cv[7]={c0.read(id),c1.read(id),c2.read(id),c3.read(id),c4.read(id),c5.read(id),c6.read(id)};\n"
-" float4 r=float4(wb.b[0],wb.b[1],wb.b[2],wb.b[3]);\n"
-" for(int i=0;i<7;i++){ float4 g0=max(cv[i],0.0),g1=max(-cv[i],0.0);\n"
-"   for(int a=0;a<2;a++){int gi=i*2+a;int b=gi*16;float4x4 M=float4x4(wb.m[b],wb.m[b+1],wb.m[b+2],wb.m[b+3],wb.m[b+4],wb.m[b+5],wb.m[b+6],wb.m[b+7],wb.m[b+8],wb.m[b+9],wb.m[b+10],wb.m[b+11],wb.m[b+12],wb.m[b+13],wb.m[b+14],wb.m[b+15]); r+=M*(a==0?g0:g1);}}\n"
+"kernel void comb(texture2d<half> c0 [[texture(0)]],texture2d<half> c1 [[texture(1)]],texture2d<half> c2 [[texture(2)]],texture2d<half> c3 [[texture(3)]],texture2d<half> c4 [[texture(4)]],texture2d<half> c5 [[texture(5)]],texture2d<half> c6 [[texture(6)]],texture2d<half> mn [[texture(7)]], texture2d<half,access::write> d [[texture(8)]], constant W& wb [[buffer(0)]], uint2 id [[thread_position_in_grid]]){uint w=d.get_width(),h=d.get_height();if(id.x>=w||id.y>=h)return;\n"
+" half4 cv[7]={c0.read(id),c1.read(id),c2.read(id),c3.read(id),c4.read(id),c5.read(id),c6.read(id)};\n"
+" half4 r=half4(wb.b[0],wb.b[1],wb.b[2],wb.b[3]);\n"
+" for(int i=0;i<7;i++){ half4 g0=max(cv[i],0.0h),g1=max(-cv[i],0.0h);\n"
+"   for(int a=0;a<2;a++){int gi=i*2+a;int b=gi*16;half4x4 M=half4x4(half(wb.m[b]),half(wb.m[b+1]),half(wb.m[b+2]),half(wb.m[b+3]),half(wb.m[b+4]),half(wb.m[b+5]),half(wb.m[b+6]),half(wb.m[b+7]),half(wb.m[b+8]),half(wb.m[b+9]),half(wb.m[b+10]),half(wb.m[b+11]),half(wb.m[b+12]),half(wb.m[b+13]),half(wb.m[b+14]),half(wb.m[b+15])); r+=M*(a==0?g0:g1);}}\n"
 " if(wb.resid!=0u) r+=mn.read(id); d.write(r,id);}\n";
 static const char *D2S=
 "#include <metal_stdlib>\nusing namespace metal;\n"
@@ -97,32 +97,32 @@ kk_tex *kk_gpu_anime4k(kk_gpu *g, kk_tex *in, const char *weights_path) {
 // Depth-to-Space -> 2×-LUMA. Input = R8-Luma (W×H), Output = 2×-Luma (RGBA16F, .r).
 static const char *A_K0=
 "#include <metal_stdlib>\nusing namespace metal;\nstruct W{float w[144];float b[16];};\n"
-"kernel void ak0(texture2d<float> luma [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
+"kernel void ak0(texture2d<half> luma [[texture(0)]], texture2d<half,access::write> dst [[texture(1)]],\n"
 " constant W& wb [[buffer(0)]], uint2 gid [[thread_position_in_grid]]){ uint lw=luma.get_width(),lh=luma.get_height(); if(gid.x>=lw||gid.y>=lh)return;\n"
-" float4 r[4]; for(int k=0;k<4;k++) r[k]=float4(wb.b[k*4],wb.b[k*4+1],wb.b[k*4+2],wb.b[k*4+3]);\n"
+" half4 r[4]; for(int k=0;k<4;k++) r[k]=half4(wb.b[k*4],wb.b[k*4+1],wb.b[k*4+2],wb.b[k*4+3]);\n"
 " for(int X=0;X<3;X++)for(int Y=0;Y<3;Y++){ int2 lp=clamp(int2(gid)+int2(X-1,Y-1),int2(0),int2(int(lw)-1,int(lh)-1));\n"
-"   float v=luma.read(uint2(lp)).x; int sp=Y*3+X;\n"
-"   for(int k=0;k<4;k++){ int b=(k*9+sp)*4; r[k]+=float4(wb.w[b],wb.w[b+1],wb.w[b+2],wb.w[b+3])*v; } }\n"
+"   half v=luma.read(uint2(lp)).x; int sp=Y*3+X;\n"
+"   for(int k=0;k<4;k++){ int b=(k*9+sp)*4; r[k]+=half4(wb.w[b],wb.w[b+1],wb.w[b+2],wb.w[b+3])*v; } }\n"
 " uint2 o=gid*2; dst.write(r[0],o); dst.write(r[1],o+uint2(1,0)); dst.write(r[2],o+uint2(0,1)); dst.write(r[3],o+uint2(1,1));}\n";
 static const char *A_K16=
 "#include <metal_stdlib>\nusing namespace metal;\nstruct W{float w[2304];float b[16];};\n"
-"kernel void ak16(texture2d<float> in0 [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
+"kernel void ak16(texture2d<half> in0 [[texture(0)]], texture2d<half,access::write> dst [[texture(1)]],\n"
 " constant W& wb [[buffer(0)]], uint2 gid [[thread_position_in_grid]]){ uint lw=dst.get_width()/2,lh=dst.get_height()/2; if(gid.x>=lw||gid.y>=lh)return;\n"
 " int iw=int(in0.get_width()),ih=int(in0.get_height()); int2 sub[4]={int2(0,0),int2(1,0),int2(0,1),int2(1,1)};\n"
-" float4 r[4]; for(int k=0;k<4;k++) r[k]=float4(wb.b[k*4],wb.b[k*4+1],wb.b[k*4+2],wb.b[k*4+3]);\n"
+" half4 r[4]; for(int k=0;k<4;k++) r[k]=half4(wb.b[k*4],wb.b[k*4+1],wb.b[k*4+2],wb.b[k*4+3]);\n"
 " for(int C=0;C<4;C++)for(int X=0;X<3;X++)for(int Y=0;Y<3;Y++){ int2 ip=clamp(int2((int(gid.x)+X-1)*2+sub[C].x,(int(gid.y)+Y-1)*2+sub[C].y),int2(0),int2(iw-1,ih-1));\n"
-"   float4 v=in0.read(uint2(ip)); int sp=Y*3+X;\n"
-"   for(int k=0;k<4;k++){ int b=((k*4+C)*9+sp)*16; float4x4 M=float4x4(wb.w[b],wb.w[b+1],wb.w[b+2],wb.w[b+3],wb.w[b+4],wb.w[b+5],wb.w[b+6],wb.w[b+7],wb.w[b+8],wb.w[b+9],wb.w[b+10],wb.w[b+11],wb.w[b+12],wb.w[b+13],wb.w[b+14],wb.w[b+15]); r[k]+=M*v; } }\n"
-" uint2 o=gid*2; dst.write(max(r[0],0.0),o); dst.write(max(r[1],0.0),o+uint2(1,0)); dst.write(max(r[2],0.0),o+uint2(0,1)); dst.write(max(r[3],0.0),o+uint2(1,1));}\n";
+"   half4 v=in0.read(uint2(ip)); int sp=Y*3+X;\n"
+"   for(int k=0;k<4;k++){ int b=((k*4+C)*9+sp)*16; half4x4 M=half4x4(half(wb.w[b]),half(wb.w[b+1]),half(wb.w[b+2]),half(wb.w[b+3]),half(wb.w[b+4]),half(wb.w[b+5]),half(wb.w[b+6]),half(wb.w[b+7]),half(wb.w[b+8]),half(wb.w[b+9]),half(wb.w[b+10]),half(wb.w[b+11]),half(wb.w[b+12]),half(wb.w[b+13]),half(wb.w[b+14]),half(wb.w[b+15])); r[k]+=M*v; } }\n"
+" uint2 o=gid*2; dst.write(max(r[0],0.0h),o); dst.write(max(r[1],0.0h),o+uint2(1,0)); dst.write(max(r[2],0.0h),o+uint2(0,1)); dst.write(max(r[3],0.0h),o+uint2(1,1));}\n";
 static const char *A_K6=
 "#include <metal_stdlib>\nusing namespace metal;\nstruct W{float w[576];float b[4];};\n"
-"kernel void ak6(texture2d<float> in5 [[texture(0)]], texture2d<float> inS [[texture(1)]], texture2d<float,access::write> dst [[texture(2)]],\n"
+"kernel void ak6(texture2d<half> in5 [[texture(0)]], texture2d<half> inS [[texture(1)]], texture2d<half,access::write> dst [[texture(2)]],\n"
 " constant W& wb [[buffer(0)]], uint2 gid [[thread_position_in_grid]]){ uint lw=dst.get_width(),lh=dst.get_height(); if(gid.x>=lw||gid.y>=lh)return;\n"
 " int iw=int(in5.get_width()),ih=int(in5.get_height()); int2 sub[4]={int2(0,0),int2(1,0),int2(0,1),int2(1,1)};\n"
-" float4 r=float4(wb.b[0],wb.b[1],wb.b[2],wb.b[3]);\n"
+" half4 r=half4(wb.b[0],wb.b[1],wb.b[2],wb.b[3]);\n"
 " for(int C=0;C<4;C++)for(int X=0;X<3;X++)for(int Y=0;Y<3;Y++){ int2 ip=clamp(int2((int(gid.x)+X-1)*2+sub[C].x,(int(gid.y)+Y-1)*2+sub[C].y),int2(0),int2(iw-1,ih-1));\n"
-"   float4 v=in5.read(uint2(ip))+inS.read(uint2(ip)); int sp=Y*3+X; int b=(C*9+sp)*16;\n"
-"   float4x4 M=float4x4(wb.w[b],wb.w[b+1],wb.w[b+2],wb.w[b+3],wb.w[b+4],wb.w[b+5],wb.w[b+6],wb.w[b+7],wb.w[b+8],wb.w[b+9],wb.w[b+10],wb.w[b+11],wb.w[b+12],wb.w[b+13],wb.w[b+14],wb.w[b+15]); r+=M*v; }\n"
+"   half4 v=in5.read(uint2(ip))+inS.read(uint2(ip)); int sp=Y*3+X; int b=(C*9+sp)*16;\n"
+"   half4x4 M=half4x4(half(wb.w[b]),half(wb.w[b+1]),half(wb.w[b+2]),half(wb.w[b+3]),half(wb.w[b+4]),half(wb.w[b+5]),half(wb.w[b+6]),half(wb.w[b+7]),half(wb.w[b+8]),half(wb.w[b+9]),half(wb.w[b+10]),half(wb.w[b+11]),half(wb.w[b+12]),half(wb.w[b+13]),half(wb.w[b+14]),half(wb.w[b+15])); r+=M*v; }\n"
 " dst.write(r,gid);}\n";
 static const char *A_KD2S=
 "#include <metal_stdlib>\nusing namespace metal;\n"
