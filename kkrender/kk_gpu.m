@@ -210,7 +210,9 @@ kk_tex *kk_tex_wrap_iosurface(kk_gpu *g, void *iosurface, int plane, kk_fmt fmt,
 void kk_tex_destroy(kk_gpu *g, kk_tex **ptex) {
     if (!ptex || !*ptex) return;
     struct kk_tex *t = *ptex;
-    if (t->tex) CFRelease((__bridge CFTypeRef) t->tex);
+    if (t->tex) CFRelease((__bridge CFTypeRef) t->tex);  // balanciert das explizite CFRetain im wrap/create
+    t->tex = nil;   // ⚠️ ARC: strong-ivar freigeben. free() läuft objc_storeStrong(&t->tex,nil) NICHT
+                    // → der ARC-Retain aus `t->tex = …` würde sonst pro Frame leaken (IOSurface/Frame → Jetsam).
     free(t);
     *ptex = NULL;
 }
