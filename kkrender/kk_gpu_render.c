@@ -179,6 +179,37 @@ static const char *CMHDR_MSL =
 "  float3 o=clamp(mul3(p.lms2rgb,lms2),0.0,1.0); dst.write(float4(pq_oetf3(o),1.0),id);}\n"; // PQ/2020-Output
 
 static kk_gpu *g_kk = NULL;  // lazy, teilt libplacebos Device
+
+// Async-Abschluss: die Frame-Wraps (luma/chroma/tgt inkl. CVMetalTextureRef!) MÜSSEN
+// bis GPU-Completion leben (Pool-Recycling/Decoder-Write sonst mitten im GPU-Read) —
+// deshalb hängen sie an diesem Heap-Kontext und werden im Completion-Handler
+// freigegeben, DANN erst der Caller-Callback. done==NULL → synchroner finish-Pfad.
+typedef struct { kk_gpu *g; kk_tex *a, *b, *c; void (*done)(void*); void *ud; } kk_done_ctx;
+static void kk_render_done(void *p) {
+    kk_done_ctx *d = (kk_done_ctx *) p;
+    kk_tex_destroy(d->g, &d->a); kk_tex_destroy(d->g, &d->b); kk_tex_destroy(d->g, &d->c);
+    if (d->done) d->done(d->ud);
+    free(d);
+}
+static bool kk_finish_or_submit(kk_gpu *g, kk_tex **luma, kk_tex **chroma, kk_tex **tgt,
+                                void (*done)(void*), void *ud) {
+    if (!done) {
+        kk_gpu_finish(g);
+        kk_tex_destroy(g, luma); kk_tex_destroy(g, chroma); kk_tex_destroy(g, tgt);
+        return true;
+    }
+    kk_done_ctx *d = calloc(1, sizeof *d);
+    if (!d) {   // OOM-Fallback: synchron abschließen, Caller trotzdem benachrichtigen
+        kk_gpu_finish(g);
+        kk_tex_destroy(g, luma); kk_tex_destroy(g, chroma); kk_tex_destroy(g, tgt);
+        done(ud);
+        return true;
+    }
+    d->g = g; d->a = *luma; d->b = *chroma; d->c = *tgt; d->done = done; d->ud = ud;
+    *luma = NULL; *chroma = NULL; *tgt = NULL;   // Ownership → Completion-Handler
+    kk_gpu_submit(g, kk_render_done, d);
+    return true;
+}
 // Gecachte Intermediates (über Frames wiederverwendet — KEIN Per-Frame-Alloc, sonst
 // Jetsam-OOM durch Allok-Churn in Ziel-Auflösung). Re-create nur bei Dim-Wechsel.
 static kk_tex *c_dec = NULL, *c_deb = NULL, *c_lin = NULL, *c_tmpx = NULL, *c_liny = NULL, *c_out = NULL;
@@ -193,7 +224,8 @@ static unsigned g_frame = 0;   // temporaler Grain-Index (Deband)
 // yuv2rgb = 12 floats (9 Matrix row-major + 3 Offset) aus libplacebos pl_color_repr_decode
 // (vom Hook übergeben — echte 601/709/2020-Matrix + Range). true = von kk_gpu gerendert.
 bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
-                   const float *yuv2rgb, const float *prim2disp) {
+                   const float *yuv2rgb, const float *prim2disp,
+                   void (*done)(void*), void *done_ud) {
     CVPixelBufferRef pb = (CVPixelBufferRef) cv_pixbuf;
     if (!pb || !target_texture) return false;
     OSType pf = CVPixelBufferGetPixelFormatType(pb);
@@ -307,9 +339,7 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
             kk_compute_args ala = { .out=dw?tgt:c_out, .in={c_liny}, .n_in=1 };
             kk_gpu_compute(g, DELIN_MSL, "delin", &ala);
             if (!dw) kk_gpu_blit(g, c_out, tgt);
-            kk_gpu_finish(g);
-            kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt);
-            return true;
+            return kk_finish_or_submit(g, &luma, &chroma, &tgt, done, done_ud);
         }
     }
 
@@ -343,9 +373,7 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
             kk_compute_args ala = { .out=dw?tgt:c_out, .in={c_liny}, .n_in=1 };
             kk_gpu_compute(g, DELIN_MSL, "delin", &ala);
             if (!dw) kk_gpu_blit(g, c_out, tgt);
-            kk_gpu_finish(g);
-            kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt);
-            return true;
+            return kk_finish_or_submit(g, &luma, &chroma, &tgt, done, done_ud);
         }
     }
 
@@ -390,10 +418,7 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
         kk_gpu_compute(g, CAS_MSL, "cas", &ca);
     }
     if (!dw) kk_gpu_blit(g, c_out, tgt); // nur falls Target nicht direkt beschreibbar
-    kk_gpu_finish(g);
-
-    kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt); // nur die billigen Wraps
-    return true;
+    return kk_finish_or_submit(g, &luma, &chroma, &tgt, done, done_ud);
 }
 
 // HDR-Render (P010 -> PQ/2020): MKPQ(2020-10bit-Decode+PQ-EOTF) -> EWA -> CMHDR
@@ -402,7 +427,8 @@ static kk_tex *h_pq = NULL, *h_ewa = NULL, *h_out = NULL;
 static int h_W = 0, h_H = 0, h_OW = 0, h_OH = 0;
 
 bool kk_gpu_render_hdr(void *metal_device, void *cv_pixbuf, void *target_texture,
-                       const kk_hdr_params *hp) {
+                       const kk_hdr_params *hp,
+                       void (*done)(void*), void *done_ud) {
     CVPixelBufferRef pb = (CVPixelBufferRef) cv_pixbuf;
     if (!pb || !target_texture || !hp) return false;
     OSType pf = CVPixelBufferGetPixelFormatType(pb);
@@ -450,10 +476,7 @@ bool kk_gpu_render_hdr(void *metal_device, void *cv_pixbuf, void *target_texture
     kk_compute_args ca = { .out=dw?tgt:h_out, .in={h_ewa}, .n_in=1, .uniforms=hp, .uniforms_size=sizeof(kk_hdr_params) };
     kk_gpu_compute(g, CMHDR_MSL, "cmh", &ca);                         // IPT-Tonemap -> PQ/2020
     if (!dw) kk_gpu_blit(g, h_out, tgt);
-    kk_gpu_finish(g);
-
-    kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt);
-    return true;
+    return kk_finish_or_submit(g, &luma, &chroma, &tgt, done, done_ud);
 }
 
 // --- Cache-Freigabe (Speicher / Jetsam-Schutz) ---

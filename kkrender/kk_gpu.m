@@ -110,6 +110,19 @@ void kk_gpu_finish(kk_gpu *g) {
     }
 }
 
+void kk_gpu_submit(kk_gpu *g, void (*done)(void *ud), void *ud) {
+    @autoreleasepool {
+        if (g->enc) { [g->enc endEncoding]; CFRelease((__bridge CFTypeRef) g->enc); g->enc = nil; }
+        if (g->cb) {
+            if (done) [g->cb addCompletedHandler:^(id<MTLCommandBuffer> _cb){ (void)_cb; done(ud); }];
+            [g->cb commit];
+            CFRelease((__bridge CFTypeRef) g->cb); g->cb = nil;   // CB lebt bis Completion selbst weiter
+        } else if (done) {
+            done(ud);   // nichts encodet → sofort melden
+        }
+    }
+}
+
 // Texture->Texture-Copy (z.B. eigener Render-Output -> Display-Target ohne ShaderWrite).
 void kk_gpu_blit(kk_gpu *g, kk_tex *src, kk_tex *dst) {
     @autoreleasepool {

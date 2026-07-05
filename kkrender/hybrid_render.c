@@ -19,9 +19,11 @@
 
 // kk_gpu-Render-Entries (in kk_gpu_render.c).
 extern bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
-                          const float *yuv2rgb, const float *prim2disp);
+                          const float *yuv2rgb, const float *prim2disp,
+                          void (*done)(void*), void *done_ud);
 extern bool kk_gpu_render_hdr(void *metal_device, void *cv_pixbuf, void *target_texture,
-                              const kk_hdr_params *hp);
+                              const kk_hdr_params *hp,
+                              void (*done)(void*), void *done_ud);
 // Native Color-Parameter-Generatoren (kk_gpu_genparams.c).
 extern void kk_sdr_decode_matrix(int sys, int full, float out[12]);
 extern void kk_primaries_to709(int prim, float out[9]);
@@ -116,7 +118,13 @@ void *kuckuck_hybrid_create(void *mtl_device)
     return p;
 }
 
-int kuckuck_hybrid_render(void *ctx, void *cv_pixbuf, void *target_texture)
+// Async-Variante: Encode läuft synchron (Quell-Pointer-Zugriff bleibt im Caller-Scope),
+// Commit OHNE Warten — done(ud) feuert auf Metals Completion-Thread, wenn der Frame
+// fertig gerendert ist (Quell-/Target-Wraps leben intern bis dahin). Rückgabe 0 =
+// angenommen (done kommt GENAU EINMAL, auch bei leerem CB), negativ = nichts encodet
+// (done kommt NICHT).
+int kuckuck_hybrid_render_async(void *ctx, void *cv_pixbuf, void *target_texture,
+                                void (*done)(void *ud), void *ud)
 {
     struct hybrid_priv *p = ctx;
     if (!p || !cv_pixbuf || !target_texture)
@@ -152,7 +160,7 @@ int kuckuck_hybrid_render(void *ctx, void *cv_pixbuf, void *target_texture)
             kk_hdr_tone(src_peak, dst_peak, 0.005f, &hp.in_min, &hp.in_max, &hp.out_min, &hp.out_max, hp.tone_lut);
             cached_dst = dst_peak; cached_src = src_peak;
         }
-        return kk_gpu_render_hdr(p->device, cv_pixbuf, target_texture, &hp) ? 0 : -2;
+        return kk_gpu_render_hdr(p->device, cv_pixbuf, target_texture, &hp, done, ud) ? 0 : -2;
     }
 
     // SDR-NV12: echte YUV->RGB-Matrix + Primaries->709, beide aus eingebackenen Tabellen.
@@ -161,10 +169,15 @@ int kuckuck_hybrid_render(void *ctx, void *cv_pixbuf, void *target_texture)
         bool full = (pfmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
         float yuv2rgb[12]; kk_sdr_decode_matrix(hybrid_sysidx(pb), full ? 1 : 0, yuv2rgb);
         float prim2disp[9]; kk_primaries_to709(hybrid_primidx(pb), prim2disp);
-        return kk_gpu_render(p->device, cv_pixbuf, target_texture, yuv2rgb, prim2disp) ? 0 : -2;
+        return kk_gpu_render(p->device, cv_pixbuf, target_texture, yuv2rgb, prim2disp, done, ud) ? 0 : -2;
     }
 
     return -2;   // unbekanntes Format (kommt von AVPlayer-VT nicht vor)
+}
+
+int kuckuck_hybrid_render(void *ctx, void *cv_pixbuf, void *target_texture)
+{
+    return kuckuck_hybrid_render_async(ctx, cv_pixbuf, target_texture, NULL, NULL);
 }
 
 void kuckuck_hybrid_prewarm(void *ctx)

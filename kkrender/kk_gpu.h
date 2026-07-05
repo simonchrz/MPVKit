@@ -41,6 +41,9 @@ kk_gpu *kk_gpu_create(void *mtl_device);
 void    kk_gpu_destroy(kk_gpu **pgpu);
 void   *kk_gpu_mtl_device(kk_gpu *gpu);   // id<MTLDevice> für Interop
 void    kk_gpu_finish(kk_gpu *gpu);       // blockt bis GPU fertig (Bench/Download)
+// Commit OHNE Warten: done(ud) feuert auf Metals Completion-Thread, wenn die GPU
+// fertig ist (kein CB offen → done sofort). Ressourcen-Lebensdauer ist Caller-Sache.
+void    kk_gpu_submit(kk_gpu *gpu, void (*done)(void *ud), void *ud);
 void    kk_gpu_blit(kk_gpu *gpu, kk_tex *src, kk_tex *dst); // Texture-Copy (Render-Out -> Target)
 
 // --- Texturen -------------------------------------------------------------

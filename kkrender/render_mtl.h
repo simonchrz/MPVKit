@@ -16,6 +16,13 @@ void *kuckuck_hybrid_create(void *mtl_device);
 // 0 = ok, negativ = Fehler.
 int kuckuck_hybrid_render(void *ctx, void *cv_pixbuf, void *target_texture);
 
+// Async-Render: Encode synchron, Commit ohne Warten; done(ud) feuert auf Metals
+// Completion-Thread wenn der Frame fertig ist. 0 = angenommen (done kommt genau
+// einmal), negativ = nichts encodet (done kommt NICHT).
+int kuckuck_hybrid_render_async(void *ctx, void *cv_pixbuf, void *target_texture,
+                                void (*done)(void *ud), void *ud);
+
+
 // PSO-Prewarm: alle Render-Kernel einmal kompilieren (gegen Erst-Frame-Hitch).
 // Auf der Render-Queue rufen (gleiche Queue wie kuckuck_hybrid_render).
 void kuckuck_hybrid_prewarm(void *ctx);
