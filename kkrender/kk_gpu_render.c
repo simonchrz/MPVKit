@@ -108,13 +108,18 @@ static const float KK_EWA_LUT[64]={
  -0.02158188f,-0.01436004f,-0.00787209f,-0.00222358f,0.00252217f,0.00634110f,0.00924443f,0.01127407f,
  0.01249739f,0.01300187f,0.01288953f,0.01227151f,0.01126289f,0.00997788f,0.00852562f,0.00700655f,
  0.00550949f,0.00410946f,0.00286628f,0.00182385f,0.00101015f,0.00043793f,0.00010582f,-0.00000000f};
-// Sigmoidize (center=0.75 slope=6.5, libplacebos Default-Upscale-Pre): in Linear-Light.
-static const char *SIG_MSL =
-"#include <metal_stdlib>\nusing namespace metal;\n"
-"kernel void sig(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
-"  uint2 id [[thread_position_in_grid]]){ uint w=dst.get_width(),h=dst.get_height(); if(id.x>=w||id.y>=h)return;\n"
-"  float3 c=clamp(src.read(id).rgb,0.0,1.0);\n"
-"  c=0.75-(1.0/6.5)*log(1.0/(c*0.82796854+0.00757286)-1.0); dst.write(float4(c,1.0),id);}\n";
+// LIN+SIG fusioniert (Perf: ein Full-Res-Pass statt zwei — LIN und SIG sind beide
+// reine Per-Pixel-Transformationen): BT.1886-Linearize + Primaries-Gamut + Sigmoidize
+// (center=0.75 slope=6.5, libplacebos Default-Upscale-Pre). Ergebnis identisch zur
+// LIN->SIG-Kette (SIG clampte eh auf [0,1]).
+static const char *LINSIG_MSL =
+"#include <metal_stdlib>\nusing namespace metal;\nstruct L{float a,b;float m[9];};\n"
+"kernel void linsig(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
+"  constant L& l [[buffer(0)]], uint2 id [[thread_position_in_grid]]){ uint w=dst.get_width(),h=dst.get_height(); if(id.x>=w||id.y>=h)return;\n"
+"  float3 c=max(src.read(id).rgb,0.0); float3 v=l.a*pow(c+l.b,float3(2.4));\n"
+"  float3 o=float3(l.m[0]*v.x+l.m[1]*v.y+l.m[2]*v.z, l.m[3]*v.x+l.m[4]*v.y+l.m[5]*v.z, l.m[6]*v.x+l.m[7]*v.y+l.m[8]*v.z);\n"
+"  o=clamp(o,0.0,1.0); o=0.75-(1.0/6.5)*log(1.0/(o*0.82796854+0.00757286)-1.0);\n"
+"  dst.write(float4(o,1.0),id);}\n";
 // EWA-polar-Gather (eingebackene LUT als Uniform).
 static const char *EWA_MSL =
 "#include <metal_stdlib>\nusing namespace metal;\nstruct P{float scale;uint lutn;float radius;float lut[64];};\n"
@@ -180,7 +185,7 @@ static kk_tex *c_dec = NULL, *c_deb = NULL, *c_lin = NULL, *c_tmpx = NULL, *c_li
 static kk_tex *c_alin = NULL, *c_atmpx = NULL;   // Anime4K-Post (2×-Input -> Ziel)
 static kk_tex *c_srgb = NULL;                    // CAS-Input (sRGB-Ausgabe vor Sharpen)
 static kk_tex *c_a2rgb = NULL;                   // ArtCNN: 2×-Luma decodet zu encodeter RGB
-static kk_tex *c_sig = NULL;                     // sigmoidiertes Linear (EWA-Upscale-Pre)
+// c_sig entfernt: LIN+SIG fusioniert (LINSIG_MSL) → kein separates Sigmoid-Intermediate
 static kk_tex *c_adeb = NULL;                    // ArtCNN-Pfad: entbandete 2×-RGB
 static int c_W = 0, c_H = 0, c_OW = 0, c_OH = 0;
 static unsigned g_frame = 0;   // temporaler Grain-Index (Deband)
@@ -230,8 +235,7 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
         kk_tex_destroy(g,&c_srgb); kk_tex_destroy(g,&c_a2rgb);
         c_srgb  = kk_tex_create(g, OW, OH, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);   // CAS-Input
         c_a2rgb = kk_tex_create(g, W*2, H*2, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL); // ArtCNN-2×-RGB
-        kk_tex_destroy(g,&c_sig); kk_tex_destroy(g,&c_adeb);
-        c_sig   = kk_tex_create(g, W, H, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);     // Sigmoid-Pre
+        kk_tex_destroy(g,&c_adeb);
         c_adeb  = kk_tex_create(g, W*2, H*2, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL); // ArtCNN-Deband-2×
         c_W=W; c_H=H; c_OW=OW; c_OH=OH;
     }
@@ -255,10 +259,18 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
     kk_compute_args da = { .out=c_dec, .in={luma,chroma}, .n_in=2, .linear={false,true}, .uniforms=&D, .uniforms_size=sizeof D };
     kk_gpu_compute(g, DEC_MSL, "dec", &da);
 
+    // HD-Light früh entscheiden (s. Default-Scaler unten): im HD-Light entfällt
+    // Deband (wie renderpl.57) — der Pass würde sonst umsonst laufen. Für die
+    // CNN-Pfade (SD-Cartoons/Realfilm) bleibt Deband unabhängig davon aktiv.
+    const char *glsl_early = getenv("KUCKUCK_GLSL_SHADER");
+    const char *hdl = getenv("KUCKUCK_HD_LIGHT");
+    bool hdLight = hdl ? (hdl[0]=='1') : (H >= 1080);
+    bool cnnPath = glsl_early && (strcasestr(glsl_early, "anime4k") || strcasestr(glsl_early, "artcnn"));
+
     // Deband (KUCKUCK_DEBAND off|mild|strong) auf der encodeten Quelle.
     const char *dbenv = getenv("KUCKUCK_DEBAND");
     kk_tex *src_lin = c_dec;   // ohne Deband: linearize liest c_dec
-    if (dbenv && (dbenv[0]=='m' || dbenv[0]=='s')) {
+    if (dbenv && (dbenv[0]=='m' || dbenv[0]=='s') && (!hdLight || cnnPath)) {
         struct { float radius, threshold, grain; uint32_t iters, index; } db;
         db.radius = 16.0f; db.index = (g_frame++);
         if (dbenv[0]=='s') { db.iters=2; db.threshold=4.0f/1000.0f; db.grain=1.0f/1000.0f; }  // strong
@@ -333,29 +345,42 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
         }
     }
 
-    // Default-Scaler: Linearize -> [Sigmoid bei Upscale] -> EWA-lanczossharp -> [Unsig+]Delin
-    // -> [CAS] -> Blit (= libplacebos pl_render_high_quality-Default).
-    kk_compute_args la0 = { .out=c_lin, .in={src_lin}, .n_in=1, .uniforms=&L, .uniforms_size=sizeof L };
-    kk_gpu_compute(g, LIN_MSL, "lin", &la0);
-    bool up = (OW > W) && c_sig;   // Sigmoid nur bei Upscale (wie libplacebo)
-    kk_tex *escin = c_lin;
-    if (up) {
-        kk_compute_args sa = { .out=c_sig, .in={c_lin}, .n_in=1 };
-        kk_gpu_compute(g, SIG_MSL, "sig", &sa);
-        escin = c_sig;
-    }
-    struct { float scale; uint32_t lutn; float radius; float lut[64]; } ew;
-    ew.scale = (float)OW/W; ew.lutn = 64; ew.radius = KK_EWA_RADIUS;
-    for (int i=0;i<64;i++) ew.lut[i]=KK_EWA_LUT[i];
-    kk_compute_args ea = { .out=c_liny, .in={escin}, .n_in=1, .uniforms=&ew, .uniforms_size=sizeof ew };
-    kk_gpu_compute(g, EWA_MSL, "ewa", &ea);
-    // CAS-Sharpen (HD/Tuner, gated ~cas): [unsig+]delin -> c_srgb -> CAS -> c_out; sonst -> c_out.
+    // HD-Light (Port von renderpl.57, war nie nach kk_gpu portiert — gemessen 22ms avg
+    // @1080p, über dem 60Hz-Budget): ab src_h>=1080 separabler Lanczos (2×8 Taps) statt
+    // EWA-polar (~49 Taps/Output-Pixel) + Sigmoid/Deband aus. Bei ~1,1-1,3× Upscale ist
+    // EWA vs. separabel visuell belegt gleichwertig (IQ-Harness 06/2026); CAS bleibt.
+    // Env KUCKUCK_HD_LIGHT: "0"=nie, "1"=immer, unset=auto (H>=1080).
     bool dw = kk_tex_can_write(tgt);     // Target ShaderWrite-fähig -> direkt rein, Blit sparen
     kk_tex *fin = dw ? tgt : c_out;
     bool cas = glsl && strcasestr(glsl, "cas") && c_srgb;
     kk_tex *dout = cas ? c_srgb : fin;
-    kk_compute_args la = { .out=dout, .in={c_liny}, .n_in=1 };
-    kk_gpu_compute(g, up ? DELINU_MSL : DELIN_MSL, up ? "delinu" : "delin", &la);
+
+    if (hdLight && c_tmpx) {
+        // HD: DEC (ohne Deband) -> LIN -> Lanczos X -> Lanczos Y -> Delin -> [CAS].
+        kk_compute_args la0 = { .out=c_lin, .in={c_dec}, .n_in=1, .uniforms=&L, .uniforms_size=sizeof L };
+        kk_gpu_compute(g, LIN_MSL, "lin", &la0);
+        struct { float scale; uint32_t axis; } px = { (float)OW/W, 0 }, py = { (float)OH/H, 1 };
+        kk_compute_args xa = { .out=c_tmpx, .in={c_lin}, .n_in=1, .uniforms=&px, .uniforms_size=sizeof px };
+        kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &xa);
+        kk_compute_args ya = { .out=c_liny, .in={c_tmpx}, .n_in=1, .uniforms=&py, .uniforms_size=sizeof py };
+        kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &ya);
+        kk_compute_args la = { .out=dout, .in={c_liny}, .n_in=1 };
+        kk_gpu_compute(g, DELIN_MSL, "delin", &la);
+    } else {
+        // SD-Qualitätspfad: [Deband] -> LIN[+SIG fusioniert] -> EWA-lanczossharp ->
+        // [Unsig+]Delin (= libplacebos pl_render_high_quality-Default).
+        bool up = (OW > W);   // Sigmoid nur bei Upscale (wie libplacebo)
+        kk_compute_args la0 = { .out=c_lin, .in={src_lin}, .n_in=1, .uniforms=&L, .uniforms_size=sizeof L };
+        kk_gpu_compute(g, up ? LINSIG_MSL : LIN_MSL, up ? "linsig" : "lin", &la0);
+        struct { float scale; uint32_t lutn; float radius; float lut[64]; } ew;
+        ew.scale = (float)OW/W; ew.lutn = 64; ew.radius = KK_EWA_RADIUS;
+        for (int i=0;i<64;i++) ew.lut[i]=KK_EWA_LUT[i];
+        kk_compute_args ea = { .out=c_liny, .in={c_lin}, .n_in=1, .uniforms=&ew, .uniforms_size=sizeof ew };
+        kk_gpu_compute(g, EWA_MSL, "ewa", &ea);
+        kk_compute_args la = { .out=dout, .in={c_liny}, .n_in=1 };
+        kk_gpu_compute(g, up ? DELINU_MSL : DELIN_MSL, up ? "delinu" : "delin", &la);
+    }
+    // CAS-Sharpen (HD/Tuner, gated ~cas): encodete Ausgabe -> CAS -> Target.
     if (cas) {
         kk_compute_args ca = { .out=fin, .in={c_srgb}, .n_in=1 };
         kk_gpu_compute(g, CAS_MSL, "cas", &ca);
@@ -430,7 +455,7 @@ static void kk_gpu_sdr_release(kk_gpu *g) {
     kk_tex_destroy(g,&c_dec); kk_tex_destroy(g,&c_deb); kk_tex_destroy(g,&c_lin);
     kk_tex_destroy(g,&c_tmpx); kk_tex_destroy(g,&c_liny); kk_tex_destroy(g,&c_out);
     kk_tex_destroy(g,&c_alin); kk_tex_destroy(g,&c_atmpx); kk_tex_destroy(g,&c_srgb);
-    kk_tex_destroy(g,&c_a2rgb); kk_tex_destroy(g,&c_sig);
+    kk_tex_destroy(g,&c_a2rgb);
     c_W = c_H = c_OW = c_OH = 0;
 }
 // HDR-Pfad-Caches. Reset h_W → lazy Re-Alloc bei nächstem HDR-Frame.
