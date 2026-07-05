@@ -36,8 +36,8 @@ let package = Package(
             name: "Libkkrender",
             // Standalone kk_gpu-Renderer (kuckuck_hybrid_* + kk_gpu_*). renderpl.60 =
             // libplacebo-frei, self-contained. Gebaut von kkrender/build-kkrender.sh.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.67/Libkkrender.xcframework.zip",
-            checksum: "d1065c0e545b5cfa332cf2c0aa030d3ed766c923cf0702a81ea1c03f577da6ff"
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.68/Libkkrender.xcframework.zip",
+            checksum: "9700cddc728f41bb716564764235998f27e24bb8ffbf347317207c78a19ed5f2"
         ),
     ]
 )
