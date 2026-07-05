@@ -50,6 +50,10 @@ kk_tex *kk_tex_create_3d(kk_gpu *gpu, int w, int h, int d, kk_fmt fmt,
                          const void *initial_data); // 3D-LUT (z.B. Gamut-Map), texture3d
 kk_tex *kk_tex_wrap_iosurface(kk_gpu *gpu, void *iosurface, int plane,
                               kk_fmt fmt, uint32_t usage); // zero-copy In(SAMPLE)/Out(STORAGE)
+// Decoder-CVPixelBuffer-Plane via CVMetalTextureCache wrappen (Perf: die Pool-Buffer
+// recyclen → Cache-Hit statt newTextureWithDescriptor:iosurface: pro Frame; die
+// CVMetalTextureRef hängt am kk_tex und wird in kk_tex_destroy freigegeben).
+kk_tex *kk_tex_wrap_pixbuf(kk_gpu *gpu, void *cv_pixbuf, int plane, kk_fmt fmt);
 kk_tex *kk_tex_wrap_mtltexture(kk_gpu *gpu, void *mtltexture); // existierende MTLTexture (Display-Target, geteiltes Device)
 void    kk_tex_destroy(kk_gpu *gpu, kk_tex **ptex);
 int     kk_tex_w(const kk_tex *t);
@@ -71,6 +75,9 @@ typedef struct {
 
 bool kk_gpu_compute(kk_gpu *gpu, const char *msl_source, const char *entry,
                     const kk_compute_args *args);
+
+// PSO vorkompilieren (Prewarm gegen Erst-Frame-Hitch): nur Compile+Cache, kein Dispatch.
+void kk_gpu_compile(kk_gpu *gpu, const char *msl_source, const char *entry);
 
 // HDR-IPT-color_map-Parameter (vom Hook via libplacebo erzeugt, an kk_gpu_render_hdr).
 // 4 Matrizen (rgb2lms[2020], lms2ipt, ipt2lms, lms2rgb[2020]) + Tone-Range + bt2390-LUT.

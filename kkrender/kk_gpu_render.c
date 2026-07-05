@@ -208,8 +208,12 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
     if (!g_kk) return false;
     kk_gpu *g = g_kk;
 
-    kk_tex *luma   = kk_tex_wrap_iosurface(g, (void*)surf, 0, KK_FMT_R8,  KK_TEX_SAMPLE);
-    kk_tex *chroma = kk_tex_wrap_iosurface(g, (void*)surf, 1, KK_FMT_RG8, KK_TEX_SAMPLE);
+    // CVMetalTextureCache-Wrap (Pool-Buffer recyclen → Cache-Hit statt
+    // newTextureWithDescriptor:iosurface: pro Frame); Fallback auf den rohen Wrap.
+    kk_tex *luma   = kk_tex_wrap_pixbuf(g, pb, 0, KK_FMT_R8);
+    kk_tex *chroma = kk_tex_wrap_pixbuf(g, pb, 1, KK_FMT_RG8);
+    if (!luma)   luma   = kk_tex_wrap_iosurface(g, (void*)surf, 0, KK_FMT_R8,  KK_TEX_SAMPLE);
+    if (!chroma) chroma = kk_tex_wrap_iosurface(g, (void*)surf, 1, KK_FMT_RG8, KK_TEX_SAMPLE);
     kk_tex *tgt    = kk_tex_wrap_mtltexture(g, target_texture);
     if (!luma || !chroma || !tgt) {
         kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt);
@@ -411,8 +415,11 @@ bool kk_gpu_render_hdr(void *metal_device, void *cv_pixbuf, void *target_texture
     if (!g_kk) return false;
     kk_gpu *g = g_kk;
 
-    kk_tex *luma   = kk_tex_wrap_iosurface(g, (void*)surf, 0, KK_FMT_R16,  KK_TEX_SAMPLE);
-    kk_tex *chroma = kk_tex_wrap_iosurface(g, (void*)surf, 1, KK_FMT_RG16, KK_TEX_SAMPLE);
+    // CVMetalTextureCache-Wrap wie im SDR-Pfad; Fallback auf den rohen Wrap.
+    kk_tex *luma   = kk_tex_wrap_pixbuf(g, pb, 0, KK_FMT_R16);
+    kk_tex *chroma = kk_tex_wrap_pixbuf(g, pb, 1, KK_FMT_RG16);
+    if (!luma)   luma   = kk_tex_wrap_iosurface(g, (void*)surf, 0, KK_FMT_R16,  KK_TEX_SAMPLE);
+    if (!chroma) chroma = kk_tex_wrap_iosurface(g, (void*)surf, 1, KK_FMT_RG16, KK_TEX_SAMPLE);
     kk_tex *tgt    = kk_tex_wrap_mtltexture(g, target_texture);
     if (!luma || !chroma || !tgt) {
         kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt); return false;
@@ -468,4 +475,25 @@ void kk_gpu_release_all(void) {
     if (!g_kk) return;
     kk_gpu_sdr_release(g_kk); kk_gpu_hdr_release(g_kk);
     kk_gpu_anime4k_release(g_kk); kk_gpu_artcnn_release(g_kk);
+}
+
+// PSO-Prewarm (gegen Erst-Frame-Hitch): alle statischen Kernel einmal kompilieren
+// (nur Compile+Cache, kein Dispatch). Vom App-Attach auf der Render-Queue gerufen —
+// dieselbe Queue wie der erste Render → kein Race auf den PSO-Cache. CNN-Shader
+// kompilieren weiterhin lazy in ihrem gated Pfad (groß + selten).
+void kk_gpu_prewarm(void *metal_device) {
+    if (!g_kk) g_kk = kk_gpu_create(metal_device);
+    if (!g_kk) return;
+    kk_gpu *g = g_kk;
+    kk_gpu_compile(g, DEC_MSL,    "dec");
+    kk_gpu_compile(g, DEBAND_MSL, "deband");
+    kk_gpu_compile(g, LIN_MSL,    "lin");
+    kk_gpu_compile(g, LINSIG_MSL, "linsig");
+    kk_gpu_compile(g, LANCZOS_MSL,"lanczos");
+    kk_gpu_compile(g, DELIN_MSL,  "delin");
+    kk_gpu_compile(g, DELINU_MSL, "delinu");
+    kk_gpu_compile(g, CAS_MSL,    "cas");
+    kk_gpu_compile(g, EWA_MSL,    "ewa");
+    kk_gpu_compile(g, MKPQ_MSL,   "mk");
+    kk_gpu_compile(g, CMHDR_MSL,  "cmh");
 }

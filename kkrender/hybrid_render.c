@@ -167,6 +167,13 @@ int kuckuck_hybrid_render(void *ctx, void *cv_pixbuf, void *target_texture)
     return -2;   // unbekanntes Format (kommt von AVPlayer-VT nicht vor)
 }
 
+void kuckuck_hybrid_prewarm(void *ctx)
+{
+    extern void kk_gpu_prewarm(void *metal_device);
+    struct hybrid_priv *p = ctx;
+    if (p) kk_gpu_prewarm(p->device);
+}
+
 void kuckuck_hybrid_destroy(void *ctx)
 {
     extern void kk_gpu_release_all(void);

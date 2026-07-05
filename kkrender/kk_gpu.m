@@ -10,6 +10,7 @@ struct kk_tex {
     id<MTLTexture> tex;
     int w, h;
     bool downloadable;
+    CVMetalTextureRef cvref;   // gesetzt bei kk_tex_wrap_pixbuf (hält den Cache-Eintrag am Leben)
 };
 
 struct kk_gpu {
@@ -19,6 +20,7 @@ struct kk_gpu {
     id<MTLComputeCommandEncoder> enc;
     NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *psoCache;
     id<MTLSamplerState> sampNearest, sampLinear;
+    CVMetalTextureCacheRef texCache; // Decoder-Buffer-Wraps (Pool recycled → Cache-Hits statt Neu-Alloc/Frame)
 };
 
 static MTLPixelFormat mtl_fmt(kk_fmt f) {
@@ -66,6 +68,7 @@ kk_gpu *kk_gpu_create(void *mtl_device) {
         sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
         g->sampLinear = [g->dev newSamplerStateWithDescriptor:sd];
         CFRetain((__bridge CFTypeRef) g->sampLinear);
+        CVMetalTextureCacheCreate(kCFAllocatorDefault, NULL, g->dev, NULL, &g->texCache);
         return g;
     }
 }
@@ -74,6 +77,7 @@ void kk_gpu_destroy(kk_gpu **pgpu) {
     if (!pgpu || !*pgpu) return;
     struct kk_gpu *g = *pgpu;
     kk_gpu_finish(g);
+    if (g->texCache) { CVMetalTextureCacheFlush(g->texCache, 0); CFRelease(g->texCache); }
     if (g->sampLinear)  CFRelease((__bridge CFTypeRef) g->sampLinear);
     if (g->sampNearest) CFRelease((__bridge CFTypeRef) g->sampNearest);
     if (g->psoCache)    CFRelease((__bridge CFTypeRef) g->psoCache);
@@ -170,6 +174,28 @@ kk_tex *kk_tex_create_3d(kk_gpu *g, int w, int h, int d, kk_fmt fmt,
     }
 }
 
+kk_tex *kk_tex_wrap_pixbuf(kk_gpu *g, void *cv_pixbuf, int plane, kk_fmt fmt) {
+    @autoreleasepool {
+        CVPixelBufferRef pb = (CVPixelBufferRef) cv_pixbuf;
+        if (!pb || !g->texCache) return NULL;
+        size_t w = CVPixelBufferGetWidthOfPlane(pb, plane);
+        size_t h = CVPixelBufferGetHeightOfPlane(pb, plane);
+        CVMetalTextureRef cvref = NULL;
+        CVReturn rc = CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault, g->texCache, pb, NULL, mtl_fmt(fmt), w, h, plane, &cvref);
+        if (rc != kCVReturnSuccess || !cvref) return NULL;
+        id<MTLTexture> mt = CVMetalTextureGetTexture(cvref);
+        if (!mt) { CFRelease(cvref); return NULL; }
+        struct kk_tex *t = calloc(1, sizeof(*t));
+        if (!t) { CFRelease(cvref); return NULL; }
+        t->w = (int) w; t->h = (int) h;
+        t->tex = mt;
+        CFRetain((__bridge CFTypeRef) t->tex);
+        t->cvref = cvref;   // hält den Cache-Eintrag bis kk_tex_destroy (nach finish) am Leben
+        return t;
+    }
+}
+
 kk_tex *kk_tex_wrap_mtltexture(kk_gpu *g, void *mtltexture) {
     @autoreleasepool {
         id<MTLTexture> mt = (__bridge id<MTLTexture>) mtltexture;
@@ -213,6 +239,7 @@ void kk_tex_destroy(kk_gpu *g, kk_tex **ptex) {
     if (t->tex) CFRelease((__bridge CFTypeRef) t->tex);  // balanciert das explizite CFRetain im wrap/create
     t->tex = nil;   // ⚠️ ARC: strong-ivar freigeben. free() läuft objc_storeStrong(&t->tex,nil) NICHT
                     // → der ARC-Retain aus `t->tex = …` würde sonst pro Frame leaken (IOSurface/Frame → Jetsam).
+    if (t->cvref) { CFRelease(t->cvref); t->cvref = NULL; }  // Cache-Eintrag freigeben (pixbuf-Wrap)
     free(t);
     *ptex = NULL;
 }
@@ -245,6 +272,10 @@ static id<MTLComputePipelineState> get_pso(struct kk_gpu *g, const char *src, co
     if (!pso) { fprintf(stderr, "[kk_gpu] PSO failed: %s\n", err.localizedDescription.UTF8String); return nil; }
     g->psoCache[key] = pso;
     return pso;
+}
+
+void kk_gpu_compile(kk_gpu *g, const char *msl_source, const char *entry) {
+    @autoreleasepool { (void) get_pso(g, msl_source, entry); }
 }
 
 bool kk_gpu_compute(kk_gpu *g, const char *msl_source, const char *entry,
