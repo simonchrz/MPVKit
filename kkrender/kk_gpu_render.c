@@ -72,8 +72,12 @@ static const char *LANCZOS_MSL =
 "kernel void lanczos(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
 "  constant P& p [[buffer(0)]], uint2 id [[thread_position_in_grid]]){ uint W=dst.get_width(),H=dst.get_height(); if(id.x>=W||id.y>=H)return;\n"
 "  int sw=int(src.get_width()),sh=int(src.get_height()); float coord=(p.axis==0u?float(id.x):float(id.y));\n"
+// Band-limitiert für Downscale (HDR 1440p -> Display ~0,84x): Filter in den Quellraum
+// gestreckt (sf<1, Fenster 3/sf). Upscale (sf=1): Gewichte identisch zu vorher — die
+// alten Rand-Taps -3/+4 hatten exakt Gewicht 0 (l3>=3 -> 0), R=3 lässt sie nur weg.
+"  float sf=min(p.scale,1.0); int R=int(ceil(3.0/sf));\n"
 "  float s=(coord+0.5)/p.scale-0.5; int base=int(floor(s)); float4 acc=float4(0.0); float wsum=0.0;\n"
-"  for(int t=-3;t<=4;t++){ int tap=base+t; float w=l3(s-float(tap));\n"
+"  for(int t=1-R;t<=R;t++){ int tap=base+t; float w=l3((s-float(tap))*sf);\n"
 "    int cx=(p.axis==0u)?clamp(tap,0,sw-1):int(id.x); int cy=(p.axis==1u)?clamp(tap,0,sh-1):int(id.y);\n"
 "    acc+=w*src.read(uint2(cx,cy)); wsum+=w; } dst.write(acc/wsum,id);}\n";
 static const char *DELIN_MSL =
@@ -423,7 +427,7 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
 
 // HDR-Render (P010 -> PQ/2020): MKPQ(2020-10bit-Decode+PQ-EOTF) -> EWA -> CMHDR
 // (IPT-Tonemap zum EDR-Peak + Chroma-Hull -> PQ-Output) -> Blit. hp vom Hook (libplacebo).
-static kk_tex *h_pq = NULL, *h_ewa = NULL, *h_out = NULL;
+static kk_tex *h_pq = NULL, *h_ewa = NULL, *h_out = NULL, *h_tmpx = NULL;
 static int h_W = 0, h_H = 0, h_OW = 0, h_OH = 0;
 
 bool kk_gpu_render_hdr(void *metal_device, void *cv_pixbuf, void *target_texture,
@@ -454,10 +458,11 @@ bool kk_gpu_render_hdr(void *metal_device, void *cv_pixbuf, void *target_texture
     if (W<=0||H<=0||OW<=0||OH<=0) { kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt); return false; }
 
     if (W != h_W || H != h_H || OW != h_OW || OH != h_OH) {
-        kk_tex_destroy(g,&h_pq); kk_tex_destroy(g,&h_ewa); kk_tex_destroy(g,&h_out);
+        kk_tex_destroy(g,&h_pq); kk_tex_destroy(g,&h_ewa); kk_tex_destroy(g,&h_out); kk_tex_destroy(g,&h_tmpx);
         h_pq  = kk_tex_create(g, W,  H,  KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
         h_ewa = kk_tex_create(g, OW, OH, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
         h_out = kk_tex_create(g, OW, OH, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL); // PQ-Float
+        h_tmpx = kk_tex_create(g, OW, H, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL); // HD-Light Lanczos-X
         h_W=W; h_H=H; h_OW=OW; h_OH=OH;
     }
     if (!h_pq || !h_ewa || !h_out) {
@@ -468,10 +473,24 @@ bool kk_gpu_render_hdr(void *metal_device, void *cv_pixbuf, void *target_texture
 
     kk_compute_args mk = { .out=h_pq, .in={luma,chroma}, .n_in=2, .linear={false,true} };
     kk_gpu_compute(g, MKPQ_MSL, "mk", &mk);                           // P010 -> linear 2020 (10000-norm)
-    struct { float scale; uint32_t lutn; float radius; float lut[64]; } ew;
-    ew.scale=(float)OW/W; ew.lutn=64; ew.radius=KK_EWA_RADIUS; for(int i=0;i<64;i++) ew.lut[i]=KK_EWA_LUT[i];
-    kk_compute_args ea = { .out=h_ewa, .in={h_pq}, .n_in=1, .uniforms=&ew, .uniforms_size=sizeof ew };
-    kk_gpu_compute(g, EWA_MSL, "ewa", &ea);                           // EWA-Scale in Linear
+    // HD-Light auch für HDR (renderpl.69): 1440p-HDR ist am iPhone ein DOWNSCALE
+    // (~0,84x) -> die EWA-Box wächst auf ~9x9=81 Taps = gemessen ~33ms avg (2x über
+    // dem 60Hz-Budget, jeder 2. Frame gedroppt). Separabler band-limitierter Lanczos
+    // (2x ~8 Taps) wie im SDR-HD-Pfad; gleiche Env-Gate-Semantik.
+    const char *hdl = getenv("KUCKUCK_HD_LIGHT");
+    bool hdLight = hdl ? (hdl[0]=='1') : (H >= 1080);
+    if (hdLight && h_tmpx) {
+        struct { float scale; uint32_t axis; } px = { (float)OW/W, 0 }, py = { (float)OH/H, 1 };
+        kk_compute_args xa = { .out=h_tmpx, .in={h_pq}, .n_in=1, .uniforms=&px, .uniforms_size=sizeof px };
+        kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &xa);
+        kk_compute_args ya = { .out=h_ewa, .in={h_tmpx}, .n_in=1, .uniforms=&py, .uniforms_size=sizeof py };
+        kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &ya);
+    } else {
+        struct { float scale; uint32_t lutn; float radius; float lut[64]; } ew;
+        ew.scale=(float)OW/W; ew.lutn=64; ew.radius=KK_EWA_RADIUS; for(int i=0;i<64;i++) ew.lut[i]=KK_EWA_LUT[i];
+        kk_compute_args ea = { .out=h_ewa, .in={h_pq}, .n_in=1, .uniforms=&ew, .uniforms_size=sizeof ew };
+        kk_gpu_compute(g, EWA_MSL, "ewa", &ea);                       // EWA-Scale in Linear
+    }
     bool dw = kk_tex_can_write(tgt);     // Target ShaderWrite-fähig -> direkt rein, Blit sparen
     kk_compute_args ca = { .out=dw?tgt:h_out, .in={h_ewa}, .n_in=1, .uniforms=hp, .uniforms_size=sizeof(kk_hdr_params) };
     kk_gpu_compute(g, CMHDR_MSL, "cmh", &ca);                         // IPT-Tonemap -> PQ/2020
@@ -490,7 +509,7 @@ static void kk_gpu_sdr_release(kk_gpu *g) {
 }
 // HDR-Pfad-Caches. Reset h_W → lazy Re-Alloc bei nächstem HDR-Frame.
 static void kk_gpu_hdr_release(kk_gpu *g) {
-    kk_tex_destroy(g,&h_pq); kk_tex_destroy(g,&h_ewa); kk_tex_destroy(g,&h_out);
+    kk_tex_destroy(g,&h_pq); kk_tex_destroy(g,&h_ewa); kk_tex_destroy(g,&h_out); kk_tex_destroy(g,&h_tmpx);
     h_W = h_H = h_OW = h_OH = 0;
 }
 // Alle kk_gpu-Caches freigeben (Teardown / Player-Close): SDR + HDR + beide CNN. g_kk bleibt.
