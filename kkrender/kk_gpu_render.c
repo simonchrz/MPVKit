@@ -11,6 +11,7 @@
 // EWA statt Lanczos. Alle als verifizierte Bausteine vorhanden (iq-harness/kk_*_ab).
 #include "kk_gpu.h"
 #include <CoreVideo/CoreVideo.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -36,6 +37,19 @@ static const char *DEC_MSL =
 "  float3 v=float3(Y,C.r,C.g);\n"
 "  float3 rgb=float3(d.m[0]*v.x+d.m[1]*v.y+d.m[2]*v.z, d.m[3]*v.x+d.m[4]*v.y+d.m[5]*v.z, d.m[6]*v.x+d.m[7]*v.y+d.m[8]*v.z)+float3(d.m[9],d.m[10],d.m[11]);\n"
 "  dst.write(float4(rgb,1.0),id);}\n";
+// DECLIN: DEC+LIN fusioniert (HD-Light, kein Deband/CNN dazwischen -> c_dec-Roundtrip
+// in voller Quellauflösung gespart). Mathematisch identisch zu dec->lin in Serie.
+static const char *DECLIN_MSL =
+"#include <metal_stdlib>\nusing namespace metal;\nstruct DL{float d[12];float a,b;float m[9];};\n"
+"kernel void declin(texture2d<float> luma [[texture(0)]], texture2d<float> chroma [[texture(1)]],\n"
+"  texture2d<float,access::write> dst [[texture(2)]], sampler near [[sampler(0)]], sampler lin [[sampler(1)]],\n"
+"  constant DL& p [[buffer(0)]], uint2 id [[thread_position_in_grid]]){ uint w=dst.get_width(),h=dst.get_height(); if(id.x>=w||id.y>=h)return;\n"
+"  float2 uv=(float2(id)+0.5)/float2(w,h); float Y=luma.read(id).r; float2 C=chroma.sample(lin,uv).rg;\n"
+"  float3 v=float3(Y,C.r,C.g);\n"
+"  float3 rgb=float3(p.d[0]*v.x+p.d[1]*v.y+p.d[2]*v.z, p.d[3]*v.x+p.d[4]*v.y+p.d[5]*v.z, p.d[6]*v.x+p.d[7]*v.y+p.d[8]*v.z)+float3(p.d[9],p.d[10],p.d[11]);\n"
+"  float3 c=max(rgb,0.0); float3 vl=p.a*pow(c+p.b,float3(2.4));\n"
+"  float3 o=float3(p.m[0]*vl.x+p.m[1]*vl.y+p.m[2]*vl.z, p.m[3]*vl.x+p.m[4]*vl.y+p.m[5]*vl.z, p.m[6]*vl.x+p.m[7]*vl.y+p.m[8]*vl.z);\n"
+"  dst.write(float4(o,1.0),id);}\n";
 // DEBAND: pl_shader_deband (pcg3d-PRNG, 4-Sample-Quarter-Turn-Smoothing + Grain),
 // headless gegen libplacebo verifiziert (mild/strong 0.1 LSB). radius/threshold/grain/
 // iters/index als Uniform (threshold/grain = param/1000).
@@ -66,9 +80,12 @@ static const char *LIN_MSL =
 "  float3 o=float3(l.m[0]*v.x+l.m[1]*v.y+l.m[2]*v.z, l.m[3]*v.x+l.m[4]*v.y+l.m[5]*v.z, l.m[6]*v.x+l.m[7]*v.y+l.m[8]*v.z);\n"
 "  dst.write(float4(o,1.0),id);}\n";
 static const char *LANCZOS_MSL =
-"#include <metal_stdlib>\nusing namespace metal;\nstruct P{float scale;uint axis;};\n"
-"static inline float sinc(float x){if(x==0.0)return 1.0;x*=M_PI_F;return sin(x)/x;}\n"
-"static inline float l3(float x){x=abs(x);if(x>=3.0)return 0.0;return sinc(x)*sinc(x/3.0);}\n"
+"#include <metal_stdlib>\nusing namespace metal;\nstruct P{float scale;uint axis;float lut[64];};\n"
+// Lanczos3-Gewichte als 64er-LUT (host-seitig gebacken, s. kk_lanczos_params) statt
+// 2x sin() pro Tap — gleiche LUT-Dichte/-Interpolation wie der verifizierte EWA-Pfad;
+// lut[63]=l3(3.0)=0, min() clampt Distanzen >=3 exakt auf 0.
+"static inline float l3lut(constant P& p, float x){ x=min(abs(x),3.0)*(63.0/3.0);\n"
+"  int i0=int(x); return mix(p.lut[i0], p.lut[min(i0+1,63)], x-float(i0)); }\n"
 "kernel void lanczos(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
 "  constant P& p [[buffer(0)]], uint2 id [[thread_position_in_grid]]){ uint W=dst.get_width(),H=dst.get_height(); if(id.x>=W||id.y>=H)return;\n"
 "  int sw=int(src.get_width()),sh=int(src.get_height()); float coord=(p.axis==0u?float(id.x):float(id.y));\n"
@@ -77,9 +94,28 @@ static const char *LANCZOS_MSL =
 // alten Rand-Taps -3/+4 hatten exakt Gewicht 0 (l3>=3 -> 0), R=3 lässt sie nur weg.
 "  float sf=min(p.scale,1.0); int R=int(ceil(3.0/sf));\n"
 "  float s=(coord+0.5)/p.scale-0.5; int base=int(floor(s)); float4 acc=float4(0.0); float wsum=0.0;\n"
-"  for(int t=1-R;t<=R;t++){ int tap=base+t; float w=l3((s-float(tap))*sf);\n"
+"  for(int t=1-R;t<=R;t++){ int tap=base+t; float w=l3lut(p,(s-float(tap))*sf);\n"
 "    int cx=(p.axis==0u)?clamp(tap,0,sw-1):int(id.x); int cy=(p.axis==1u)?clamp(tap,0,sh-1):int(id.y);\n"
 "    acc+=w*src.read(uint2(cx,cy)); wsum+=w; } dst.write(acc/wsum,id);}\n";
+// Host-Seite: Lanczos-Uniforms inkl. gebackener l3-LUT (einmal berechnet, dann memcpy).
+typedef struct { float scale; uint32_t axis; float lut[64]; } kk_lanczos_p;
+static kk_lanczos_p kk_lanczos_params(float scale, uint32_t axis) {
+    static float tbl[64]; static bool init = false;
+    if (!init) {
+        for (int i = 0; i < 64; i++) {
+            double x = 3.0 * i / 63.0;
+            double s1 = (x == 0.0) ? 1.0 : sin(M_PI * x) / (M_PI * x);
+            double x3 = x / 3.0;
+            double s3 = (x3 == 0.0) ? 1.0 : sin(M_PI * x3) / (M_PI * x3);
+            tbl[i] = (float)(s1 * s3);
+        }
+        tbl[63] = 0.0f;   // exakt 0 am Fensterrand (l3(3.0))
+        init = true;
+    }
+    kk_lanczos_p p; p.scale = scale; p.axis = axis;
+    memcpy(p.lut, tbl, sizeof tbl);
+    return p;
+}
 static const char *DELIN_MSL =
 "#include <metal_stdlib>\nusing namespace metal;\n"
 "static inline float srgb(float c){ return c<=0.0031308 ? 12.92*c : 1.055*pow(c,1.0/2.4)-0.055; }\n"
@@ -94,6 +130,23 @@ static const char *CAS_MSL =
 "  uint2 id [[thread_position_in_grid]]){ uint W=dst.get_width(),H=dst.get_height(); if(id.x>=W||id.y>=H)return;\n"
 "  int sw=int(W),sh=int(H); int2 p=int2(id);\n"
 "#define T(dx,dy) src.read(uint2(clamp(p.x+(dx),0,sw-1),clamp(p.y+(dy),0,sh-1))).rgb\n"
+"  float3 a=T(-1,-1),b=T(0,-1),c=T(1,-1),d=T(-1,0),e=T(0,0),f=T(1,0),g=T(-1,1),h=T(0,1),i=T(1,1);\n"
+"  float3 mn=min(min(min(d,e),min(f,b)),h); float3 mn2=min(mn,min(min(a,c),min(g,i))); mn+=mn2;\n"
+"  float3 mx=max(max(max(d,e),max(f,b)),h); float3 mx2=max(mx,max(max(a,c),max(g,i))); mx+=mx2;\n"
+"  float3 rcpM=1.0/max(mx,float3(1e-5)); float3 amp=clamp(min(mn,2.0-mx)*rcpM,0.0,1.0); amp=rsqrt(max(amp,float3(1e-5)));\n"
+"  float peak=-3.0*SHARP+8.0; float3 w=-1.0/(amp*peak); float3 rcpW=1.0/(1.0+4.0*w);\n"
+"  float3 win=(b+d)+(f+h); float3 o=clamp((win*w+e)*rcpW,0.0,1.0); dst.write(float4(o,1.0),id);}\n";
+// DELINCAS: Delin+CAS fusioniert (HD-Light) — der c_srgb-Roundtrip in voller Output-
+// Auflösung entfällt; das sRGB-Encode läuft pro Tap inline (9x3 pow, ALU gegen
+// Bandbreite getauscht — der Renderer ist bandbreiten-gebunden). Identische Mathe.
+static const char *DELINCAS_MSL =
+"#include <metal_stdlib>\nusing namespace metal;\n#define SHARP 0.5\n"
+"static inline float srgb(float c){ return c<=0.0031308 ? 12.92*c : 1.055*pow(c,1.0/2.4)-0.055; }\n"
+"static inline float3 srgb3(float3 c){ c=clamp(c,0.0,1.0); return float3(srgb(c.r),srgb(c.g),srgb(c.b)); }\n"
+"kernel void delincas(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
+"  uint2 id [[thread_position_in_grid]]){ uint W=dst.get_width(),H=dst.get_height(); if(id.x>=W||id.y>=H)return;\n"
+"  int sw=int(W),sh=int(H); int2 p=int2(id);\n"
+"#define T(dx,dy) srgb3(src.read(uint2(clamp(p.x+(dx),0,sw-1),clamp(p.y+(dy),0,sh-1))).rgb)\n"
 "  float3 a=T(-1,-1),b=T(0,-1),c=T(1,-1),d=T(-1,0),e=T(0,0),f=T(1,0),g=T(-1,1),h=T(0,1),i=T(1,1);\n"
 "  float3 mn=min(min(min(d,e),min(f,b)),h); float3 mn2=min(mn,min(min(a,c),min(g,i))); mn+=mn2;\n"
 "  float3 mx=max(max(max(d,e),max(f,b)),h); float3 mx2=max(mx,max(max(a,c),max(g,i))); mx+=mx2;\n"
@@ -296,9 +349,6 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
     if (yuv2rgb) { for (int i=0;i<12;i++) D.m[i]=yuv2rgb[i]; }
     else { float f[12]={1.1643f,0.0f,1.7927f, 1.1643f,-0.2132f,-0.5329f, 1.1643f,2.1124f,0.0f, -0.9729f,0.3015f,-1.1334f};
            for (int i=0;i<12;i++) D.m[i]=f[i]; }
-    kk_compute_args da = { .out=c_dec, .in={luma,chroma}, .n_in=2, .linear={false,true}, .uniforms=&D, .uniforms_size=sizeof D };
-    kk_gpu_compute(g, DEC_MSL, "dec", &da);
-
     // HD-Light früh entscheiden (s. Default-Scaler unten): im HD-Light entfällt
     // Deband (wie renderpl.57) — der Pass würde sonst umsonst laufen. Für die
     // CNN-Pfade (SD-Cartoons/Realfilm) bleibt Deband unabhängig davon aktiv.
@@ -306,6 +356,14 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
     const char *hdl = getenv("KUCKUCK_HD_LIGHT");
     bool hdLight = hdl ? (hdl[0]=='1') : (H >= 1080);
     bool cnnPath = glsl_early && (strcasestr(glsl_early, "anime4k") || strcasestr(glsl_early, "artcnn"));
+    // DEC+LIN-Fusion (HD-Light ohne CNN): dort ist LIN der EINZIGE c_dec-Konsument
+    // (Deband ist aus, CNN-Pfade laufen nicht) -> der Standalone-DEC entfällt,
+    // declin liest luma/chroma direkt (spart den c_dec-Roundtrip in Quellauflösung).
+    bool fusedDec = hdLight && !cnnPath;
+    if (!fusedDec) {
+        kk_compute_args da = { .out=c_dec, .in={luma,chroma}, .n_in=2, .linear={false,true}, .uniforms=&D, .uniforms_size=sizeof D };
+        kk_gpu_compute(g, DEC_MSL, "dec", &da);
+    }
 
     // Deband (KUCKUCK_DEBAND off|mild|strong) auf der encodeten Quelle.
     const char *dbenv = getenv("KUCKUCK_DEBAND");
@@ -334,7 +392,7 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
         if (a) {
             kk_compute_args alz = { .out=c_alin, .in={a}, .n_in=1, .uniforms=&L, .uniforms_size=sizeof L };
             kk_gpu_compute(g, LIN_MSL, "lin", &alz);                    // linearize (2W×2H)
-            struct { float scale; uint32_t axis; } apx = { (float)OW/(W*2), 0 }, apy = { (float)OH/(H*2), 1 };
+            kk_lanczos_p apx = kk_lanczos_params((float)OW/(W*2), 0), apy = kk_lanczos_params((float)OH/(H*2), 1);
             kk_compute_args axa = { .out=c_atmpx, .in={c_alin}, .n_in=1, .uniforms=&apx, .uniforms_size=sizeof apx };
             kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &axa);            // X: 2W -> OW
             kk_compute_args aya = { .out=c_liny, .in={c_atmpx}, .n_in=1, .uniforms=&apy, .uniforms_size=sizeof apy };
@@ -368,7 +426,7 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
             }
             kk_compute_args alz = { .out=c_alin, .in={asrc}, .n_in=1, .uniforms=&L, .uniforms_size=sizeof L };
             kk_gpu_compute(g, LIN_MSL, "lin", &alz);
-            struct { float scale; uint32_t axis; } apx = { (float)OW/(W*2), 0 }, apy = { (float)OH/(H*2), 1 };
+            kk_lanczos_p apx = kk_lanczos_params((float)OW/(W*2), 0), apy = kk_lanczos_params((float)OH/(H*2), 1);
             kk_compute_args axa = { .out=c_atmpx, .in={c_alin}, .n_in=1, .uniforms=&apx, .uniforms_size=sizeof apx };
             kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &axa);
             kk_compute_args aya = { .out=c_liny, .in={c_atmpx}, .n_in=1, .uniforms=&apy, .uniforms_size=sizeof apy };
@@ -392,16 +450,26 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
     kk_tex *dout = cas ? c_srgb : fin;
 
     if (hdLight && c_tmpx) {
-        // HD: DEC (ohne Deband) -> LIN -> Lanczos X -> Lanczos Y -> Delin -> [CAS].
-        kk_compute_args la0 = { .out=c_lin, .in={c_dec}, .n_in=1, .uniforms=&L, .uniforms_size=sizeof L };
-        kk_gpu_compute(g, LIN_MSL, "lin", &la0);
-        struct { float scale; uint32_t axis; } px = { (float)OW/W, 0 }, py = { (float)OH/H, 1 };
+        // HD: DECLIN (fusioniert) -> Lanczos X -> Lanczos Y -> Delin[+CAS fusioniert].
+        if (fusedDec) {
+            struct { float d[12]; float a, b; float m[9]; } DL2;
+            memcpy(DL2.d, D.m, sizeof DL2.d); DL2.a = L.a; DL2.b = L.b; memcpy(DL2.m, L.m, sizeof DL2.m);
+            kk_compute_args la0 = { .out=c_lin, .in={luma,chroma}, .n_in=2, .linear={false,true}, .uniforms=&DL2, .uniforms_size=sizeof DL2 };
+            kk_gpu_compute(g, DECLIN_MSL, "declin", &la0);
+        } else {   // CNN-Gate an, aber CNN-Pfad oben gescheitert -> c_dec existiert
+            kk_compute_args la0 = { .out=c_lin, .in={c_dec}, .n_in=1, .uniforms=&L, .uniforms_size=sizeof L };
+            kk_gpu_compute(g, LIN_MSL, "lin", &la0);
+        }
+        kk_lanczos_p px = kk_lanczos_params((float)OW/W, 0), py = kk_lanczos_params((float)OH/H, 1);
         kk_compute_args xa = { .out=c_tmpx, .in={c_lin}, .n_in=1, .uniforms=&px, .uniforms_size=sizeof px };
         kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &xa);
         kk_compute_args ya = { .out=c_liny, .in={c_tmpx}, .n_in=1, .uniforms=&py, .uniforms_size=sizeof py };
         kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &ya);
-        kk_compute_args la = { .out=dout, .in={c_liny}, .n_in=1 };
-        kk_gpu_compute(g, DELIN_MSL, "delin", &la);
+        // Delin+CAS in EINEM Pass direkt -> fin (c_srgb-Roundtrip entfällt).
+        kk_compute_args la = { .out=fin, .in={c_liny}, .n_in=1 };
+        kk_gpu_compute(g, cas ? DELINCAS_MSL : DELIN_MSL, cas ? "delincas" : "delin", &la);
+        if (!dw) kk_gpu_blit(g, c_out, tgt);
+        return kk_finish_or_submit(g, &luma, &chroma, &tgt, done, done_ud);
     } else {
         // SD-Qualitätspfad: [Deband] -> LIN[+SIG fusioniert] -> EWA-lanczossharp ->
         // [Unsig+]Delin (= libplacebos pl_render_high_quality-Default).
@@ -480,7 +548,7 @@ bool kk_gpu_render_hdr(void *metal_device, void *cv_pixbuf, void *target_texture
     const char *hdl = getenv("KUCKUCK_HD_LIGHT");
     bool hdLight = hdl ? (hdl[0]=='1') : (H >= 1080);
     if (hdLight && h_tmpx) {
-        struct { float scale; uint32_t axis; } px = { (float)OW/W, 0 }, py = { (float)OH/H, 1 };
+        kk_lanczos_p px = kk_lanczos_params((float)OW/W, 0), py = kk_lanczos_params((float)OH/H, 1);
         kk_compute_args xa = { .out=h_tmpx, .in={h_pq}, .n_in=1, .uniforms=&px, .uniforms_size=sizeof px };
         kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &xa);
         kk_compute_args ya = { .out=h_ewa, .in={h_tmpx}, .n_in=1, .uniforms=&py, .uniforms_size=sizeof py };
@@ -528,6 +596,8 @@ void kk_gpu_prewarm(void *metal_device) {
     if (!g_kk) return;
     kk_gpu *g = g_kk;
     kk_gpu_compile(g, DEC_MSL,    "dec");
+    kk_gpu_compile(g, DECLIN_MSL, "declin");
+    kk_gpu_compile(g, DELINCAS_MSL, "delincas");
     kk_gpu_compile(g, DEBAND_MSL, "deband");
     kk_gpu_compile(g, LIN_MSL,    "lin");
     kk_gpu_compile(g, LINSIG_MSL, "linsig");
