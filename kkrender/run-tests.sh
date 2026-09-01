@@ -21,7 +21,7 @@ GEMEINSAM=("$ROOT/kk_gpu.m" "$ROOT/kk_gpu_genparams.c" "$ROOT/kk_gpu_cnn.c")
 RAHMEN=(-framework Metal -framework Foundation -framework CoreVideo -framework IOSurface)
 
 alle=(kk_tg_test kk_decode_test kk_iosurface_test kk_scale_test kk_cnn_test
-      kk_fusion_test kk_lut_test)
+      kk_fusion_test kk_lut_test kk_ewa_test)
 tests=("$@"); [ ${#tests[@]} -eq 0 ] && tests=("${alle[@]}")
 
 fehler=0

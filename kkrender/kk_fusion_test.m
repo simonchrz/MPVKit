@@ -114,12 +114,78 @@ static int pruefe_declin(kk_gpu *g) {
     return schlecht;
 }
 
+/// DELINCAS (Delin+CAS fusioniert) gegen DELIN -> CAS in Serie.
+///
+/// ⚠️ Hier ist „identische Mathe" eine STÄRKERE Behauptung als bei DECLIN: der
+/// getrennte Weg schreibt das sRGB-Ergebnis in eine RGBA8-Textur und schärft
+/// DANACH auf den quantisierten Werten. Der fusionierte Kernel encodiert pro
+/// Abtastpunkt in voller Präzision und schärft auf den unquantisierten Werten.
+/// Die Fusion ist also nicht nur schneller, sondern genauer — erwartbar ist ein
+/// kleiner Unterschied. Was NICHT sein darf, ist ein systematischer Versatz:
+/// der hiesse, dass Bilder seit renderpl.70 heller oder dunkler sind.
+static int pruefe_delincas(kk_gpu *g) {
+    const int W = 64, H = 32;
+    // Linearlicht-Eingang mit Kanten (CAS ist ein Kantenfilter — eine Fläche
+    // würde jeden Unterschied verstecken).
+    unsigned char *lin = malloc(4 * W * H);
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) {
+            int hell = ((x / 5 + y / 5) % 2);
+            unsigned char v = hell ? 200 : 40;
+            if (x % 5 == 0) v = hell ? 240 : 10;      // harte Kanten dazwischen
+            lin[4*(y*W+x)+0] = v;
+            lin[4*(y*W+x)+1] = (unsigned char)(v * 0.8);
+            lin[4*(y*W+x)+2] = (unsigned char)(v * 0.6);
+            lin[4*(y*W+x)+3] = 255;
+        }
+    kk_tex *src = kk_tex_create(g, W, H, KK_FMT_RGBA8, KK_TEX_SAMPLE, lin);
+
+    // --- Weg A: DELIN -> CAS (getrennt, mit RGBA8-Zwischenstufe wie vor renderpl.70)
+    kk_tex *srgb = kk_tex_create(g, W, H, KK_FMT_RGBA8, KK_TEX_SAMPLE | KK_TEX_STORAGE, NULL);
+    kk_tex *outA = kk_tex_create(g, W, H, KK_FMT_RGBA8, KK_TEX_STORAGE | KK_TEX_DOWNLOAD, NULL);
+    kk_gpu_compute(g, DELIN_MSL, "delin", &(kk_compute_args){
+        .out = srgb, .in = { src }, .n_in = 1 });
+    kk_gpu_compute(g, CAS_MSL, "cas", &(kk_compute_args){
+        .out = outA, .in = { srgb }, .n_in = 1 });
+
+    // --- Weg B: DELINCAS (Produktionspfad im HD-Light)
+    kk_tex *outB = kk_tex_create(g, W, H, KK_FMT_RGBA8, KK_TEX_STORAGE | KK_TEX_DOWNLOAD, NULL);
+    kk_gpu_compute(g, DELINCAS_MSL, "delincas", &(kk_compute_args){
+        .out = outB, .in = { src }, .n_in = 1 });
+    kk_gpu_finish(g);
+
+    unsigned char *a = malloc(4 * W * H), *b = malloc(4 * W * H);
+    kk_tex_download(g, outA, a);
+    kk_tex_download(g, outB, b);
+
+    double maxabs = 0.0, summe = 0.0; int n = 0;
+    for (int i = 0; i < W * H; i++)
+        for (int k = 0; k < 3; k++) {
+            double fa = a[4*i+k] / 255.0, fb = b[4*i+k] / 255.0;
+            maxabs = fmax(maxabs, fabs(fa - fb));
+            summe += fa - fb; n++;
+        }
+    double mittel = summe / n;
+    printf("  DELINCAS vs DELIN->CAS maxdiff=%.1f LSB  mittlerer Versatz=%+.3f LSB",
+           maxabs * 255.0, mittel * 255.0);
+    // Grosszügiger als bei DECLIN: die eingesparte Quantisierung wirkt sich an
+    // Kanten aus, wo CAS die Nachbarn gewichtet. Der Versatz muss trotzdem ~0 sein.
+    int schlecht = (maxabs > 4.0 / 255.0) || (fabs(mittel) > 0.3 / 255.0);
+    printf("%s\n", schlecht ? "   FEHLER" : "   ok");
+
+    free(lin); free(a); free(b);
+    kk_tex_destroy(g, &src); kk_tex_destroy(g, &srgb);
+    kk_tex_destroy(g, &outA); kk_tex_destroy(g, &outB);
+    return schlecht;
+}
+
 int main(void) { @autoreleasepool {
     setvbuf(stdout, NULL, _IONBF, 0);
     kk_gpu *g = kk_gpu_create(NULL);
     if (!g) { printf("kk_gpu_create fehlgeschlagen\n"); return 1; }
 
     int fehler = pruefe_declin(g);
+    fehler |= pruefe_delincas(g);
 
     kk_gpu_destroy(&g);
     printf(fehler ? "kk_fusion_test: FEHLGESCHLAGEN\n"
