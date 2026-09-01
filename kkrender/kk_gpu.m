@@ -155,6 +155,12 @@ kk_tex *kk_tex_create(kk_gpu *g, int w, int h, kk_fmt fmt, uint32_t usage,
         t->tex = [g->dev newTextureWithDescriptor:d];
         if (!t->tex) { free(t); return NULL; }
         CFRetain((__bridge CFTypeRef) t->tex);
+        // ⚠️ FALLE: ohne KK_TEX_DOWNLOAD ist die Textur PRIVATE, und
+        // `replaceRegion` auf privaten Speicher ist laut Metal ungültig. Es geht
+        // meistens gut und kracht grössenabhängig (2026-09-01 in einem Prüfstand
+        // bei 64×64: SIGSEGV; 32×32 lief). KEIN Produktionsaufruf ist betroffen —
+        // die Renderer geben durchweg NULL und füllen per Compute oder Wrap.
+        // Wer initial_data nutzt, MUSS KK_TEX_DOWNLOAD mitsetzen.
         if (initial_data) {
             [t->tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
                         withBytes:initial_data bytesPerRow:(NSUInteger) w * fmt_bytes(fmt)];
