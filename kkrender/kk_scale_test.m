@@ -74,3 +74,12 @@ int main(void){
     kk_gpu_destroy(&g);
     return fails?1:0;
 }
+
+// ⚠️ NACHTRAG 2026-09-01: Dieser Prüfstand trägt eine EIGENE Kopie des
+// Lanczos-Kernels (LANCZOS_MSL oben) und ruft KEINEN Produktionscode auf. Als
+// kk_gpu_render.c im Juli 2026 auf eine gebackene 64er-LUT umgestellt wurde
+// (renderpl.70), blieb er trotzdem grün — er prüfte weiter seine eigene
+// sin()-Variante. Er beweist damit die MECHANIK (Convolution, 2-Pass, Sampler),
+// nicht den ausgelieferten Kernel.
+// Den echten Pfad prüft `kk_lut_test.m`. Dasselbe gilt sinngemäß für die vier
+// anderen Prüfstände aus der Bauphase.

@@ -121,3 +121,5 @@ dist/
 Package.resolved
 buildServer.json
 .vscode
+# kkrender: Bau-Ausgabe (build-kkrender.sh legt sie neu an)
+kkrender/out/

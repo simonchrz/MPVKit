@@ -32,3 +32,14 @@ xcodebuild -create-xcframework \
   -library "$OUT/sim/libkkrender.a" -headers "$ROOT/include" \
   -output "$OUT/Libkkrender.xcframework"
 echo "==> Libkkrender.xcframework gebaut:"; find "$OUT/Libkkrender.xcframework" -maxdepth 2
+
+# Prüfstände auf dem Mac laufen lassen (macOS-SDK, echte GPU, CPU-Referenzen).
+# ⚠️ Bewusst NACH dem Bau und im selben Skript: bis 2026-09-01 lagen die Prüfstände
+# daneben und mussten von Hand übersetzt werden — entsprechend lief sie niemand,
+# und `kk_scale_test` blieb monatelang grün, während es eine im Juli abgelöste
+# sin()-Variante prüfte statt des ausgelieferten Kernels.
+# Überspringen mit KK_SKIP_TESTS=1 (z.B. auf einem Rechner ohne Metal).
+if [ "${KK_SKIP_TESTS:-0}" != "1" ]; then
+  echo "==> Prüfstände:"
+  "$ROOT/run-tests.sh"
+fi
