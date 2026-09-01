@@ -7,7 +7,11 @@
 # echter Hardware auffällt (Pacing, Thermik, Speicher), gehört nicht hierher,
 # sondern in die on-device-Messung via `hybrid.log`.
 #
-# Aufruf: ./run-tests.sh [name ...]   (ohne Argument: alle)
+# Aufruf: ./run-tests.sh [name ...]   (ohne Argument: alle Pruefstaende)
+#
+# `kk_bench` ist BEWUSST nicht in der Standardliste: es prueft nichts, es misst —
+# schlaegt also nie fehl und kostet nur Zeit im Bau. Gezielt aufrufen:
+#     ./run-tests.sh kk_bench
 # `build-kkrender.sh` ruft das am Ende selbst auf — ein Prüfstand, den niemand
 # startet, schützt nichts.
 set -euo pipefail
