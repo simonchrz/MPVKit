@@ -50,6 +50,29 @@ static const char *DECLIN_MSL =
 "  float3 c=max(rgb,0.0); float3 vl=p.a*pow(c+p.b,float3(2.4));\n"
 "  float3 o=float3(p.m[0]*vl.x+p.m[1]*vl.y+p.m[2]*vl.z, p.m[3]*vl.x+p.m[4]*vl.y+p.m[5]*vl.z, p.m[6]*vl.x+p.m[7]*vl.y+p.m[8]*vl.z);\n"
 "  dst.write(float4(o,1.0),id);}\n";
+// DEBLOCK: separabler 1D-Bilateral (±3, Luma-Range-gewichtet) auf der encodeten
+// Quelle, Port von Resources/deblock_cas.glsl (App). Fuer SD-Privatsender am
+// Kabel-Tuner (VOX/RTL ~2,4-2,9 Mbit/s): die 16-px-DCT-Kacheln sind in die Pixel
+// eingebacken, man kann sie nur glaetten. ±1 war nachweislich wirkungslos (glaettet
+// nur die 1-px-Stufe), erst ±3 reicht in beide Nachbarkacheln. Raeumliche Gewichte
+// 0,88/0,61/0,32 ≈ Gauss σ≈2; SIGMA_R 0,12 (~30/255) trennt Block von Kante.
+// Zwei Dispatches (axis 0 = H, 1 = V), 7+7 statt 49 Taps. Gate: ~deblock.
+// ⚠️ Bis 2026-09-02 lief die GLSL-Datei NIE: kk_gpu liest keine GLSL, der Pfad
+// ist nur ein Substring-Schalter — „deblock_cas" traf nur „cas".
+static const char *DEBLOCK_MSL =
+"#include <metal_stdlib>\nusing namespace metal;\nstruct P{uint axis;};\n#define SIGMA_R 0.12\n"
+"static inline float dl_luma(float3 c){ return dot(c,float3(0.299,0.587,0.114)); }\n"
+"static inline float dl_w(float ln,float le,float sw){ float d=ln-le; return sw*exp(-(d*d)/(2.0*SIGMA_R*SIGMA_R)); }\n"
+"kernel void deblock(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
+"  constant P& p [[buffer(0)]], uint2 id [[thread_position_in_grid]]){ uint W=dst.get_width(),H=dst.get_height(); if(id.x>=W||id.y>=H)return;\n"
+"  int2 c=int2(id); int2 st=(p.axis==0u)?int2(1,0):int2(0,1); int2 mx=int2(int(W)-1,int(H)-1);\n"
+"#define T(k) src.read(uint2(clamp(c+(k)*st,int2(0),mx))).rgb\n"
+"  float3 e=T(0); float le=dl_luma(e);\n"
+"  float3 p1=T(1),p2=T(2),p3=T(3),m1=T(-1),m2=T(-2),m3=T(-3);\n"
+"  float w1=dl_w(dl_luma(p1),le,0.88),w2=dl_w(dl_luma(p2),le,0.61),w3=dl_w(dl_luma(p3),le,0.32);\n"
+"  float v1=dl_w(dl_luma(m1),le,0.88),v2=dl_w(dl_luma(m2),le,0.61),v3=dl_w(dl_luma(m3),le,0.32);\n"
+"  float3 sum=e+p1*w1+p2*w2+p3*w3+m1*v1+m2*v2+m3*v3; float ws=1.0+w1+w2+w3+v1+v2+v3;\n"
+"  dst.write(float4(sum/ws,1.0),id);}\n";
 // DEBAND: pl_shader_deband (pcg3d-PRNG, 4-Sample-Quarter-Turn-Smoothing + Grain),
 // headless gegen libplacebo verifiziert (mild/strong 0.1 LSB). radius/threshold/grain/
 // iters/index als Uniform (threshold/grain = param/1000).
@@ -282,6 +305,7 @@ static kk_tex *c_srgb = NULL;                    // CAS-Input (sRGB-Ausgabe vor 
 static kk_tex *c_a2rgb = NULL;                   // ArtCNN: 2×-Luma decodet zu encodeter RGB
 // c_sig entfernt: LIN+SIG fusioniert (LINSIG_MSL) → kein separates Sigmoid-Intermediate
 static kk_tex *c_adeb = NULL;                    // ArtCNN-Pfad: entbandete 2×-RGB
+static kk_tex *c_dbl = NULL;                     // Deblock: H-Zwischenstufe (W×H), nur bei ~deblock
 static int c_W = 0, c_H = 0, c_OW = 0, c_OH = 0;
 static unsigned g_frame = 0;   // temporaler Grain-Index (Deband)
 
@@ -337,6 +361,7 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
         c_a2rgb = kk_tex_create(g, W*2, H*2, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL); // ArtCNN-2×-RGB
         kk_tex_destroy(g,&c_adeb);
         c_adeb  = kk_tex_create(g, W*2, H*2, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL); // ArtCNN-Deband-2×
+        kk_tex_destroy(g,&c_dbl);   // lazy im Deblock-Block
         c_W=W; c_H=H; c_OW=OW; c_OH=OH;
     }
     if (!c_dec || !c_deb || !c_lin || !c_tmpx || !c_liny || !c_out) {
@@ -363,13 +388,27 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
     const char *hdl = getenv("KUCKUCK_HD_LIGHT");
     bool hdLight = hdl ? (hdl[0]=='1') : (H >= 1080);
     bool cnnPath = glsl_early && (strcasestr(glsl_early, "anime4k") || strcasestr(glsl_early, "artcnn"));
-    // DEC+LIN-Fusion (HD-Light ohne CNN): dort ist LIN der EINZIGE c_dec-Konsument
-    // (Deband ist aus, CNN-Pfade laufen nicht) -> der Standalone-DEC entfällt,
-    // declin liest luma/chroma direkt (spart den c_dec-Roundtrip in Quellauflösung).
-    bool fusedDec = hdLight && !cnnPath;
+    bool deblock = glsl_early && strcasestr(glsl_early, "deblock");
+    // DEC+LIN-Fusion (HD-Light ohne CNN/Deblock): dort ist LIN der EINZIGE c_dec-
+    // Konsument (Deband ist aus, CNN-Pfade laufen nicht) -> der Standalone-DEC
+    // entfällt, declin liest luma/chroma direkt (spart den c_dec-Roundtrip).
+    bool fusedDec = hdLight && !cnnPath && !deblock;
     if (!fusedDec) {
         kk_compute_args da = { .out=c_dec, .in={luma,chroma}, .n_in=2, .linear={false,true}, .uniforms=&D, .uniforms_size=sizeof D };
         kk_gpu_compute(g, DEC_MSL, "dec", &da);
+    }
+    // Deblock (gated ~deblock): H -> c_dbl, V -> zurück nach c_dec. Danach sehen
+    // alle Konsumenten (Deband, LIN, CNNs) die entblockte Quelle.
+    if (deblock) {
+        if (!c_dbl) c_dbl = kk_tex_create(g, W, H, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
+        if (c_dbl) {
+            struct { uint32_t axis; } ax = { 0 };
+            kk_compute_args dh = { .out=c_dbl, .in={c_dec}, .n_in=1, .uniforms=&ax, .uniforms_size=sizeof ax };
+            kk_gpu_compute(g, DEBLOCK_MSL, "deblock", &dh);
+            ax.axis = 1;
+            kk_compute_args dv = { .out=c_dec, .in={c_dbl}, .n_in=1, .uniforms=&ax, .uniforms_size=sizeof ax };
+            kk_gpu_compute(g, DEBLOCK_MSL, "deblock", &dv);
+        }
     }
 
     // Deband (KUCKUCK_DEBAND off|mild|strong) auf der encodeten Quelle.
@@ -595,7 +634,7 @@ static void kk_gpu_sdr_release(kk_gpu *g) {
     kk_tex_destroy(g,&c_dec); kk_tex_destroy(g,&c_deb); kk_tex_destroy(g,&c_lin);
     kk_tex_destroy(g,&c_tmpx); kk_tex_destroy(g,&c_liny); kk_tex_destroy(g,&c_out);
     kk_tex_destroy(g,&c_alin); kk_tex_destroy(g,&c_atmpx); kk_tex_destroy(g,&c_srgb);
-    kk_tex_destroy(g,&c_a2rgb);
+    kk_tex_destroy(g,&c_a2rgb); kk_tex_destroy(g,&c_dbl);
     c_W = c_H = c_OW = c_OH = 0;
 }
 // HDR-Pfad-Caches. Reset h_W → lazy Re-Alloc bei nächstem HDR-Frame.
@@ -622,6 +661,7 @@ void kk_gpu_prewarm(void *metal_device) {
     kk_gpu_compile(g, DECLIN_MSL, "declin");
     kk_gpu_compile(g, DELINCAS_MSL, "delincas");
     kk_gpu_compile(g, DEBAND_MSL, "deband");
+    kk_gpu_compile(g, DEBLOCK_MSL, "deblock");
     kk_gpu_compile(g, LIN_MSL,    "lin");
     kk_gpu_compile(g, LINSIG_MSL, "linsig");
     kk_gpu_compile(g, LANCZOS_MSL,"lanczos");

@@ -137,6 +137,72 @@ static int pruefe_deband(kk_gpu *g) {
     return schlecht | s2 | s3;
 }
 
+
+// --- DEBLOCK: separabler ±3-Bilateral (H+V wie in der Produktion) -----------
+static void deblock_lauf(kk_gpu *g, const unsigned char *in, int W, int H, unsigned char *out) {
+    kk_tex *src = kk_tex_create(g, W, H, KK_FMT_RGBA8, KK_TEX_SAMPLE | KK_TEX_DOWNLOAD, (void *)in);
+    kk_tex *mid = kk_tex_create(g, W, H, KK_FMT_RGBA8, KK_TEX_SAMPLE | KK_TEX_STORAGE | KK_TEX_DOWNLOAD, NULL);
+    kk_tex *dst = kk_tex_create(g, W, H, KK_FMT_RGBA8, KK_TEX_STORAGE | KK_TEX_DOWNLOAD, NULL);
+    struct { uint32_t axis; } ax = { 0 };
+    kk_gpu_compute(g, DEBLOCK_MSL, "deblock", &(kk_compute_args){
+        .out = mid, .in = { src }, .n_in = 1, .uniforms = &ax, .uniforms_size = sizeof ax });
+    ax.axis = 1;
+    kk_gpu_compute(g, DEBLOCK_MSL, "deblock", &(kk_compute_args){
+        .out = dst, .in = { mid }, .n_in = 1, .uniforms = &ax, .uniforms_size = sizeof ax });
+    kk_gpu_finish(g);
+    kk_tex_download(g, dst, out);
+    kk_tex_destroy(g, &src); kk_tex_destroy(g, &mid); kk_tex_destroy(g, &dst);
+}
+
+static int pruefe_deblock(kk_gpu *g) {
+    const int W = 64, H = 64;
+    unsigned char *bild = malloc(4 * W * H), *a = malloc(4 * W * H);
+    // Obere Hälfte: 16-px-Schachbrett 120/136 (Stufe 16 LSB ≈ 0,06 Luma — eine
+    // DCT-Kachelgrenze, wie sie VOX/RTL in SD liefern). Untere Hälfte: harte
+    // Kante 30/220 — echter Bildinhalt, den der Filter NICHT anfassen darf.
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) {
+            unsigned char v = (y < H/2) ? ((((x/16) + (y/16)) & 1) ? 136 : 120)
+                                        : ((x < W/2) ? 30 : 220);
+            bild[4*(y*W+x)] = bild[4*(y*W+x)+1] = bild[4*(y*W+x)+2] = v;
+            bild[4*(y*W+x)+3] = 255;
+        }
+    deblock_lauf(g, bild, W, H, a);
+
+    // (a) Kachelstufe: an der Grenze x=15|16 (Zeile 8) war der Sprung 16 LSB.
+    //     Nach dem Filter muss er deutlich kleiner sein (Soll ≈4; Identität = 16).
+    int st = abs((int)a[4*(8*W+15)] - (int)a[4*(8*W+16)]);
+    printf("  Deblock Kachelstufe      x15=%d x16=%d Stufe=%d (vorher 16)", a[4*(8*W+15)], a[4*(8*W+16)], st);
+    int s1 = st > 8;
+    printf("%s\n", s1 ? "   FEHLER (glaettet die Kachelgrenze nicht)" : "   ok");
+
+    // (b) Reichweite: ±3 muss auch 2 px neben der Grenze noch wirken (der ±1-
+    //     Filter tat das nicht — die Radius-Lehre). x=13 darf nicht mehr 120 sein.
+    int x13 = a[4*(8*W+13)];
+    printf("  Deblock Reichweite       x13=%d (vorher 120)", x13);
+    int s2 = x13 <= 120;
+    printf("%s\n", s2 ? "   FEHLER (wirkt nur 1 px weit)" : "   ok");
+
+    // (c) Helligkeitstreue: der Filter ist normiert — Mittel der Schachbrett-
+    //     Hälfte bleibt 128 (verschöbe er, würde jedes SD-Bild heller/dunkler).
+    long summe = 0;
+    for (int y = 0; y < H/2; y++) for (int x = 0; x < W; x++) summe += a[4*(y*W+x)];
+    double mittel = (double)summe / (W * H / 2);
+    printf("  Deblock Helligkeit       mittel=%.2f (Soll 128)", mittel);
+    int s3 = fabs(mittel - 128.0) > 1.0;
+    printf("%s\n", s3 ? "   FEHLER (verschiebt den Pegel)" : "   ok");
+
+    // (d) Kantenerhalt: 30/220 direkt an der Kante (x=31|32, Zeile 48) bleibt —
+    //     das Luma-Range-Gewicht (SIGMA_R) muss echte Kanten aussperren.
+    int links = a[4*(48*W+31)], rechts = a[4*(48*W+32)];
+    printf("  Deblock Kantenerhalt     links=%d rechts=%d (Soll 30/220)", links, rechts);
+    int s4 = (abs(links - 30) > 4) || (abs(rechts - 220) > 4);
+    printf("%s\n", s4 ? "   FEHLER (verwischt echte Kanten)" : "   ok");
+
+    free(bild); free(a);
+    return s1 | s2 | s3 | s4;
+}
+
 int main(void) { @autoreleasepool {
     setvbuf(stdout, NULL, _IONBF, 0);
     kk_gpu *g = kk_gpu_create(NULL);
@@ -144,9 +210,10 @@ int main(void) { @autoreleasepool {
 
     int fehler = sigmoid_rundlauf(g);
     fehler |= pruefe_deband(g);
+    fehler |= pruefe_deblock(g);
 
     kk_gpu_destroy(&g);
     printf(fehler ? "kk_rest_test: FEHLGESCHLAGEN\n"
-                  : "kk_rest_test: LINSIG/DELINU-Rundlauf + DEBAND-Invarianten  PASS\n");
+                  : "kk_rest_test: LINSIG/DELINU-Rundlauf + DEBAND/DEBLOCK-Invarianten  PASS\n");
     return fehler ? 1 : 0;
 } }
