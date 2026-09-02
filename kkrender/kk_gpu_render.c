@@ -237,6 +237,13 @@ static const char *CMHDR_MSL =
 
 static kk_gpu *g_kk = NULL;  // lazy, teilt libplacebos Device
 
+// Pass-Zeiten des zuletzt abgeschlossenen Frames — oeffentlicher Zugang fuer die
+// App, die den internen kk_gpu nicht kennt. Nur mit KUCKUCK_PASS_TIMING=1 gefuellt.
+int kuckuck_hybrid_pass_timings(const char **namen, double *ms, int max) {
+    if (!g_kk) return 0;
+    return kk_gpu_timings(g_kk, namen, ms, max);
+}
+
 // Async-Abschluss: die Frame-Wraps (luma/chroma/tgt inkl. CVMetalTextureRef!) MÜSSEN
 // bis GPU-Completion leben (Pool-Recycling/Decoder-Write sonst mitten im GPU-Read) —
 // deshalb hängen sie an diesem Heap-Kontext und werden im Completion-Handler

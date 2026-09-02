@@ -27,6 +27,15 @@ int kuckuck_hybrid_render_async(void *ctx, void *cv_pixbuf, void *target_texture
 // Auf der Render-Queue rufen (gleiche Queue wie kuckuck_hybrid_render).
 void kuckuck_hybrid_prewarm(void *ctx);
 
+// GPU-Dauer je Render-Pass des zuletzt abgeschlossenen Frames (Diagnose).
+// Nur befuellt, wenn die Umgebung KUCKUCK_PASS_TIMING=1 gesetzt hatte, ALS der
+// GPU-Kontext angelegt wurde — die Env wird einmal beim Create gelesen.
+// ⚠️ Im Messmodus bekommt jeder Pass einen eigenen Metal-Encoder (Apple-GPUs
+// koennen Zeitstempel nur an Encoder-Grenzen). Das bricht das Buendeln auf, die
+// Summe liegt ueber dem Normalbetrieb. Verwertbar sind die ANTEILE.
+// `namen` zeigt auf interne Puffer und gilt bis zum naechsten Frame.
+int kuckuck_hybrid_pass_timings(const char **namen, double *ms, int max);
+
 void kuckuck_hybrid_destroy(void *ctx);
 
 #ifdef __cplusplus
