@@ -132,6 +132,79 @@ int main(void) { @autoreleasepool {
     printf("  Standard   DEC+LIN+EWA+DELIN+CAS     %6.3f ms\n", standard);
     printf("  => HD-Light ist %.1fx billiger\n", standard/hd_light);
 
+
+    // --- Probe: halbe Praezision ---
+    // Alle Produktions-Kernel rechnen in float, obwohl die Zwischentexturen RGBA16F
+    // sind — die Daten liegen also schon in half, gerechnet wird in voller Breite.
+    // Apple-GPUs haben fuer half den doppelten ALU-Durchsatz und halben Register-
+    // druck. Ob das hier etwas bringt, haengt davon ab, ob die Paesse rechen- oder
+    // speichergebunden sind; genau das misst diese Probe an den zwei teuersten
+    // Paessen (Lanczos-Y und DELINCAS). Die Varianten leben NUR hier im Benchmark.
+    printf("\n  --- Probe: halbe Praezision (Varianten nur im Benchmark) ---\n");
+    static const char *LANCZOS_HALF_MSL =
+    "#include <metal_stdlib>\nusing namespace metal;\nstruct P{float scale;uint axis;float lut[64];};\n"
+    "static inline float l3lut(constant P& p, float x){ x=min(abs(x),3.0)*(63.0/3.0);\n"
+    "  int i0=int(x); return mix(p.lut[i0], p.lut[min(i0+1,63)], x-float(i0)); }\n"
+    "kernel void lanczosh(texture2d<half> src [[texture(0)]], texture2d<half,access::write> dst [[texture(1)]],\n"
+    "  constant P& p [[buffer(0)]], uint2 id [[thread_position_in_grid]]){ uint W=dst.get_width(),H=dst.get_height(); if(id.x>=W||id.y>=H)return;\n"
+    "  int sw=int(src.get_width()),sh=int(src.get_height()); float coord=(p.axis==0u?float(id.x):float(id.y));\n"
+    "  float sf=min(p.scale,1.0); int R=int(ceil(3.0/sf));\n"
+    "  float s=(coord+0.5)/p.scale-0.5; int base=int(floor(s)); half4 acc=half4(0.0h); float wsum=0.0;\n"
+    "  for(int t=1-R;t<=R;t++){ int tap=base+t; float w=l3lut(p,(s-float(tap))*sf);\n"
+    "    int cx=(p.axis==0u)?clamp(tap,0,sw-1):int(id.x); int cy=(p.axis==1u)?clamp(tap,0,sh-1):int(id.y);\n"
+    "    acc+=half(w)*src.read(uint2(cx,cy)); wsum+=w; } dst.write(acc/half(wsum),id);}\n";
+    static const char *DELINCAS_HALF_MSL =
+    "#include <metal_stdlib>\nusing namespace metal;\n#define SHARP 0.5h\n"
+    "static inline half srgb(half c){ return c<=0.0031308h ? 12.92h*c : 1.055h*pow(c,half(1.0/2.4))-0.055h; }\n"
+    "static inline half3 srgb3(half3 c){ c=clamp(c,0.0h,1.0h); return half3(srgb(c.r),srgb(c.g),srgb(c.b)); }\n"
+    "kernel void delincash(texture2d<half> src [[texture(0)]], texture2d<half,access::write> dst [[texture(1)]],\n"
+    "  uint2 id [[thread_position_in_grid]]){ uint W=dst.get_width(),H=dst.get_height(); if(id.x>=W||id.y>=H)return;\n"
+    "  int sw=int(W),sh=int(H); int2 p=int2(id);\n"
+    "#define T(dx,dy) srgb3(src.read(uint2(clamp(p.x+(dx),0,sw-1),clamp(p.y+(dy),0,sh-1))).rgb)\n"
+    "  half3 a=T(-1,-1),b=T(0,-1),c=T(1,-1),d=T(-1,0),e=T(0,0),f=T(1,0),g=T(-1,1),h=T(0,1),i=T(1,1);\n"
+    "  half3 mn=min(min(min(d,e),min(f,b)),h); half3 mn2=min(mn,min(min(a,c),min(g,i))); mn+=mn2;\n"
+    "  half3 mx=max(max(max(d,e),max(f,b)),h); half3 mx2=max(mx,max(max(a,c),max(g,i))); mx+=mx2;\n"
+    "  half3 rcpM=1.0h/max(mx,half3(1e-3h)); half3 amp=clamp(min(mn,2.0h-mx)*rcpM,0.0h,1.0h); amp=rsqrt(max(amp,half3(1e-3h)));\n"
+    "  half peak=-3.0h*SHARP+8.0h; half3 w=-1.0h/(amp*peak); half3 rcpW=1.0h/(1.0h+4.0h*w);\n"
+    "  half3 win=(b+d)+(f+h); half3 o=clamp((win*w+e)*rcpW,0.0h,1.0h); dst.write(half4(o,1.0h),id);}\n";
+    double t_lanx_h = miss(g, LANCZOS_HALF_MSL, "lanczosh", &(kk_compute_args){
+        .out=tmpx, .in={lin}, .n_in=1, .uniforms=&px, .uniforms_size=sizeof px }, N);
+    double t_lany_h = miss(g, LANCZOS_HALF_MSL, "lanczosh", &(kk_compute_args){
+        .out=skal, .in={tmpx}, .n_in=1, .uniforms=&py, .uniforms_size=sizeof py }, N);
+    double t_delincas_h = miss(g, DELINCAS_HALF_MSL, "delincash", &(kk_compute_args){
+        .out=ziel, .in={skal}, .n_in=1 }, N);
+    printf("  Lanczos X   float %6.3f  half %6.3f ms  = %+.0f%%\n", t_lanx, t_lanx_h, 100.0*(t_lanx_h/t_lanx-1.0));
+    printf("  Lanczos Y   float %6.3f  half %6.3f ms  = %+.0f%%\n", t_lany, t_lany_h, 100.0*(t_lany_h/t_lany-1.0));
+    printf("  DELINCAS    float %6.3f  half %6.3f ms  = %+.0f%%\n", t_delincas, t_delincas_h, 100.0*(t_delincas_h/t_delincas-1.0));
+    // Auf dem Mac dauert ein Pass ~0,13 ms — das ist nah an der Dispatch-Grundlast,
+    // eine ALU-Ersparnis ginge darin unter. Darum dieselbe Probe noch einmal mit
+    // 4x Pixeln (UHD-Quelle -> 4720x2180), wo der Kernel selbst dominiert; das
+    // Verhaeltnis dort ist das uebertragbare.
+    {
+        const int SW = 2*SRC_W, SH = 2*SRC_H, OW = 2*OUT_W, OH = 2*OUT_H;
+        kk_tex *lin4  = kk_tex_create(g, SW, SH, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
+        kk_tex *tmpx4 = kk_tex_create(g, OW, SH, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
+        kk_tex *skal4 = kk_tex_create(g, OW, OH, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
+        kk_tex *ziel4 = kk_tex_create(g, OW, OH, KK_FMT_RGBA8, KK_TEX_STORAGE, NULL);
+        kk_lanczos_p px4 = kk_lanczos_params((float)OW/SW, 0);
+        kk_lanczos_p py4 = kk_lanczos_params((float)OH/SH, 1);
+        double fx = miss(g, LANCZOS_MSL, "lanczos", &(kk_compute_args){
+            .out=tmpx4, .in={lin4}, .n_in=1, .uniforms=&px4, .uniforms_size=sizeof px4 }, N);
+        double hx = miss(g, LANCZOS_HALF_MSL, "lanczosh", &(kk_compute_args){
+            .out=tmpx4, .in={lin4}, .n_in=1, .uniforms=&px4, .uniforms_size=sizeof px4 }, N);
+        double fy = miss(g, LANCZOS_MSL, "lanczos", &(kk_compute_args){
+            .out=skal4, .in={tmpx4}, .n_in=1, .uniforms=&py4, .uniforms_size=sizeof py4 }, N);
+        double hy = miss(g, LANCZOS_HALF_MSL, "lanczosh", &(kk_compute_args){
+            .out=skal4, .in={tmpx4}, .n_in=1, .uniforms=&py4, .uniforms_size=sizeof py4 }, N);
+        double fd = miss(g, DELINCAS_MSL, "delincas", &(kk_compute_args){ .out=ziel4, .in={skal4}, .n_in=1 }, N);
+        double hd = miss(g, DELINCAS_HALF_MSL, "delincash", &(kk_compute_args){ .out=ziel4, .in={skal4}, .n_in=1 }, N);
+        printf("  4x Pixel (%dx%d -> %dx%d):\n", SW, SH, OW, OH);
+        printf("  Lanczos X   float %6.3f  half %6.3f ms  = %+.0f%%\n", fx, hx, 100.0*(hx/fx-1.0));
+        printf("  Lanczos Y   float %6.3f  half %6.3f ms  = %+.0f%%\n", fy, hy, 100.0*(hy/fy-1.0));
+        printf("  DELINCAS    float %6.3f  half %6.3f ms  = %+.0f%%\n", fd, hd, 100.0*(hd/fd-1.0));
+        kk_tex_destroy(g, &lin4); kk_tex_destroy(g, &tmpx4); kk_tex_destroy(g, &skal4); kk_tex_destroy(g, &ziel4);
+    }
+
     // --- Gegenprobe der Pass-Zeitmessung (KUCKUCK_PASS_TIMING=1) ---
     // Misst dieselbe Kette nochmal, diesmal von der GPU selbst gestoppt. Die
     // Summe muss ungefaehr zu den Einzelmessungen oben passen — tut sie das
