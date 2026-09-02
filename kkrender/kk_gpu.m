@@ -21,6 +21,19 @@ struct kk_gpu {
     NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *psoCache;
     id<MTLSamplerState> sampNearest, sampLinear;
     CVMetalTextureCacheRef texCache; // Decoder-Buffer-Wraps (Pool recycled → Cache-Hits statt Neu-Alloc/Frame)
+
+    // --- Pass-Zeitmessung (opt-in via KUCKUCK_PASS_TIMING=1) ---
+    // ⚠️ Warum GPU-Zeitstempel und nicht ein CommandBuffer pro Pass: kk_gpu
+    // batcht bewusst ALLE Dispatches eines Frames in EINEN Encoder/CB. Ein CB je
+    // Pass wuerde genau das aufbrechen und damit messen, was man durch das Messen
+    // erzeugt hat. `sampleCountersInBuffer` setzt Marken IN den laufenden Encoder.
+    bool timing;                      // aus der Env, einmal beim Create gelesen
+    id<MTLCounterSampleBuffer> tsBuf; // Zeitstempel-Puffer (2 Marken je Pass)
+    NSMutableArray<NSString *> *tsNames;
+    int tsCount;                      // Passes im laufenden Frame
+    double tsLastMs[KK_TIMING_MAX];   // Ergebnis des ZULETZT abgeschlossenen Frames
+    char tsLastName[KK_TIMING_MAX][32];
+    int tsLastCount;
 };
 
 static MTLPixelFormat mtl_fmt(kk_fmt f) {
@@ -69,6 +82,40 @@ kk_gpu *kk_gpu_create(void *mtl_device) {
         g->sampLinear = [g->dev newSamplerStateWithDescriptor:sd];
         CFRetain((__bridge CFTypeRef) g->sampLinear);
         CVMetalTextureCacheCreate(kCFAllocatorDefault, NULL, g->dev, NULL, &g->texCache);
+        // Pass-Zeitmessung vorbereiten (nur wenn angefordert UND vom Geraet
+        // unterstuetzt — aeltere GPUs kennen den Timestamp-CounterSet nicht).
+        const char *tenv = getenv("KUCKUCK_PASS_TIMING");
+        g->timing = tenv && tenv[0] == '1';
+        if (g->timing) {
+            // ⚠️ NICHT nur den CounterSet pruefen! Der existiert auf Apple-GPUs,
+            // aber `sampleCountersInBuffer` an DISPATCH-Grenzen wird nicht
+            // unterstuetzt — der Aufruf endet dort in einer ASSERTION, also einem
+            // Absturz (gemessen M5 Pro: AtStageBoundary ja, AtDispatchBoundary NEIN).
+            // Nutzbar ist nur die Encoder-Grenze; darum bekommt im Messmodus jeder
+            // Pass seinen EIGENEN Encoder (s. get_enc).
+            id<MTLCounterSet> ts = nil;
+            for (id<MTLCounterSet> cs in g->dev.counterSets)
+                if ([cs.name isEqualToString:MTLCommonCounterSetTimestamp]) ts = cs;
+            if (ts && ![g->dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+                fprintf(stderr, "[kk_gpu] Zeitmessung: Geraet kann keine Encoder-Zeitstempel\n");
+                ts = nil;
+            }
+            if (ts) {
+                MTLCounterSampleBufferDescriptor *d = [MTLCounterSampleBufferDescriptor new];
+                d.counterSet = ts;
+                d.storageMode = MTLStorageModeShared;
+                d.sampleCount = KK_TIMING_MAX * 2;
+                NSError *e = nil;
+                g->tsBuf = [g->dev newCounterSampleBufferWithDescriptor:d error:&e];
+                if (g->tsBuf) CFRetain((__bridge CFTypeRef) g->tsBuf);
+                else fprintf(stderr, "[kk_gpu] Zeitmessung: Puffer fehlgeschlagen (%s)\n",
+                             e.localizedDescription.UTF8String);
+            } else {
+                fprintf(stderr, "[kk_gpu] Zeitmessung: Geraet kennt keine GPU-Zeitstempel\n");
+            }
+            g->tsNames = [NSMutableArray arrayWithCapacity:KK_TIMING_MAX];
+            for (int i = 0; i < KK_TIMING_MAX; i++) [g->tsNames addObject:@""];
+        }
         return g;
     }
 }
@@ -96,17 +143,73 @@ static id<MTLComputeCommandEncoder> get_enc(struct kk_gpu *g) {
         CFRetain((__bridge CFTypeRef) g->cb);
     }
     if (!g->enc) {
-        g->enc = [g->cb computeCommandEncoder];
+        if (g->timing && g->tsBuf && g->tsCount < KK_TIMING_MAX) {
+            // Messmodus: eigener Encoder je Pass, mit Start-/Endmarke. Apple-GPUs
+            // koennen Zeitstempel NUR an Encoder-Grenzen (s. kk_gpu_create).
+            // ⚠️ Das bricht das Batching bewusst auf — die Summe liegt deshalb
+            // ueber dem Normalbetrieb. Verwertbar sind die ANTEILE, nicht die
+            // Absolutwerte; darum ist der Modus opt-in und nie im Alltag an.
+            MTLComputePassDescriptor *pd = [MTLComputePassDescriptor computePassDescriptor];
+            pd.sampleBufferAttachments[0].sampleBuffer = g->tsBuf;
+            pd.sampleBufferAttachments[0].startOfEncoderSampleIndex = (NSUInteger)(g->tsCount * 2);
+            pd.sampleBufferAttachments[0].endOfEncoderSampleIndex   = (NSUInteger)(g->tsCount * 2 + 1);
+            g->enc = [g->cb computeCommandEncoderWithDescriptor:pd];
+            g->tsCount++;
+        } else {
+            g->enc = [g->cb computeCommandEncoder];
+        }
         CFRetain((__bridge CFTypeRef) g->enc);
     }
     return g->enc;
+}
+
+
+// Zeitstempel des abgeschlossenen Frames aufloesen und als ms ablegen.
+// ⚠️ Erst NACH der GPU-Fertigstellung aufrufen — vorher steht im Puffer Muell.
+// Die Rohwerte sind GPU-Ticks; `MTLCounterErrorValue` markiert Marken, die die
+// GPU verworfen hat (kommt vor, wenn ein Pass wegoptimiert oder verschmolzen
+// wurde) — solche Paare werden uebersprungen statt als 0 gezaehlt.
+static void kk_timing_aufloesen(struct kk_gpu *g) {
+    if (!g->timing || !g->tsBuf || g->tsCount <= 0) { g->tsCount = 0; return; }
+    NSUInteger n = (NSUInteger) g->tsCount * 2;
+    NSData *d = [g->tsBuf resolveCounterRange:NSMakeRange(0, n)];
+    if (d && d.length >= n * sizeof(MTLCounterResultTimestamp)) {
+        const MTLCounterResultTimestamp *t = d.bytes;
+        // GPU-Ticks -> ms: das Verhaeltnis liefert das Geraet ueber die
+        // Korrelation von CPU- und GPU-Zeitbasis.
+        MTLTimestamp cpu0 = 0, gpu0 = 0, cpu1 = 0, gpu1 = 0;
+        [g->dev sampleTimestamps:&cpu0 gpuTimestamp:&gpu0];
+        [g->dev sampleTimestamps:&cpu1 gpuTimestamp:&gpu1];
+        double skala = 1.0;   // GPU-Ticks sind auf Apple-GPUs Nanosekunden
+        (void) cpu0; (void) gpu0; (void) cpu1; (void) gpu1;
+        int k = 0;
+        for (int i = 0; i < g->tsCount && k < KK_TIMING_MAX; i++) {
+            MTLTimestamp a = t[i*2].timestamp, b = t[i*2+1].timestamp;
+            if (a == MTLCounterErrorValue || b == MTLCounterErrorValue || b < a) continue;
+            g->tsLastMs[k] = (double)(b - a) * skala / 1e6;
+            NSString *nm = g->tsNames[i];
+            strncpy(g->tsLastName[k], nm.UTF8String ?: "?", sizeof g->tsLastName[k] - 1);
+            g->tsLastName[k][sizeof g->tsLastName[k] - 1] = 0;
+            k++;
+        }
+        g->tsLastCount = k;
+    }
+    g->tsCount = 0;
+}
+
+int kk_gpu_timings(kk_gpu *g, const char **namen, double *ms, int max) {
+    if (!g || !g->timing) return 0;
+    int n = g->tsLastCount < max ? g->tsLastCount : max;
+    for (int i = 0; i < n; i++) { namen[i] = g->tsLastName[i]; ms[i] = g->tsLastMs[i]; }
+    return n;
 }
 
 void kk_gpu_finish(kk_gpu *g) {
     @autoreleasepool {
         if (g->enc) { [g->enc endEncoding]; CFRelease((__bridge CFTypeRef) g->enc); g->enc = nil; }
         if (g->cb)  { [g->cb commit]; [g->cb waitUntilCompleted];
-                      CFRelease((__bridge CFTypeRef) g->cb); g->cb = nil; }
+                      CFRelease((__bridge CFTypeRef) g->cb); g->cb = nil;
+                      kk_timing_aufloesen(g); }
     }
 }
 
@@ -114,7 +217,9 @@ void kk_gpu_submit(kk_gpu *g, void (*done)(void *ud), void *ud) {
     @autoreleasepool {
         if (g->enc) { [g->enc endEncoding]; CFRelease((__bridge CFTypeRef) g->enc); g->enc = nil; }
         if (g->cb) {
-            if (done) [g->cb addCompletedHandler:^(id<MTLCommandBuffer> _cb){ (void)_cb; done(ud); }];
+            struct kk_gpu *gg = g;
+            [g->cb addCompletedHandler:^(id<MTLCommandBuffer> _cb){
+                (void)_cb; kk_timing_aufloesen(gg); if (done) done(ud); }];
             [g->cb commit];
             CFRelease((__bridge CFTypeRef) g->cb); g->cb = nil;   // CB lebt bis Completion selbst weiter
         } else if (done) {
@@ -319,6 +424,14 @@ bool kk_gpu_compute(kk_gpu *g, const char *msl_source, const char *entry,
         MTLSize grid = MTLSizeMake(a->out->w, a->out->h, 1);
         NSUInteger tgw = 16, tgh = 16;
         [enc dispatchThreads:grid threadsPerThreadgroup:MTLSizeMake(tgw, tgh, 1)];
+        if (g->timing && g->tsBuf && g->tsCount > 0 && g->tsCount <= KK_TIMING_MAX) {
+            // Der Encoder gehoert im Messmodus allein diesem Pass — Namen merken
+            // und sofort schliessen, damit die Encoder-Endmarke diesen Pass meint.
+            g->tsNames[g->tsCount - 1] = [NSString stringWithUTF8String:entry];
+            [g->enc endEncoding];
+            CFRelease((__bridge CFTypeRef) g->enc);
+            g->enc = nil;
+        }
         return true;
     }
 }

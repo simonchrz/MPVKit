@@ -132,6 +132,29 @@ int main(void) { @autoreleasepool {
     printf("  Standard   DEC+LIN+EWA+DELIN+CAS     %6.3f ms\n", standard);
     printf("  => HD-Light ist %.1fx billiger\n", standard/hd_light);
 
+    // --- Gegenprobe der Pass-Zeitmessung (KUCKUCK_PASS_TIMING=1) ---
+    // Misst dieselbe Kette nochmal, diesmal von der GPU selbst gestoppt. Die
+    // Summe muss ungefaehr zu den Einzelmessungen oben passen — tut sie das
+    // nicht, misst die Instrumentierung etwas anderes als sie behauptet.
+    if (getenv("KUCKUCK_PASS_TIMING")) {
+        printf("\n  --- Gegenprobe: GPU-Zeitstempel je Pass (eine HD-Light-Kette) ---\n");
+        kk_gpu_compute(g, DECLIN_MSL, "declin", &(kk_compute_args){
+            .out=lin, .in={luma,chroma}, .n_in=2, .uniforms=&DL, .uniforms_size=sizeof DL });
+        kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &(kk_compute_args){
+            .out=tmpx, .in={lin}, .n_in=1, .uniforms=&px, .uniforms_size=sizeof px });
+        kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &(kk_compute_args){
+            .out=skal, .in={tmpx}, .n_in=1, .uniforms=&py, .uniforms_size=sizeof py });
+        kk_gpu_compute(g, DELINCAS_MSL, "delincas", &(kk_compute_args){
+            .out=ziel, .in={skal}, .n_in=1 });
+        kk_gpu_finish(g);
+        const char *nm[KK_TIMING_MAX]; double t[KK_TIMING_MAX];
+        int n = kk_gpu_timings(g, nm, t, KK_TIMING_MAX);
+        double summe = 0;
+        for (int i = 0; i < n; i++) { printf("   %-10s %6.3f ms\n", nm[i], t[i]); summe += t[i]; }
+        if (n == 0) printf("   (keine Werte — Geraet ohne GPU-Zeitstempel?)\n");
+        else printf("   Summe     %6.3f ms   (Einzelmessung oben: %.3f ms)\n", summe, hd_light);
+    }
+
     kk_gpu_destroy(&g);
     printf("\nkk_bench: fertig (Verhaeltnisse uebertragbar, absolute Werte nicht)\n");
     return 0;

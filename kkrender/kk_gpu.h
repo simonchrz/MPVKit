@@ -79,6 +79,16 @@ typedef struct {
 bool kk_gpu_compute(kk_gpu *gpu, const char *msl_source, const char *entry,
                     const kk_compute_args *args);
 
+// --- Pass-Zeitmessung (opt-in via Env KUCKUCK_PASS_TIMING=1) ---
+// Liefert die GPU-Dauer je Compute-Pass des ZULETZT abgeschlossenen Frames.
+// Gedacht fuer die Frage „wohin gehen die 11 ms?" — hybrid.log nennt nur die
+// Gesamtzeit, und die Verhaeltnisse vom Mac-Benchmark uebertragen sich nur grob
+// (gemessen 2026-09-02: Vorhersage 5-7 ms, real 11,1 ms).
+// `namen` zeigt auf interne Puffer und gilt bis zum naechsten Frame.
+// Rueckgabe: Anzahl gefuellter Eintraege (0 wenn aus oder nicht unterstuetzt).
+#define KK_TIMING_MAX 24
+int kk_gpu_timings(kk_gpu *gpu, const char **namen, double *ms, int max);
+
 // PSO vorkompilieren (Prewarm gegen Erst-Frame-Hitch): nur Compile+Cache, kein Dispatch.
 void kk_gpu_compile(kk_gpu *gpu, const char *msl_source, const char *entry);
 
