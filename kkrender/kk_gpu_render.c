@@ -473,8 +473,24 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
         kk_compute_args ya = { .out=c_liny, .in={c_tmpx}, .n_in=1, .uniforms=&py, .uniforms_size=sizeof py };
         kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &ya);
         // Delin+CAS in EINEM Pass direkt -> fin (c_srgb-Roundtrip entfällt).
-        kk_compute_args la = { .out=fin, .in={c_liny}, .n_in=1 };
-        kk_gpu_compute(g, cas ? DELINCAS_MSL : DELIN_MSL, cas ? "delincas" : "delin", &la);
+        //
+        // ⚠️ KUCKUCK_NO_FUSION=1 fährt stattdessen DELIN -> CAS getrennt, mit
+        // c_srgb als Zwischenstufe (der Zustand vor renderpl.70). Nur zum MESSEN:
+        // die Fusion wurde 2026-07 am Mac verglichen (dort 9 % besser) und nie auf
+        // einem Gerät. Die Pass-Zeitmessung vom 2026-09-02 legt nahe, dass der
+        // Tausch „ALU gegen Bandbreite" dort anders ausgeht — delincas war mit
+        // 2,567 ms der teuerste Pass, weil es je Pixel NEUN pow() rechnet (sRGB
+        // pro CAS-Abtastpunkt) statt einem.
+        const char *nofus = getenv("KUCKUCK_NO_FUSION");
+        if (cas && nofus && nofus[0] == '1') {
+            kk_compute_args ld = { .out=c_srgb, .in={c_liny}, .n_in=1 };
+            kk_gpu_compute(g, DELIN_MSL, "delin", &ld);
+            kk_compute_args lc = { .out=fin, .in={c_srgb}, .n_in=1 };
+            kk_gpu_compute(g, CAS_MSL, "cas", &lc);
+        } else {
+            kk_compute_args la = { .out=fin, .in={c_liny}, .n_in=1 };
+            kk_gpu_compute(g, cas ? DELINCAS_MSL : DELIN_MSL, cas ? "delincas" : "delin", &la);
+        }
         if (!dw) kk_gpu_blit(g, c_out, tgt);
         return kk_finish_or_submit(g, &luma, &chroma, &tgt, done, done_ud);
     } else {

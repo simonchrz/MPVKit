@@ -34,6 +34,16 @@ void kuckuck_hybrid_prewarm(void *ctx);
 // koennen Zeitstempel nur an Encoder-Grenzen). Das bricht das Buendeln auf, die
 // Summe liegt ueber dem Normalbetrieb. Verwertbar sind die ANTEILE.
 // `namen` zeigt auf interne Puffer und gilt bis zum naechsten Frame.
+//
+// 🔑 **WOFUER DAS WERKZEUG TAUGT — UND WOFUER NICHT.** Der Encoder-Split
+// benachteiligt systematisch alles, dessen Vorteil im ZUSAMMENFASSEN liegt.
+// Belegt 2026-09-02: im Messmodus sah die getrennte Variante DELIN+CAS 22%
+// besser aus als das fusionierte DELINCAS — im Normalbetrieb sind beide exakt
+// gleich schnell (10,5 ms). Wer nur die Messwerte gelesen haette, haette eine
+// funktionierende Optimierung zurueckgebaut.
+//   TAUGT FUER:      welcher Pass ist teuer, wie verschiebt sich das je Geraet.
+//   TAUGT NICHT FUER: ob sich eine Fusion lohnt. Das entscheidet nur ein A/B der
+//                     GESAMT-Renderzeit OHNE Messmodus (hybrid.log `avg=`).
 int kuckuck_hybrid_pass_timings(const char **namen, double *ms, int max);
 
 void kuckuck_hybrid_destroy(void *ctx);
