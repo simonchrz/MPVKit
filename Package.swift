@@ -36,8 +36,10 @@ let package = Package(
             name: "Libkkrender",
             // Standalone kk_gpu-Renderer (kuckuck_hybrid_* + kk_gpu_*). renderpl.60 =
             // libplacebo-frei, self-contained. Gebaut von kkrender/build-kkrender.sh.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.70/Libkkrender.xcframework.zip",
-            checksum: "3dc09ba3e55764f2258fea011574c3e34c25410bf09a92cd5c8dcf203e29196e"
+            // renderpl.71 = echter SD-Deblock als MSL-Pass (~deblock-Gate) + die
+            // Pass-Zeitmessung, die seit .70 im Branch lag, aber nie released war.
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.71/Libkkrender.xcframework.zip",
+            checksum: "822f1f6b65bd734f1adbc29492cca42e63ccdef6b218432422790cc036b27437"
         ),
     ]
 )
