@@ -205,6 +205,55 @@ int main(void) { @autoreleasepool {
         kk_tex_destroy(g, &lin4); kk_tex_destroy(g, &tmpx4); kk_tex_destroy(g, &skal4); kk_tex_destroy(g, &ziel4);
     }
 
+    // --- ArtCNN auf SD: lohnt der CNN-Upscaler nach dem fp16-Umbau wieder? ---
+    //
+    // Vorgeschichte: der SD-Zweig lief bis 2026-06-30 auf ArtCNN_C4F16 und wurde
+    // auf CAS umgestellt, weil der CNN auf dem A19 real ~22-35 ms/Frame kostete
+    // (Spitzen 72 ms) und damit das 25fps-Budget riss. Seither wurde die CNN-Kette
+    // auf fp16 umgebaut. Diese Messung beziffert, WIE VIEL das gebracht hat —
+    // relativ zu CAS/EWA in derselben Auflösung, auf derselben GPU.
+    //
+    // ⚠️ kk_gpu_artcnn ist kein einzelner Kernel, sondern eine Kette (6 Conv-Stufen
+    // + Depth-to-Space) mit eigenen Zwischentexturen. Deshalb nicht ueber miss(),
+    // sondern die ganze Funktion takten. Die Weights liegen im App-Repo; ohne sie
+    // wird der Abschnitt uebersprungen statt zu luegen.
+    {
+        const char *wpath = getenv("KK_ARTCNN_WEIGHTS");
+        if (!wpath) wpath = "/Users/simon/Documents/Kuckuck/Kuckuck/Kuckuck/"
+                            "Resources/artcnn_c4f16.weights";
+        FILE *wf = fopen(wpath, "rb");
+        if (!wf) {
+            printf("\n  --- ArtCNN (SD) --- uebersprungen: Weights nicht gefunden (%s)\n", wpath);
+            printf("      Pfad ueber KK_ARTCNN_WEIGHTS setzen.\n");
+        } else {
+            fclose(wf);
+            printf("\n  --- ArtCNN auf SD-Luma %dx%d -> 2x (fp16-Kette) ---\n", SD_W, SD_H);
+            kk_tex *sdluma = kk_tex_create(g, SD_W, SD_H, KK_FMT_R8,
+                                           KK_TEX_SAMPLE|KK_TEX_DOWNLOAD, NULL);
+            if (!sdluma) {
+                printf("      Textur fehlgeschlagen\n");
+            } else {
+                kk_tex *out = kk_gpu_artcnn(g, sdluma, wpath);   // Warmlauf: PSOs + Weights
+                kk_gpu_finish(g);
+                if (!out) {
+                    printf("      kk_gpu_artcnn lieferte NULL (Weights unbrauchbar?)\n");
+                } else {
+                    const int NC = 20;
+                    double t0 = jetzt_ms();
+                    for (int i = 0; i < NC; i++) (void)kk_gpu_artcnn(g, sdluma, wpath);
+                    kk_gpu_finish(g);
+                    double cnn = (jetzt_ms() - t0) / NC;
+                    printf("    ArtCNN gesamt      %6.3f ms  (%dx%d -> %dx%d Luma)\n",
+                           cnn, SD_W, SD_H, SD_W*2, SD_H*2);
+                    printf("    zum Vergleich: CAS und EWA oben in Ziel-Aufloesung.\n");
+                    printf("    ⚠️ Mac-GPU. Uebertragbar ist das VERHAELTNIS, nicht die ms.\n");
+                }
+                kk_gpu_artcnn_release(g);
+                kk_tex_destroy(g, &sdluma);
+            }
+        }
+    }
+
     // --- Gegenprobe der Pass-Zeitmessung (KUCKUCK_PASS_TIMING=1) ---
     // Misst dieselbe Kette nochmal, diesmal von der GPU selbst gestoppt. Die
     // Summe muss ungefaehr zu den Einzelmessungen oben passen — tut sie das
