@@ -73,6 +73,23 @@ static const char *DEBLOCK_MSL =
 "  float v1=dl_w(dl_luma(m1),le,0.88),v2=dl_w(dl_luma(m2),le,0.61),v3=dl_w(dl_luma(m3),le,0.32);\n"
 "  float3 sum=e+p1*w1+p2*w2+p3*w3+m1*v1+m2*v2+m3*v3; float ws=1.0+w1+w2+w3+v1+v2+v3;\n"
 "  dst.write(float4(sum/ws,1.0),id);}\n";
+// DEBLOCK_Y: derselbe separable Bilateral (±3, SIGMA_R 0,12), aber auf der LUMA-
+// EBENE eines NV12-Buffers — für den Lauf VOR VT-SR. Mit VT-SR entfällt der RGB-
+// Deblock oben bewusst (er liefe NACH der 1,5×-Skalierung, Kachelraster 16→24 px,
+// ±3 zu kurz). Hier sieht der Filter das Original-Raster. Chroma wird kopiert.
+static const char *DEBLOCK_Y_MSL =
+"#include <metal_stdlib>\nusing namespace metal;\nstruct P{uint axis;};\n#define SIGMA_R 0.12\n"
+"static inline float dy_w(float ln,float le,float sw){ float d=ln-le; return sw*exp(-(d*d)/(2.0*SIGMA_R*SIGMA_R)); }\n"
+"kernel void deblock_y(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
+"  constant P& p [[buffer(0)]], uint2 id [[thread_position_in_grid]]){ uint W=dst.get_width(),H=dst.get_height(); if(id.x>=W||id.y>=H)return;\n"
+"  int2 c=int2(id); int2 st=(p.axis==0u)?int2(1,0):int2(0,1); int2 mx=int2(int(W)-1,int(H)-1);\n"
+"#define TY(k) src.read(uint2(clamp(c+(k)*st,int2(0),mx))).r\n"
+"  float e=TY(0);\n"
+"  float p1=TY(1),p2=TY(2),p3=TY(3),m1=TY(-1),m2=TY(-2),m3=TY(-3);\n"
+"  float w1=dy_w(p1,e,0.88),w2=dy_w(p2,e,0.61),w3=dy_w(p3,e,0.32);\n"
+"  float v1=dy_w(m1,e,0.88),v2=dy_w(m2,e,0.61),v3=dy_w(m3,e,0.32);\n"
+"  float sum=e+p1*w1+p2*w2+p3*w3+m1*v1+m2*v2+m3*v3; float ws=1.0+w1+w2+w3+v1+v2+v3;\n"
+"  dst.write(float4(sum/ws,0.0,0.0,1.0),id);}\n";
 // DEBAND: pl_shader_deband (pcg3d-PRNG, 4-Sample-Quarter-Turn-Smoothing + Grain),
 // headless gegen libplacebo verifiziert (mild/strong 0.1 LSB). radius/threshold/grain/
 // iters/index als Uniform (threshold/grain = param/1000).
@@ -671,4 +688,54 @@ void kk_gpu_prewarm(void *metal_device) {
     kk_gpu_compile(g, EWA_MSL,    "ewa");
     kk_gpu_compile(g, MKPQ_MSL,   "mk");
     kk_gpu_compile(g, CMHDR_MSL,  "cmh");
+}
+
+
+// ---------------------------------------------------------------------------
+// Deblock VOR VT-SR: NV12 (Decoder-Buffer) -> NV12 (IOSurface-Pool-Buffer der App),
+// Luma über den separablen Bilateral, Chroma per Blit. Synchron (finish) — läuft
+// auf der srQueue der App unmittelbar vor dem ANE-Aufruf.
+// ⚠️ EIGENER kk_gpu-Kontext: kk_gpu bündelt alle Dispatches eines Kontexts in
+// EINEN Command-Buffer (g->cb/g->enc). Der Render-Kontext g_kk wird gleichzeitig
+// von der renderQueue befüllt — ein geteilter Kontext wäre ein Encoder-Race.
+// Zwei Kontexte auf demselben MTLDevice/-Queue sind dagegen erlaubt.
+static kk_gpu *g_dbl = NULL;
+static kk_tex *c_dblY = NULL;
+static int c_dblW = 0, c_dblH = 0;
+bool kk_gpu_deblock_nv12(void *metal_device, void *src_pb, void *dst_pb) {
+    CVPixelBufferRef s = (CVPixelBufferRef) src_pb, d = (CVPixelBufferRef) dst_pb;
+    if (!s || !d) return false;
+    if (!g_dbl) g_dbl = kk_gpu_create(metal_device);
+    if (!g_dbl) return false;
+    kk_gpu *g = g_dbl;
+    int W = (int) CVPixelBufferGetWidthOfPlane(s, 0), H = (int) CVPixelBufferGetHeightOfPlane(s, 0);
+    if (W <= 0 || H <= 0 || W != (int) CVPixelBufferGetWidthOfPlane(d, 0) || H != (int) CVPixelBufferGetHeightOfPlane(d, 0)) return false;
+    IOSurfaceRef ssurf = CVPixelBufferGetIOSurface(s), dsurf = CVPixelBufferGetIOSurface(d);
+    if (!dsurf) return false;
+    kk_tex *sy = kk_tex_wrap_pixbuf(g, s, 0, KK_FMT_R8);
+    kk_tex *sc = kk_tex_wrap_pixbuf(g, s, 1, KK_FMT_RG8);
+    if (!sy && ssurf) sy = kk_tex_wrap_iosurface(g, (void*) ssurf, 0, KK_FMT_R8,  KK_TEX_SAMPLE);
+    if (!sc && ssurf) sc = kk_tex_wrap_iosurface(g, (void*) ssurf, 1, KK_FMT_RG8, KK_TEX_SAMPLE);
+    kk_tex *dy = kk_tex_wrap_iosurface(g, (void*) dsurf, 0, KK_FMT_R8,  KK_TEX_STORAGE | KK_TEX_SAMPLE);
+    kk_tex *dc = kk_tex_wrap_iosurface(g, (void*) dsurf, 1, KK_FMT_RG8, KK_TEX_STORAGE | KK_TEX_SAMPLE);
+    bool ok = false;
+    if (sy && sc && dy && dc) {
+        if (!c_dblY || c_dblW != W || c_dblH != H) {
+            if (c_dblY) kk_tex_destroy(g, &c_dblY);
+            c_dblY = kk_tex_create(g, W, H, KK_FMT_R8, KK_TEX_SAMPLE | KK_TEX_STORAGE, NULL);
+            c_dblW = W; c_dblH = H;
+        }
+        if (c_dblY) {
+            struct { uint32_t axis; } ax = { 0 };
+            kk_compute_args dh = { .out=c_dblY, .in={sy}, .n_in=1, .uniforms=&ax, .uniforms_size=sizeof ax };
+            ok = kk_gpu_compute(g, DEBLOCK_Y_MSL, "deblock_y", &dh);
+            ax.axis = 1;
+            kk_compute_args dv = { .out=dy, .in={c_dblY}, .n_in=1, .uniforms=&ax, .uniforms_size=sizeof ax };
+            ok = ok && kk_gpu_compute(g, DEBLOCK_Y_MSL, "deblock_y", &dv);
+            if (ok) kk_gpu_blit(g, sc, dc);
+            kk_gpu_finish(g);
+        }
+    }
+    kk_tex_destroy(g, &sy); kk_tex_destroy(g, &sc); kk_tex_destroy(g, &dy); kk_tex_destroy(g, &dc);
+    return ok;
 }

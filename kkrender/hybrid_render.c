@@ -187,6 +187,14 @@ void kuckuck_hybrid_prewarm(void *ctx)
     if (p) kk_gpu_prewarm(p->device);
 }
 
+int kuckuck_hybrid_deblock_nv12(void *ctx, void *src_pixbuf, void *dst_pixbuf)
+{
+    extern bool kk_gpu_deblock_nv12(void *metal_device, void *src_pb, void *dst_pb);
+    struct hybrid_priv *p = ctx;
+    if (!p) return -1;
+    return kk_gpu_deblock_nv12(p->device, src_pixbuf, dst_pixbuf) ? 0 : -2;
+}
+
 void kuckuck_hybrid_destroy(void *ctx)
 {
     extern void kk_gpu_release_all(void);

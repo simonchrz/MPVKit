@@ -46,6 +46,12 @@ void kuckuck_hybrid_prewarm(void *ctx);
 //                     GESAMT-Renderzeit OHNE Messmodus (hybrid.log `avg=`).
 int kuckuck_hybrid_pass_timings(const char **namen, double *ms, int max);
 
+// Deblock VOR VT-SR (2026-09-12): NV12-Decoder-Buffer -> NV12-Zielbuffer (IOSurface-
+// backed, gleiche Dims), Luma über den separablen ±3-Bilateral, Chroma kopiert.
+// Synchron; darf NEBEN kuckuck_hybrid_render von einer anderen Queue laufen
+// (eigener GPU-Kontext). 0 = ok, negativ = nichts geschrieben.
+int kuckuck_hybrid_deblock_nv12(void *ctx, void *src_pixbuf, void *dst_pixbuf);
+
 void kuckuck_hybrid_destroy(void *ctx);
 
 #ifdef __cplusplus
