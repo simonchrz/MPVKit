@@ -11,6 +11,10 @@
 //  3. CHROMA-ORT: bei left-sited kodierter Quelle ist der Farbfehler mit dem
 //     Versatz aus kk_chroma_offset (+0,25 Texel) KLEINER als ohne; das Vorzeichen
 //     umzudrehen macht es schlechter. Ein Pixelbuffer ohne Attachment ergibt left.
+//  4. CHROMA-LANCZOS3: CHH + DEC_L3 hat an denselben Farbkanten einen kleineren
+//     Fehler als bilinear (beide left-sited) und lässt eine flache Farbfläche
+//     unverändert (die Gewichte summieren sich zu 1, kein Pegelversatz). Default nur
+//     ausserhalb HD-Light, KUCKUCK_CHROMA_UP=bilinear|lanczos erzwingt.
 
 #import <Foundation/Foundation.h>
 #include "kk_gpu.h"
@@ -137,6 +141,115 @@ static int pruefe_chroma(kk_gpu *g) {
     return schlecht;
 }
 
+/// Farbfehler (rms, R+B) des Balkenbilds aus pruefe_chroma: bilinear oder Lanczos3.
+static double balken_fehler(kk_gpu *g, int lanczos, double *flach_max) {
+    const int W = 256, H = 8, CW = W/2, CH = H/2;
+    double cb[256], cr[256];
+    for (int x = 0; x < W; x++) {
+        int b = ((x + (x / 37)) / 11) % 3;
+        cb[x] = b == 0 ? 90 : b == 1 ? 200 : 128;  cr[x] = b == 0 ? 220 : b == 1 ? 60 : 128;
+    }
+    unsigned char *l = malloc(W*H), *c = malloc(2*CW*CH), *f = malloc(2*CW*CH); memset(l, 126, W*H);
+    for (int j = 0; j < CH; j++) for (int i = 0; i < CW; i++) {
+        int x = 2*i, xm = x > 0 ? x-1 : 0, xp = x+1 < W ? x+1 : W-1;
+        c[2*(j*CW+i)+0] = (unsigned char)lround((cb[xm] + 2*cb[x] + cb[xp]) / 4);
+        c[2*(j*CW+i)+1] = (unsigned char)lround((cr[xm] + 2*cr[x] + cr[xp]) / 4);
+        f[2*(j*CW+i)+0] = 90; f[2*(j*CW+i)+1] = 220;              // flache Farbfläche
+    }
+    kk_tex *tl = kk_tex_create(g, W, H, KK_FMT_R8, KK_TEX_SAMPLE | KK_TEX_DOWNLOAD, l);
+    double ergebnis[2] = { 0, 0 };
+    for (int flach = 0; flach < 2; flach++) {
+        kk_tex *tc = kk_tex_create(g, CW, CH, KK_FMT_RG8, KK_TEX_SAMPLE | KK_TEX_DOWNLOAD, flach ? f : c);
+        D_uniform U; memcpy(U.m, DM, sizeof U.m); U.co[0] = 0.25f; U.co[1] = 0;
+        kk_tex *chh = lanczos ? kk_chroma_h(g, tc, &c_chh, W, U.co[0]) : NULL;
+        kk_tex *o = kk_tex_create(g, W, H, KK_FMT_RGBA8, KK_TEX_STORAGE | KK_TEX_DOWNLOAD, NULL);
+        kk_gpu_compute(g, chh ? DEC_L3_MSL : DEC_MSL, "dec", &(kk_compute_args){ .out = o,
+            .in = { tl, chh ? chh : tc }, .n_in = 2, .linear = { false, true }, .uniforms = &U, .uniforms_size = sizeof U });
+        kk_gpu_finish(g);
+        unsigned char *px = malloc(4*W*H); kk_tex_download(g, o, px);
+        double q = 0, mx = 0; int n = 0;
+        for (int x = 2; x < W-2; x++) for (int k = 0; k < 3; k += 2) {
+            double vv[3] = { 126/255.0, (flach ? 90 : cb[x])/255.0, (flach ? 220 : cr[x])/255.0 };
+            double t = 255.0 * (DM[3*k]*vv[0] + DM[3*k+1]*vv[1] + DM[3*k+2]*vv[2] + DM[9+k]);
+            t = t < 0 ? 0 : t > 255 ? 255 : t;
+            double d = px[4*(4*W+x)+k] - t; q += d*d; n++; mx = fmax(mx, fabs(d));
+        }
+        ergebnis[flach] = flach ? mx : sqrt(q/n);
+        free(px); kk_tex_destroy(g, &o); kk_tex_destroy(g, &tc);
+    }
+    *flach_max = ergebnis[1];
+    free(l); free(c); free(f); kk_tex_destroy(g, &tl);
+    return ergebnis[0];
+}
+
+/// Exakte CPU-Referenz für CHH+DEC_L3 auf einem 2D-Muster (ändert sich in BEIDE
+/// Richtungen, sonst fiele eine falsche vertikale Phase nicht auf). Toleranz 1 LSB.
+static double l3_cpu(double x) {
+    x = fabs(x); if (x < 1e-9) return 1.0; if (x >= 3.0) return 0.0;
+    return 3.0 * sin(M_PI * x) * sin(M_PI * x / 3.0) / (M_PI * M_PI * x * x);
+}
+static double l3_1d(const double *src, int n, int stride, double s) {
+    int b = (int)floor(s); double acc = 0, ws = 0;
+    for (int t = -2; t <= 3; t++) { int i = b + t; i = i < 0 ? 0 : i >= n ? n-1 : i;
+        double w = l3_cpu(s - (b + t)); acc += w * src[i * stride]; ws += w; }
+    return acc / ws;
+}
+static int l3_gegen_cpu(kk_gpu *g, double *maxd) {
+    const int W = 96, H = 64, CW = W/2, CH = H/2;
+    unsigned char *l = malloc(W*H), *c = malloc(2*CW*CH);
+    for (int i = 0; i < W*H; i++) l[i] = (unsigned char)(60 + (i * 37) % 120);
+    double cu[48*32], cv[48*32];   // = CW*CH (feste Größe: keine VLA-Warnung)
+    for (int j = 0; j < CH; j++) for (int i = 0; i < CW; i++) {
+        cu[j*CW+i] = ((i/5 + j/3) % 2) ? 200 : 70;                  // Kanten in x UND y
+        cv[j*CW+i] = 128 + 90 * sin(i * 0.9) * cos(j * 0.7);
+        c[2*(j*CW+i)] = (unsigned char)cu[j*CW+i]; c[2*(j*CW+i)+1] = (unsigned char)lround(cv[j*CW+i]);
+        cv[j*CW+i] = c[2*(j*CW+i)+1];
+    }
+    kk_tex *tl = kk_tex_create(g, W, H, KK_FMT_R8, KK_TEX_SAMPLE | KK_TEX_DOWNLOAD, l);
+    kk_tex *tc = kk_tex_create(g, CW, CH, KK_FMT_RG8, KK_TEX_SAMPLE | KK_TEX_DOWNLOAD, c);
+    D_uniform U; memcpy(U.m, DM, sizeof U.m); U.co[0] = 0.25f; U.co[1] = 0.25f;   // top-left: beide Achsen
+    kk_tex *chh = kk_chroma_h(g, tc, &c_chh, W, U.co[0]);
+    kk_tex *o = kk_tex_create(g, W, H, KK_FMT_RGBA8, KK_TEX_STORAGE | KK_TEX_DOWNLOAD, NULL);
+    kk_gpu_compute(g, DEC_L3_MSL, "dec", &(kk_compute_args){ .out = o, .in = { tl, chh }, .n_in = 2,
+        .linear = { false, true }, .uniforms = &U, .uniforms_size = sizeof U });
+    kk_gpu_finish(g);
+    unsigned char *px = malloc(4*W*H); kk_tex_download(g, o, px);
+    double hu[96*32], hv[96*32], md = 0;   // = W*CH
+    for (int j = 0; j < CH; j++) for (int x = 0; x < W; x++) {
+        double sx = (x + 0.5) * CW / (double)W - 0.5 + 0.25;
+        hu[j*W+x] = l3_1d(cu + j*CW, CW, 1, sx); hv[j*W+x] = l3_1d(cv + j*CW, CW, 1, sx);
+    }
+    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+        double sy = (y + 0.5) * CH / (double)H - 0.5 + 0.25;
+        double u = l3_1d(hu + x, CH, W, sy), v = l3_1d(hv + x, CH, W, sy);
+        double vv[3] = { l[y*W+x]/255.0, u/255.0, v/255.0 };
+        for (int k = 0; k < 3; k++) {
+            double t = 255.0 * (DM[3*k]*vv[0] + DM[3*k+1]*vv[1] + DM[3*k+2]*vv[2] + DM[9+k]);
+            t = t < 0 ? 0 : t > 255 ? 255 : t;
+            md = fmax(md, fabs(px[4*(y*W+x)+k] - t));
+        }
+    }
+    *maxd = md;
+    free(l); free(c); free(px); kk_tex_destroy(g,&tl); kk_tex_destroy(g,&tc); kk_tex_destroy(g,&o);
+    return md > 1.0;
+}
+
+static int pruefe_chroma_l3(kk_gpu *g) {
+    double fB, fL, eB = balken_fehler(g, 0, &fB), eL = balken_fehler(g, 1, &fL);
+    // Schaltlogik: Default Lanczos3 nur ausserhalb HD-Light, Env erzwingt beides.
+    unsetenv("KUCKUCK_CHROMA_UP");
+    int gate = kk_chroma_l3_an(false) && !kk_chroma_l3_an(true);
+    setenv("KUCKUCK_CHROMA_UP", "bilinear", 1); gate &= !kk_chroma_l3_an(false);
+    setenv("KUCKUCK_CHROMA_UP", "lanczos", 1);  gate &= kk_chroma_l3_an(true);
+    unsetenv("KUCKUCK_CHROMA_UP");
+    if (!gate) printf("  Chroma-Lanczos3: Schaltlogik (HD-Light/Env) falsch   FEHLER\n");
+    double md; int cpuFehler = l3_gegen_cpu(g, &md);
+    int schlecht = !gate || cpuFehler || !(eL < eB * 0.95) || fL > 1.0;
+    printf("  Chroma-Lanczos3: gegen CPU-Referenz (2D, top-left) max %.2f LSB; Kanten bilinear %.1f -> %.1f; flach max %.1f%s\n",
+           md, eB, eL, fL, schlecht ? "   FEHLER" : "   ok");
+    return schlecht;
+}
+
 int main(void) { @autoreleasepool {
     setvbuf(stdout, NULL, _IONBF, 0);
     unsetenv("KUCKUCK_CHROMA_LOC"); unsetenv("KUCKUCK_DITHER");
@@ -145,8 +258,9 @@ int main(void) { @autoreleasepool {
     int f = pruefe_schwarzpunkt(g);
     f |= pruefe_dither(g);
     f |= pruefe_chroma(g);
+    f |= pruefe_chroma_l3(g);
     kk_gpu_destroy(&g);
     printf(f ? "kk_iq_test: FEHLGESCHLAGEN\n"
-             : "kk_iq_test: Schwarzpunkt, Dither und Chroma-Ort halten  PASS\n");
+             : "kk_iq_test: Schwarzpunkt, Dither, Chroma-Ort und Chroma-Lanczos3 halten  PASS\n");
     return f ? 1 : 0;
 } }

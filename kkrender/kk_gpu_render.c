@@ -26,34 +26,75 @@ extern void kk_gpu_artcnn_release(kk_gpu *gpu);
 static void kk_gpu_sdr_release(kk_gpu *g);
 static void kk_gpu_hdr_release(kk_gpu *g);
 
-// DEC: YUV -> encodete RGB (exakte Matrix via pl_color_repr_decode, 9+3). KEIN linearize
-// (Deband sitzt auf der encodeten Quelle, wie libplacebos source-deband).
-//
+// Chroma-Abtastung für DEC/DECLIN (zwei Varianten per #define, wie der Dither):
+//  KK_CHROMA_L3 0: bilinear direkt aus der Chroma-Ebene (Stand bis renderpl.73).
+//  KK_CHROMA_L3 1: Lanczos3, separabel. `chroma` ist dann die schon HORIZONTAL
+//                  hochskalierte Stufe aus CHH (Ausgabebreite × Chroma-Höhe); hier
+//                  laufen nur noch die 6 vertikalen Taps. Gemessen 2026-09-22 an
+//                  echten Bildern (Referenz mit nativer Chroma-Auflösung): Farbfehler
+//                  an Kanten VOX −22 %, Disney-Cartoon −34 %, ZDF-720p −26 %, auch in
+//                  den Ausreißern besser (kein sichtbares Überschwingen).
 // co = Chroma-Ort-Versatz in CHROMA-Texeln (kk_chroma_offset): mittig 0, left-sited
 // +0,25 horizontal. In Texel-Einheiten, damit er auch für den 2×-Luma-Eingang des
 // ArtCNN-Pfads stimmt (dort sind es 1,0 statt 0,5 Luma-Pixel).
-static const char *DEC_MSL =
-"#include <metal_stdlib>\nusing namespace metal;\nstruct D{float m[12];float co[2];};\n"
-"kernel void dec(texture2d<float> luma [[texture(0)]], texture2d<float> chroma [[texture(1)]],\n"
-"  texture2d<float,access::write> dst [[texture(2)]], sampler near [[sampler(0)]], sampler lin [[sampler(1)]],\n"
-"  constant D& d [[buffer(0)]], uint2 id [[thread_position_in_grid]]){ uint w=dst.get_width(),h=dst.get_height(); if(id.x>=w||id.y>=h)return;\n"
-"  float2 uv=(float2(id)+0.5)/float2(w,h); float Y=luma.read(id).r; float2 C=chroma.sample(lin,uv+float2(d.co[0],d.co[1])/float2(chroma.get_width(),chroma.get_height())).rg;\n"
-"  float3 v=float3(Y,C.r,C.g);\n"
-"  float3 rgb=float3(d.m[0]*v.x+d.m[1]*v.y+d.m[2]*v.z, d.m[3]*v.x+d.m[4]*v.y+d.m[5]*v.z, d.m[6]*v.x+d.m[7]*v.y+d.m[8]*v.z)+float3(d.m[9],d.m[10],d.m[11]);\n"
-"  dst.write(float4(rgb,1.0),id);}\n";
+#define KK_CHROMA_FN \
+"static inline float kk_l3(float x){ x=abs(x); if(x<1e-5) return 1.0; if(x>=3.0) return 0.0;\n" \
+"  return 3.0*sinpi(x)*sinpi(x/3.0)/(M_PI_F*M_PI_F*x*x); }\n" \
+"static inline float2 kk_chroma(texture2d<float> chroma, sampler lin, uint2 id, uint w, uint h, float cox, float coy){\n" \
+"#if KK_CHROMA_L3\n" \
+"  int ch=int(chroma.get_height()); float s=(float(id.y)+0.5)*float(ch)/float(h)-0.5+coy; int b=int(floor(s));\n" \
+"  float2 acc=float2(0.0); float ws=0.0;\n" \
+"  for(int t=-2;t<=3;t++){ int tap=b+t; float wt=kk_l3(s-float(tap));\n" \
+"    acc+=wt*chroma.read(uint2(id.x,uint(clamp(tap,0,ch-1)))).rg; ws+=wt; }\n" \
+"  return acc/ws;\n" \
+"#else\n" \
+"  float2 uv=(float2(id)+0.5)/float2(w,h);\n" \
+"  return chroma.sample(lin,uv+float2(cox,coy)/float2(chroma.get_width(),chroma.get_height())).rg;\n" \
+"#endif\n" \
+"}\n"
+// CHH: Chroma horizontal auf die Ausgabebreite (Lanczos3, 6 Taps), Zeilen bleiben in
+// Chroma-Höhe. Beliebiges Verhältnis (2× für DEC/DECLIN, 4× für den ArtCNN-2×-Eingang).
+// Ziel RG16Unorm: Chroma liegt bei 16..240/255, das lässt Luft fürs Überschwingen.
+static const char *CHH_MSL =
+"#include <metal_stdlib>\nusing namespace metal;\nstruct P{float cox;};\n"
+KK_CHROMA_FN
+"kernel void chh(texture2d<float> c [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
+"  constant P& p [[buffer(0)]], uint2 id [[thread_position_in_grid]]){ uint W=dst.get_width(),H=dst.get_height(); if(id.x>=W||id.y>=H)return;\n"
+"  int cw=int(c.get_width()); float s=(float(id.x)+0.5)*float(cw)/float(W)-0.5+p.cox; int b=int(floor(s));\n"
+"  float2 acc=float2(0.0); float ws=0.0;\n"
+"  for(int t=-2;t<=3;t++){ int tap=b+t; float wt=kk_l3(s-float(tap)); acc+=wt*c.read(uint2(uint(clamp(tap,0,cw-1)),id.y)).rg; ws+=wt; }\n"
+"  dst.write(float4(acc/ws,0.0,1.0),id);}\n";
+
+// DEC: YUV -> encodete RGB (exakte Matrix via pl_color_repr_decode, 9+3). KEIN linearize
+// (Deband sitzt auf der encodeten Quelle, wie libplacebos source-deband).
+#define DEC_SRC \
+"#include <metal_stdlib>\nusing namespace metal;\nstruct D{float m[12];float co[2];};\n" \
+KK_CHROMA_FN \
+"kernel void dec(texture2d<float> luma [[texture(0)]], texture2d<float> chroma [[texture(1)]],\n" \
+"  texture2d<float,access::write> dst [[texture(2)]], sampler near [[sampler(0)]], sampler lin [[sampler(1)]],\n" \
+"  constant D& d [[buffer(0)]], uint2 id [[thread_position_in_grid]]){ uint w=dst.get_width(),h=dst.get_height(); if(id.x>=w||id.y>=h)return;\n" \
+"  float Y=luma.read(id).r; float2 C=kk_chroma(chroma,lin,id,w,h,d.co[0],d.co[1]);\n" \
+"  float3 v=float3(Y,C.r,C.g);\n" \
+"  float3 rgb=float3(d.m[0]*v.x+d.m[1]*v.y+d.m[2]*v.z, d.m[3]*v.x+d.m[4]*v.y+d.m[5]*v.z, d.m[6]*v.x+d.m[7]*v.y+d.m[8]*v.z)+float3(d.m[9],d.m[10],d.m[11]);\n" \
+"  dst.write(float4(rgb,1.0),id);}\n"
+static const char *DEC_MSL    = "#define KK_CHROMA_L3 0\n" DEC_SRC;
+static const char *DEC_L3_MSL = "#define KK_CHROMA_L3 1\n" DEC_SRC;   // chroma = CHH-Stufe
 // DECLIN: DEC+LIN fusioniert (HD-Light, kein Deband/CNN dazwischen -> c_dec-Roundtrip
 // in voller Quellauflösung gespart). Mathematisch identisch zu dec->lin in Serie.
-static const char *DECLIN_MSL =
-"#include <metal_stdlib>\nusing namespace metal;\nstruct DL{float d[12];float a,b;float m[9];float o;float co[2];};\n"
-"kernel void declin(texture2d<float> luma [[texture(0)]], texture2d<float> chroma [[texture(1)]],\n"
-"  texture2d<float,access::write> dst [[texture(2)]], sampler near [[sampler(0)]], sampler lin [[sampler(1)]],\n"
-"  constant DL& p [[buffer(0)]], uint2 id [[thread_position_in_grid]]){ uint w=dst.get_width(),h=dst.get_height(); if(id.x>=w||id.y>=h)return;\n"
-"  float2 uv=(float2(id)+0.5)/float2(w,h); float Y=luma.read(id).r; float2 C=chroma.sample(lin,uv+float2(p.co[0],p.co[1])/float2(chroma.get_width(),chroma.get_height())).rg;\n"
-"  float3 v=float3(Y,C.r,C.g);\n"
-"  float3 rgb=float3(p.d[0]*v.x+p.d[1]*v.y+p.d[2]*v.z, p.d[3]*v.x+p.d[4]*v.y+p.d[5]*v.z, p.d[6]*v.x+p.d[7]*v.y+p.d[8]*v.z)+float3(p.d[9],p.d[10],p.d[11]);\n"
-"  float3 c=max(rgb,0.0); float3 vl=p.a*pow(c+p.b,float3(2.4))-p.o;\n"
-"  float3 o=float3(p.m[0]*vl.x+p.m[1]*vl.y+p.m[2]*vl.z, p.m[3]*vl.x+p.m[4]*vl.y+p.m[5]*vl.z, p.m[6]*vl.x+p.m[7]*vl.y+p.m[8]*vl.z);\n"
-"  dst.write(float4(o,1.0),id);}\n";
+#define DECLIN_SRC \
+"#include <metal_stdlib>\nusing namespace metal;\nstruct DL{float d[12];float a,b;float m[9];float o;float co[2];};\n" \
+KK_CHROMA_FN \
+"kernel void declin(texture2d<float> luma [[texture(0)]], texture2d<float> chroma [[texture(1)]],\n" \
+"  texture2d<float,access::write> dst [[texture(2)]], sampler near [[sampler(0)]], sampler lin [[sampler(1)]],\n" \
+"  constant DL& p [[buffer(0)]], uint2 id [[thread_position_in_grid]]){ uint w=dst.get_width(),h=dst.get_height(); if(id.x>=w||id.y>=h)return;\n" \
+"  float Y=luma.read(id).r; float2 C=kk_chroma(chroma,lin,id,w,h,p.co[0],p.co[1]);\n" \
+"  float3 v=float3(Y,C.r,C.g);\n" \
+"  float3 rgb=float3(p.d[0]*v.x+p.d[1]*v.y+p.d[2]*v.z, p.d[3]*v.x+p.d[4]*v.y+p.d[5]*v.z, p.d[6]*v.x+p.d[7]*v.y+p.d[8]*v.z)+float3(p.d[9],p.d[10],p.d[11]);\n" \
+"  float3 c=max(rgb,0.0); float3 vl=p.a*pow(c+p.b,float3(2.4))-p.o;\n" \
+"  float3 o=float3(p.m[0]*vl.x+p.m[1]*vl.y+p.m[2]*vl.z, p.m[3]*vl.x+p.m[4]*vl.y+p.m[5]*vl.z, p.m[6]*vl.x+p.m[7]*vl.y+p.m[8]*vl.z);\n" \
+"  dst.write(float4(o,1.0),id);}\n"
+static const char *DECLIN_MSL    = "#define KK_CHROMA_L3 0\n" DECLIN_SRC;
+static const char *DECLIN_L3_MSL = "#define KK_CHROMA_L3 1\n" DECLIN_SRC;   // chroma = CHH-Stufe
 // DEBLOCK: separabler 1D-Bilateral (±3, Luma-Range-gewichtet) auf der encodeten
 // Quelle, Port von Resources/deblock_cas.glsl (App). Fuer SD-Privatsender am
 // Kabel-Tuner (VOX/RTL ~2,4-2,9 Mbit/s): die 16-px-DCT-Kacheln sind in die Pixel
@@ -429,6 +470,30 @@ static bool kk_dither_an(void) {
     const char *e = getenv("KUCKUCK_DITHER");
     return !(e && e[0] == '0');
 }
+
+// CHROMA-HOCHSKALIERUNG: Lanczos3 separabel statt bilinear (s. KK_CHROMA_FN).
+// Default nur AUSSERHALB von HD-Light (Quelle < 1080p): dort ist der Gewinn am größten
+// (Cartoon-SD −34 %) und der Render billig. HD-Light bleibt bewusst leicht — auf dem
+// Mac kostet CHH+DEC_L3 bei 1080p +0,21 ms (0,26 -> 0,47), auf dem A16 läge 1080p50-
+// Live damit noch weiter über dem Budget. KUCKUCK_CHROMA_UP=bilinear|lanczos erzwingt.
+// Die horizontale Stufe (Ausgabebreite × Chroma-Höhe) wird je Ziel gecacht; NULL =
+// Allokation gescheitert -> bilinear.
+static kk_tex *c_chh = NULL, *c_chh2 = NULL;   // DEC/DECLIN-Breite bzw. ArtCNN-2×-Breite
+static bool kk_chroma_l3_an(bool hdLight) {
+    const char *e = getenv("KUCKUCK_CHROMA_UP");
+    if (e && e[0] == 'b') return false;
+    if (e && e[0] == 'l') return true;
+    return !hdLight;
+}
+static kk_tex *kk_chroma_h(kk_gpu *g, kk_tex *chroma, kk_tex **cache, int W, float cox) {
+    int ch = kk_tex_h(chroma);
+    if (*cache && (kk_tex_w(*cache) != W || kk_tex_h(*cache) != ch)) kk_tex_destroy(g, cache);
+    if (!*cache) *cache = kk_tex_create(g, W, ch, KK_FMT_RG16, KK_TEX_SAMPLE | KK_TEX_STORAGE, NULL);
+    if (!*cache) return NULL;
+    struct { float cox; } P = { cox };
+    kk_compute_args a = { .out = *cache, .in = { chroma }, .n_in = 1, .uniforms = &P, .uniforms_size = sizeof P };
+    return kk_gpu_compute(g, CHH_MSL, "chh", &a) ? *cache : NULL;
+}
 static unsigned g_frame = 0;   // temporaler Grain-Index (Deband)
 
 // yuv2rgb = 12 floats (9 Matrix row-major + 3 Offset) aus libplacebos pl_color_repr_decode
@@ -517,9 +582,11 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
     // Konsument (Deband ist aus, CNN-Pfade laufen nicht) -> der Standalone-DEC
     // entfällt, declin liest luma/chroma direkt (spart den c_dec-Roundtrip).
     bool fusedDec = hdLight && !cnnPath && !deblock;
+    bool l3 = kk_chroma_l3_an(hdLight);
     if (!fusedDec) {
-        kk_compute_args da = { .out=c_dec, .in={luma,chroma}, .n_in=2, .linear={false,true}, .uniforms=&D, .uniforms_size=sizeof D };
-        kk_gpu_compute(g, DEC_MSL, "dec", &da);
+        kk_tex *chh = l3 ? kk_chroma_h(g, chroma, &c_chh, W, D.co[0]) : NULL;
+        kk_compute_args da = { .out=c_dec, .in={luma, chh ? chh : chroma}, .n_in=2, .linear={false,true}, .uniforms=&D, .uniforms_size=sizeof D };
+        kk_gpu_compute(g, chh ? DEC_L3_MSL : DEC_MSL, "dec", &da);
     }
     // Deblock (gated ~deblock): H -> c_dbl, V -> zurück nach c_dec. Danach sehen
     // alle Konsumenten (Deband, LIN, CNNs) die entblockte Quelle.
@@ -583,8 +650,9 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
         char wp[1200]; snprintf(wp, sizeof wp, "%s/artcnn_c4f16.weights", res ? res : ".");
         kk_tex *luma2 = kk_gpu_artcnn(g, luma, wp);   // 2W×2H Luma (.r)
         if (luma2) {
-            kk_compute_args ad = { .out=c_a2rgb, .in={luma2, chroma}, .n_in=2, .linear={false,true}, .uniforms=&D, .uniforms_size=sizeof D };
-            kk_gpu_compute(g, DEC_MSL, "dec", &ad);   // 2×-Luma + chroma -> encodete RGB
+            kk_tex *chh2 = l3 ? kk_chroma_h(g, chroma, &c_chh2, kk_tex_w(luma2), D.co[0]) : NULL;
+            kk_compute_args ad = { .out=c_a2rgb, .in={luma2, chh2 ? chh2 : chroma}, .n_in=2, .linear={false,true}, .uniforms=&D, .uniforms_size=sizeof D };
+            kk_gpu_compute(g, chh2 ? DEC_L3_MSL : DEC_MSL, "dec", &ad);   // 2×-Luma + chroma -> encodete RGB
             kk_tex *asrc = c_a2rgb;                    // Deband-mild (Realfilm) auf der 2×-Quelle
             if (dbenv && (dbenv[0]=='m' || dbenv[0]=='s') && c_adeb) {
                 struct { float radius, threshold, grain; uint32_t iters, index; } db;
@@ -626,8 +694,9 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
             struct { float d[12]; float a, b; float m[9]; float o; float co[2]; } DL2;
             memcpy(DL2.d, D.m, sizeof DL2.d); DL2.a = L.a; DL2.b = L.b; memcpy(DL2.m, L.m, sizeof DL2.m);
             DL2.o = L.o; DL2.co[0] = D.co[0]; DL2.co[1] = D.co[1];
-            kk_compute_args la0 = { .out=c_lin, .in={luma,chroma}, .n_in=2, .linear={false,true}, .uniforms=&DL2, .uniforms_size=sizeof DL2 };
-            kk_gpu_compute(g, DECLIN_MSL, "declin", &la0);
+            kk_tex *chh = l3 ? kk_chroma_h(g, chroma, &c_chh, W, D.co[0]) : NULL;
+            kk_compute_args la0 = { .out=c_lin, .in={luma, chh ? chh : chroma}, .n_in=2, .linear={false,true}, .uniforms=&DL2, .uniforms_size=sizeof DL2 };
+            kk_gpu_compute(g, chh ? DECLIN_L3_MSL : DECLIN_MSL, "declin", &la0);
         } else {   // CNN-Gate an, aber CNN-Pfad oben gescheitert -> c_dec existiert
             kk_compute_args la0 = { .out=c_lin, .in={c_dec}, .n_in=1, .uniforms=&L, .uniforms_size=sizeof L };
             kk_gpu_compute(g, LIN_MSL, "lin", &la0);
@@ -765,6 +834,7 @@ static void kk_gpu_sdr_release(kk_gpu *g) {
     kk_tex_destroy(g,&c_tmpx); kk_tex_destroy(g,&c_liny); kk_tex_destroy(g,&c_out);
     kk_tex_destroy(g,&c_alin); kk_tex_destroy(g,&c_atmpx); kk_tex_destroy(g,&c_srgb);
     kk_tex_destroy(g,&c_a2rgb); kk_tex_destroy(g,&c_dbl);
+    kk_tex_destroy(g,&c_chh); kk_tex_destroy(g,&c_chh2);
     c_W = c_H = c_OW = c_OH = 0;
 }
 // HDR-Pfad-Caches. Reset h_W → lazy Re-Alloc bei nächstem HDR-Frame.
@@ -789,6 +859,9 @@ void kk_gpu_prewarm(void *metal_device) {
     kk_gpu *g = g_kk;
     kk_gpu_compile(g, DEC_MSL,    "dec");
     kk_gpu_compile(g, DECLIN_MSL, "declin");
+    kk_gpu_compile(g, DECLIN_L3_MSL, "declin");
+    kk_gpu_compile(g, DEC_L3_MSL, "dec");
+    kk_gpu_compile(g, CHH_MSL, "chh");
     kk_gpu_compile(g, DELINCAS_MSL, "delincas");
     kk_gpu_compile(g, DELINCAS_D_MSL, "delincas");
     kk_gpu_compile(g, DEBAND_MSL, "deband");
