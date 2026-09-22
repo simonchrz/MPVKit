@@ -32,40 +32,25 @@ static const float DM[12] = { 1.1643f, 0.0f, 1.7927f,
                               -0.9729f, 0.3015f, -1.1334f };
 static const float LA = 0.8704f, LB = 0.0595f;
 
-typedef struct { float d[12]; float a, b; float m[9]; } DL_uniform;
+typedef struct { float d[12]; float a, b; float m[9]; float o; float co[2]; } DL_uniform;
+typedef struct { float m[12]; float co[2]; } D_uniform;
 
 static double srgb_d(double c) { return c <= 0.0031308 ? 12.92 * c : 1.055 * pow(c, 1.0 / 2.4) - 0.055; }
 
 /// Exakter Ausgabewert (0..255, ungerundet) für eine Y/Cb/Cr-Eingabe, Kanal k.
-static double wahr(double Y, double Cb, double Cr, int k) {
+static double wahr(double Y, double Cb, double Cr, int k, int bpc) {
     double v[3] = { Y / 255.0, Cb / 255.0, Cr / 255.0 };
     double rgb = DM[3*k] * v[0] + DM[3*k+1] * v[1] + DM[3*k+2] * v[2] + DM[9+k];
     if (rgb < 0) rgb = 0;
     double lin = LA * pow(rgb + LB, 2.4);
+    if (bpc) { double lb = LA * pow(LB, 2.4); lin = (lin - lb) / (1 - lb); }
     if (lin > 1) lin = 1;
     return 255.0 * srgb_d(lin);
 }
 
-// DELIN mit TPDF-Dither (±1 LSB, Dreiecksverteilung aus zwei Hashes). Nur Probe.
-static const char *DELIN_DITHER_MSL =
-"#include <metal_stdlib>\nusing namespace metal;\n"
-"static inline float srgb(float c){ return c<=0.0031308 ? 12.92*c : 1.055*pow(c,1.0/2.4)-0.055; }\n"
-"static inline float h(uint2 p, uint s){ uint x=p.x*1973u+p.y*9277u+s*26699u; x^=x>>15; x*=0x2c1b3c6du; x^=x>>12; x*=0x297a2d39u; x^=x>>15; return float(x)*(1.0/4294967296.0); }\n"
-"kernel void delind(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
-"  uint2 id [[thread_position_in_grid]]){ uint w=dst.get_width(),hh=dst.get_height(); if(id.x>=w||id.y>=hh)return;\n"
-"  float3 c=clamp(src.read(id).rgb,0.0,1.0); float n=(h(id,1u)+h(id,2u)-1.0)/255.0;\n"
-"  dst.write(float4(saturate(float3(srgb(c.r),srgb(c.g),srgb(c.b))+n),1.0),id);}\n";
-
-// DEC mit verschiebbarer Chroma-Abtastung (cx in LUMA-Pixeln; left-sited = +0,5).
-static const char *DEC_SITE_MSL =
-"#include <metal_stdlib>\nusing namespace metal;\nstruct D{float m[12]; float cx;};\n"
-"kernel void decs(texture2d<float> luma [[texture(0)]], texture2d<float> chroma [[texture(1)]],\n"
-"  texture2d<float,access::write> dst [[texture(2)]], sampler near [[sampler(0)]], sampler lin [[sampler(1)]],\n"
-"  constant D& d [[buffer(0)]], uint2 id [[thread_position_in_grid]]){ uint w=dst.get_width(),h=dst.get_height(); if(id.x>=w||id.y>=h)return;\n"
-"  float2 uv=(float2(id)+0.5)/float2(w,h); float Y=luma.read(id).r; float2 C=chroma.sample(lin,uv+float2(d.cx/float(w),0.0)).rg;\n"
-"  float3 v=float3(Y,C.r,C.g);\n"
-"  float3 rgb=float3(d.m[0]*v.x+d.m[1]*v.y+d.m[2]*v.z, d.m[3]*v.x+d.m[4]*v.y+d.m[5]*v.z, d.m[6]*v.x+d.m[7]*v.y+d.m[8]*v.z)+float3(d.m[9],d.m[10],d.m[11]);\n"
-"  dst.write(float4(rgb,1.0),id);}\n";
+// Seit renderpl.73 misst die Sonde die PRODUKTIONS-Kernel: DELIN_D_MSL (Dither),
+// DEC_MSL mit Chroma-Ort-Uniform, kk_lin_params (Schwarzpunkt). „alt" = die Werte,
+// mit denen die Kernel exakt den Stand vor .73 rechnen (o=0, co=0, ohne _D).
 
 // ---------------------------------------------------------------- 1 + 2
 static void probe_quant(kk_gpu *g) {
@@ -77,30 +62,38 @@ static void probe_quant(kk_gpu *g) {
     kk_tex *tl = kk_tex_create(g, W, H, KK_FMT_R8, KK_TEX_SAMPLE | KK_TEX_DOWNLOAD, luma);
     kk_tex *tc = kk_tex_create(g, CW, CH, KK_FMT_RG8, KK_TEX_SAMPLE | KK_TEX_DOWNLOAD, chroma);
     kk_tex *lin = kk_tex_create(g, W, H, KK_FMT_RGBA16F, KK_TEX_SAMPLE | KK_TEX_STORAGE, NULL);
+    kk_tex *linN = kk_tex_create(g, W, H, KK_FMT_RGBA16F, KK_TEX_SAMPLE | KK_TEX_STORAGE, NULL);
+    kk_tex *oAlt = kk_tex_create(g, W, H, KK_FMT_RGBA8, KK_TEX_STORAGE | KK_TEX_DOWNLOAD, NULL);
     kk_tex *o0 = kk_tex_create(g, W, H, KK_FMT_RGBA8, KK_TEX_STORAGE | KK_TEX_DOWNLOAD, NULL);
     kk_tex *o1 = kk_tex_create(g, W, H, KK_FMT_RGBA8, KK_TEX_STORAGE | KK_TEX_DOWNLOAD, NULL);
-    DL_uniform DL; memcpy(DL.d, DM, sizeof DL.d); DL.a = LA; DL.b = LB;
+    DL_uniform DL; memcpy(DL.d, DM, sizeof DL.d); DL.a = LA; DL.b = LB; DL.o = 0; DL.co[0] = DL.co[1] = 0;
     float id3[9] = {1,0,0, 0,1,0, 0,0,1}; memcpy(DL.m, id3, sizeof DL.m);
     kk_gpu_compute(g, DECLIN_MSL, "declin", &(kk_compute_args){ .out = lin, .in = { tl, tc }, .n_in = 2,
         .linear = { false, true }, .uniforms = &DL, .uniforms_size = sizeof DL });
-    kk_gpu_compute(g, DELIN_MSL, "delin", &(kk_compute_args){ .out = o0, .in = { lin }, .n_in = 1 });
-    kk_gpu_compute(g, DELIN_DITHER_MSL, "delind", &(kk_compute_args){ .out = o1, .in = { lin }, .n_in = 1 });
+    kk_gpu_compute(g, DELIN_MSL, "delin", &(kk_compute_args){ .out = oAlt, .in = { lin }, .n_in = 1 });
+    DL_uniform DN = DL; kk_lin_params(&DN.a, &DN.o);            // Produktion ab .73
+    kk_gpu_compute(g, DECLIN_MSL, "declin", &(kk_compute_args){ .out = linN, .in = { tl, tc }, .n_in = 2,
+        .linear = { false, true }, .uniforms = &DN, .uniforms_size = sizeof DN });
+    kk_gpu_compute(g, DELIN_MSL, "delin", &(kk_compute_args){ .out = o0, .in = { linN }, .n_in = 1 });
+    kk_gpu_compute(g, DELIN_D_MSL, "delin", &(kk_compute_args){ .out = o1, .in = { linN }, .n_in = 1 });
     kk_gpu_finish(g);
-    unsigned char *a = malloc(4 * W * H), *b = malloc(4 * W * H);
-    kk_tex_download(g, o0, a); kk_tex_download(g, o1, b);
+    unsigned char *a = malloc(4 * W * H), *b = malloc(4 * W * H), *alt = malloc(4 * W * H);
+    kk_tex_download(g, o0, a); kk_tex_download(g, o1, b); kk_tex_download(g, oAlt, alt);
 
     // Kanal G (Grau: R=G=B bis auf Rundung).
-    int code[220]; double mA[220], mB[220], w[220];
+    int code[220], codeAlt[220]; double mA[220], mB[220], w[220];
     for (int s = 0; s < STUFEN; s++) {
         double sa = 0, sb = 0;
         for (int y = 0; y < H; y++) for (int x = s*BW; x < (s+1)*BW; x++) { sa += a[4*(y*W+x)+1]; sb += b[4*(y*W+x)+1]; }
         mA[s] = sa / (BW*H); mB[s] = sb / (BW*H);
         code[s] = a[4*(8*W + s*BW + 8) + 1];
-        w[s] = wahr(16 + s, 128, 128, 1);
+        codeAlt[s] = alt[4*(8*W + s*BW + 8) + 1];
+        w[s] = wahr(16 + s, 128, 128, 1, 1);
     }
-    printf("\n[1] Schwarzwert (Y=16 -> sRGB-Code, 0 = echtes Schwarz)\n");
-    printf("    Y=16 -> %d  (exakt %.2f)   Y=17 -> %d   Y=20 -> %d   Y=235 -> %d\n",
-           code[0], w[0], code[1], code[4], code[219]);
+    printf("\n[1] Schwarzwert (Y -> sRGB-Code, 0 = echtes Schwarz)   alt | neu\n");
+    const int zeig[] = { 0, 1, 2, 4, 8, 14, 24, 44, 84, 144, 219 };
+    for (unsigned i = 0; i < sizeof zeig / sizeof *zeig; i++)
+        printf("    Y=%3d  %3d | %3d\n", 16 + zeig[i], codeAlt[zeig[i]], code[zeig[i]]);
     printf("    Linearlicht bei Y=16: %.5f (= %.2f %% Weiss)\n", LA * pow(LB, 2.4), 100 * LA * pow(LB, 2.4));
 
     printf("\n[2] Stufen: 1 TV-Schritt -> wie viele sRGB-Codes?\n");
@@ -127,8 +120,9 @@ static void probe_quant(kk_gpu *g) {
         double d = b[4*(y*W+x)+1] - mB[s]; rausch += d*d; n++; }
     printf("    Preis des Dithers: Pixelrauschen %.2f LSB rms\n", sqrt(rausch / n));
 
-    free(luma); free(chroma); free(a); free(b);
-    kk_tex_destroy(g,&tl); kk_tex_destroy(g,&tc); kk_tex_destroy(g,&lin); kk_tex_destroy(g,&o0); kk_tex_destroy(g,&o1);
+    free(luma); free(chroma); free(a); free(b); free(alt);
+    kk_tex_destroy(g,&tl); kk_tex_destroy(g,&tc); kk_tex_destroy(g,&lin); kk_tex_destroy(g,&linN);
+    kk_tex_destroy(g,&oAlt); kk_tex_destroy(g,&o0); kk_tex_destroy(g,&o1);
 }
 
 // ---------------------------------------------------------------- 3
@@ -137,7 +131,7 @@ static void probe_quant(kk_gpu *g) {
 // [1 2 1]/4 um die geraden Luma-Positionen, vertikal Mittel aus zwei Zeilen.
 static void probe_chroma(kk_gpu *g) {
     const int W = 256, H = 8, CW = W / 2, CH = H / 2;
-    double cb[256], cr[256];
+    double cb[256], cr[256];   // W
     for (int x = 0; x < W; x++) {
         int balken = ((x + (x / 37)) / 11) % 3;          // unregelmäßige Kantenlage
         cb[x] = balken == 0 ? 90 : balken == 1 ? 200 : 128;
@@ -152,14 +146,15 @@ static void probe_chroma(kk_gpu *g) {
     }
     kk_tex *tl = kk_tex_create(g, W, H, KK_FMT_R8, KK_TEX_SAMPLE | KK_TEX_DOWNLOAD, luma);
     kk_tex *tc = kk_tex_create(g, CW, CH, KK_FMT_RG8, KK_TEX_SAMPLE | KK_TEX_DOWNLOAD, chroma);
-    struct { float m[12]; float cx; } U; memcpy(U.m, DM, sizeof U.m);
-    const float versatz[3] = { 0.0f, 0.5f, -0.5f };
-    const char *name[3] = { "mittig (heute)", "left-sited (+0,5)", "Gegenprobe (-0,5)" };
+    D_uniform U; memcpy(U.m, DM, sizeof U.m); U.co[1] = 0;
+    // co in Chroma-Texeln: +0,25 = left-sited = 0,5 Luma-Pixel.
+    const float versatz[3] = { 0.0f, 0.25f, -0.25f };
+    const char *name[3] = { "mittig (alt)", "left (neu, +0,25 T)", "Gegenprobe (-0,25)" };
     printf("\n[3] Chroma-Ort: Farbfehler gegen das 4:4:4-Original (encodete RGB, LSB)\n");
     for (int v = 0; v < 3; v++) {
-        U.cx = versatz[v];
+        U.co[0] = versatz[v];
         kk_tex *o = kk_tex_create(g, W, H, KK_FMT_RGBA8, KK_TEX_STORAGE | KK_TEX_DOWNLOAD, NULL);
-        kk_gpu_compute(g, DEC_SITE_MSL, "decs", &(kk_compute_args){ .out = o, .in = { tl, tc }, .n_in = 2,
+        kk_gpu_compute(g, DEC_MSL, "dec", &(kk_compute_args){ .out = o, .in = { tl, tc }, .n_in = 2,
             .linear = { false, true }, .uniforms = &U, .uniforms_size = sizeof U });
         kk_gpu_finish(g);
         unsigned char *px = malloc(4 * W * H); kk_tex_download(g, o, px);
@@ -178,18 +173,6 @@ static void probe_chroma(kk_gpu *g) {
         printf("    %-20s rms %.2f   an Kanten rms %.2f   max %.0f\n", name[v], sqrt(q/n), sqrt(qk/nk), mx);
         free(px); kk_tex_destroy(g, &o);
     }
-    // Kontrolle: der Produktionskernel DEC muss exakt der Variante „mittig" gleichen.
-    kk_tex *o = kk_tex_create(g, W, H, KK_FMT_RGBA8, KK_TEX_STORAGE | KK_TEX_DOWNLOAD, NULL);
-    kk_gpu_compute(g, DEC_MSL, "dec", &(kk_compute_args){ .out = o, .in = { tl, tc }, .n_in = 2,
-        .linear = { false, true }, .uniforms = DM, .uniforms_size = sizeof DM });
-    U.cx = 0; kk_tex *o2 = kk_tex_create(g, W, H, KK_FMT_RGBA8, KK_TEX_STORAGE | KK_TEX_DOWNLOAD, NULL);
-    kk_gpu_compute(g, DEC_SITE_MSL, "decs", &(kk_compute_args){ .out = o2, .in = { tl, tc }, .n_in = 2,
-        .linear = { false, true }, .uniforms = &U, .uniforms_size = sizeof U });
-    kk_gpu_finish(g);
-    unsigned char *p1 = malloc(4*W*H), *p2 = malloc(4*W*H);
-    kk_tex_download(g, o, p1); kk_tex_download(g, o2, p2);
-    printf("    Kontrolle DEC(Produktion) == Variante mittig: %s\n", memcmp(p1, p2, 4*W*H) ? "NEIN" : "ja");
-    free(p1); free(p2); kk_tex_destroy(g,&o); kk_tex_destroy(g,&o2);
     free(luma); free(chroma); kk_tex_destroy(g,&tl); kk_tex_destroy(g,&tc);
 }
 

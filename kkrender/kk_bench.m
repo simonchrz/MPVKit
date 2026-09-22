@@ -23,9 +23,9 @@
 #include "kk_gpu.h"
 #include "kk_gpu_render.c"
 
-typedef struct { float a, b; float m[9]; } L_uniform;
-typedef struct { float m[12]; } D_uniform;
-typedef struct { float d[12]; float a, b; float m[9]; } DL_uniform;
+typedef struct { float a, b; float m[9]; float o; } L_uniform;   // o = Schwarzpunkt-Abzug (0 = alt)
+typedef struct { float m[12]; float co[2]; } D_uniform;   // co = Chroma-Ort (0 = mittig, alt)
+typedef struct { float d[12]; float a, b; float m[9]; float o; float co[2]; } DL_uniform;
 typedef struct { float radius, threshold, grain; uint32_t iters, index; } DB_uniform;
 typedef struct { float scale; uint32_t lutn; float radius; float lut[64]; } EWA_uniform;
 
@@ -75,7 +75,7 @@ int main(void) { @autoreleasepool {
     D_uniform D = {{ 1.1643f,0.0f,1.7927f, 1.1643f,-0.2132f,-0.5329f,
                      1.1643f,2.1124f,0.0f, -0.9729f,0.3015f,-1.1334f }};
     L_uniform L = { 0.8704f, 0.0595f, {1,0,0, 0,1,0, 0,0,1} };
-    DL_uniform DL; memcpy(DL.d, D.m, sizeof DL.d); DL.a=L.a; DL.b=L.b; memcpy(DL.m, L.m, sizeof DL.m);
+    DL_uniform DL; memcpy(DL.d, D.m, sizeof DL.d); DL.a=L.a; DL.b=L.b; memcpy(DL.m, L.m, sizeof DL.m); DL.o = 0; DL.co[0] = DL.co[1] = 0;
     DB_uniform DB = { .radius=16.0f, .threshold=0.004f, .grain=0.006f, .iters=1, .index=0 };
 
     double t_dec, t_lin, t_declin, t_deband, t_lanx, t_lany, t_ewa, t_delin, t_cas, t_delincas;

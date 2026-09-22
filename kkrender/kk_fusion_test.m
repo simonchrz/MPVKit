@@ -25,9 +25,9 @@
 #include "kk_gpu.h"
 #include "kk_gpu_render.c"
 
-typedef struct { float d[12]; float a, b; float m[9]; } DL_uniform;
-typedef struct { float m[12]; } D_uniform;
-typedef struct { float a, b; float m[9]; } L_uniform;
+typedef struct { float d[12]; float a, b; float m[9]; float o; float co[2]; } DL_uniform;
+typedef struct { float m[12]; float co[2]; } D_uniform;   // co = Chroma-Ort (0 = mittig, alt)
+typedef struct { float a, b; float m[9]; float o; } L_uniform;   // o = Schwarzpunkt-Abzug (0 = alt)
 
 /// Baut ein Testbild: Luma mit Verlauf + Kanten, Chroma mit Farbwechseln.
 /// Bewusst NICHT uniform — eine Fläche würde einen Matrixfehler verstecken.
@@ -78,7 +78,7 @@ static int pruefe_declin(kk_gpu *g) {
 
     // --- Weg B: DECLIN, fusioniert (Produktionspfad seit renderpl.70)
     DL_uniform DL;
-    memcpy(DL.d, D.m, sizeof DL.d); DL.a = L.a; DL.b = L.b; memcpy(DL.m, L.m, sizeof DL.m);
+    memcpy(DL.d, D.m, sizeof DL.d); DL.a = L.a; DL.b = L.b; memcpy(DL.m, L.m, sizeof DL.m); DL.o = 0; DL.co[0] = DL.co[1] = 0;
     kk_tex *outB = kk_tex_create(g, W, H, KK_FMT_RGBA8,
                                  KK_TEX_STORAGE | KK_TEX_DOWNLOAD, NULL);
     kk_gpu_compute(g, DECLIN_MSL, "declin", &(kk_compute_args){

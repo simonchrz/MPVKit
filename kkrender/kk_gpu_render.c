@@ -28,26 +28,30 @@ static void kk_gpu_hdr_release(kk_gpu *g);
 
 // DEC: YUV -> encodete RGB (exakte Matrix via pl_color_repr_decode, 9+3). KEIN linearize
 // (Deband sitzt auf der encodeten Quelle, wie libplacebos source-deband).
+//
+// co = Chroma-Ort-Versatz in CHROMA-Texeln (kk_chroma_offset): mittig 0, left-sited
+// +0,25 horizontal. In Texel-Einheiten, damit er auch für den 2×-Luma-Eingang des
+// ArtCNN-Pfads stimmt (dort sind es 1,0 statt 0,5 Luma-Pixel).
 static const char *DEC_MSL =
-"#include <metal_stdlib>\nusing namespace metal;\nstruct D{float m[12];};\n"
+"#include <metal_stdlib>\nusing namespace metal;\nstruct D{float m[12];float co[2];};\n"
 "kernel void dec(texture2d<float> luma [[texture(0)]], texture2d<float> chroma [[texture(1)]],\n"
 "  texture2d<float,access::write> dst [[texture(2)]], sampler near [[sampler(0)]], sampler lin [[sampler(1)]],\n"
 "  constant D& d [[buffer(0)]], uint2 id [[thread_position_in_grid]]){ uint w=dst.get_width(),h=dst.get_height(); if(id.x>=w||id.y>=h)return;\n"
-"  float2 uv=(float2(id)+0.5)/float2(w,h); float Y=luma.read(id).r; float2 C=chroma.sample(lin,uv).rg;\n"
+"  float2 uv=(float2(id)+0.5)/float2(w,h); float Y=luma.read(id).r; float2 C=chroma.sample(lin,uv+float2(d.co[0],d.co[1])/float2(chroma.get_width(),chroma.get_height())).rg;\n"
 "  float3 v=float3(Y,C.r,C.g);\n"
 "  float3 rgb=float3(d.m[0]*v.x+d.m[1]*v.y+d.m[2]*v.z, d.m[3]*v.x+d.m[4]*v.y+d.m[5]*v.z, d.m[6]*v.x+d.m[7]*v.y+d.m[8]*v.z)+float3(d.m[9],d.m[10],d.m[11]);\n"
 "  dst.write(float4(rgb,1.0),id);}\n";
 // DECLIN: DEC+LIN fusioniert (HD-Light, kein Deband/CNN dazwischen -> c_dec-Roundtrip
 // in voller Quellauflösung gespart). Mathematisch identisch zu dec->lin in Serie.
 static const char *DECLIN_MSL =
-"#include <metal_stdlib>\nusing namespace metal;\nstruct DL{float d[12];float a,b;float m[9];};\n"
+"#include <metal_stdlib>\nusing namespace metal;\nstruct DL{float d[12];float a,b;float m[9];float o;float co[2];};\n"
 "kernel void declin(texture2d<float> luma [[texture(0)]], texture2d<float> chroma [[texture(1)]],\n"
 "  texture2d<float,access::write> dst [[texture(2)]], sampler near [[sampler(0)]], sampler lin [[sampler(1)]],\n"
 "  constant DL& p [[buffer(0)]], uint2 id [[thread_position_in_grid]]){ uint w=dst.get_width(),h=dst.get_height(); if(id.x>=w||id.y>=h)return;\n"
-"  float2 uv=(float2(id)+0.5)/float2(w,h); float Y=luma.read(id).r; float2 C=chroma.sample(lin,uv).rg;\n"
+"  float2 uv=(float2(id)+0.5)/float2(w,h); float Y=luma.read(id).r; float2 C=chroma.sample(lin,uv+float2(p.co[0],p.co[1])/float2(chroma.get_width(),chroma.get_height())).rg;\n"
 "  float3 v=float3(Y,C.r,C.g);\n"
 "  float3 rgb=float3(p.d[0]*v.x+p.d[1]*v.y+p.d[2]*v.z, p.d[3]*v.x+p.d[4]*v.y+p.d[5]*v.z, p.d[6]*v.x+p.d[7]*v.y+p.d[8]*v.z)+float3(p.d[9],p.d[10],p.d[11]);\n"
-"  float3 c=max(rgb,0.0); float3 vl=p.a*pow(c+p.b,float3(2.4));\n"
+"  float3 c=max(rgb,0.0); float3 vl=p.a*pow(c+p.b,float3(2.4))-p.o;\n"
 "  float3 o=float3(p.m[0]*vl.x+p.m[1]*vl.y+p.m[2]*vl.z, p.m[3]*vl.x+p.m[4]*vl.y+p.m[5]*vl.z, p.m[6]*vl.x+p.m[7]*vl.y+p.m[8]*vl.z);\n"
 "  dst.write(float4(o,1.0),id);}\n";
 // DEBLOCK: separabler 1D-Bilateral (±3, Luma-Range-gewichtet) auf der encodeten
@@ -112,11 +116,12 @@ static const char *DEBAND_MSL =
 "  dst.write(float4(res,1.0),id);}\n";
 // LIN: BT.1886 a*pow(c+b,2.4) (encoded -> linear) + Primaries-Gamut (601/2020 -> 709,
 // RGB-RGB-Matrix in Linear-Light; identity bei 709-Quelle = no-op).
+// `- o`: Schwarzpunkt-Ausgleich (kk_lin_params). Mit o=0 und dem rohen a exakt wie vorher.
 static const char *LIN_MSL =
-"#include <metal_stdlib>\nusing namespace metal;\nstruct L{float a,b;float m[9];};\n"
+"#include <metal_stdlib>\nusing namespace metal;\nstruct L{float a,b;float m[9];float o;};\n"
 "kernel void lin(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
 "  constant L& l [[buffer(0)]], uint2 id [[thread_position_in_grid]]){ uint w=dst.get_width(),h=dst.get_height(); if(id.x>=w||id.y>=h)return;\n"
-"  float3 c=max(src.read(id).rgb,0.0); float3 v=l.a*pow(c+l.b,float3(2.4));\n"
+"  float3 c=max(src.read(id).rgb,0.0); float3 v=l.a*pow(c+l.b,float3(2.4))-l.o;\n"
 "  float3 o=float3(l.m[0]*v.x+l.m[1]*v.y+l.m[2]*v.z, l.m[3]*v.x+l.m[4]*v.y+l.m[5]*v.z, l.m[6]*v.x+l.m[7]*v.y+l.m[8]*v.z);\n"
 "  dst.write(float4(o,1.0),id);}\n";
 static const char *LANCZOS_MSL =
@@ -156,43 +161,76 @@ static kk_lanczos_p kk_lanczos_params(float scale, uint32_t axis) {
     memcpy(p.lut, tbl, sizeof tbl);
     return p;
 }
-static const char *DELIN_MSL =
-"#include <metal_stdlib>\nusing namespace metal;\n"
-"static inline float srgb(float c){ return c<=0.0031308 ? 12.92*c : 1.055*pow(c,1.0/2.4)-0.055; }\n"
-"kernel void delin(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
-"  uint2 id [[thread_position_in_grid]]){ uint w=dst.get_width(),h=dst.get_height(); if(id.x>=w||id.y>=h)return;\n"
-"  float3 c=clamp(src.read(id).rgb,0.0,1.0); dst.write(float4(srgb(c.r),srgb(c.g),srgb(c.b),1.0),id);}\n";
+#define DELIN_SRC \
+"#include <metal_stdlib>\nusing namespace metal;\n" \
+"static inline float3 kk_dither(float3 v, uint2 p){\n" \
+"#if KK_DITHER\n" \
+"  uint x=p.x*1973u+p.y*9277u; x^=x>>15; x*=0x2c1b3c6du; x^=x>>12; x*=0x297a2d39u; x^=x>>15;\n" \
+"  float n=(float(x&0xFFFFu)+float(x>>16))*(1.0/65536.0)-1.0;   // TPDF, -1..+1 LSB\n" \
+"  return saturate(v+n*(1.0/255.0));\n" \
+"#else\n" \
+"  return v;\n" \
+"#endif\n" \
+"}\n" \
+"static inline float srgb(float c){ return c<=0.0031308 ? 12.92*c : 1.055*pow(c,1.0/2.4)-0.055; }\n" \
+"kernel void delin(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n" \
+"  uint2 id [[thread_position_in_grid]]){ uint w=dst.get_width(),h=dst.get_height(); if(id.x>=w||id.y>=h)return;\n" \
+"  float3 c=clamp(src.read(id).rgb,0.0,1.0); dst.write(float4(kk_dither(float3(srgb(c.r),srgb(c.g),srgb(c.b)),id),1.0),id);}\n"
+static const char *DELIN_MSL   = "#define KK_DITHER 0\n" DELIN_SRC;
+static const char *DELIN_D_MSL = "#define KK_DITHER 1\n" DELIN_SRC;   // + Dither (8-Bit-Ziel)
 // CAS (FidelityFX Contrast-Adaptive-Sharpening, cas.glsl-Port, headless gegen libplacebo
 // maxerr≤3) auf der encodeten sRGB-Ausgabe (HD/Tuner-Sharpener, gated via ~cas).
-static const char *CAS_MSL =
-"#include <metal_stdlib>\nusing namespace metal;\n#define SHARP 0.5\n"
-"kernel void cas(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
-"  uint2 id [[thread_position_in_grid]]){ uint W=dst.get_width(),H=dst.get_height(); if(id.x>=W||id.y>=H)return;\n"
-"  int sw=int(W),sh=int(H); int2 p=int2(id);\n"
-"#define T(dx,dy) src.read(uint2(clamp(p.x+(dx),0,sw-1),clamp(p.y+(dy),0,sh-1))).rgb\n"
-"  float3 a=T(-1,-1),b=T(0,-1),c=T(1,-1),d=T(-1,0),e=T(0,0),f=T(1,0),g=T(-1,1),h=T(0,1),i=T(1,1);\n"
-"  float3 mn=min(min(min(d,e),min(f,b)),h); float3 mn2=min(mn,min(min(a,c),min(g,i))); mn+=mn2;\n"
-"  float3 mx=max(max(max(d,e),max(f,b)),h); float3 mx2=max(mx,max(max(a,c),max(g,i))); mx+=mx2;\n"
-"  float3 rcpM=1.0/max(mx,float3(1e-5)); float3 amp=clamp(min(mn,2.0-mx)*rcpM,0.0,1.0); amp=rsqrt(max(amp,float3(1e-5)));\n"
-"  float peak=-3.0*SHARP+8.0; float3 w=-1.0/(amp*peak); float3 rcpW=1.0/(1.0+4.0*w);\n"
-"  float3 win=(b+d)+(f+h); float3 o=clamp((win*w+e)*rcpW,0.0,1.0); dst.write(float4(o,1.0),id);}\n";
+#define CAS_SRC \
+"#include <metal_stdlib>\nusing namespace metal;\n#define SHARP 0.5\n" \
+"static inline float3 kk_dither(float3 v, uint2 p){\n" \
+"#if KK_DITHER\n" \
+"  uint x=p.x*1973u+p.y*9277u; x^=x>>15; x*=0x2c1b3c6du; x^=x>>12; x*=0x297a2d39u; x^=x>>15;\n" \
+"  float n=(float(x&0xFFFFu)+float(x>>16))*(1.0/65536.0)-1.0;   // TPDF, -1..+1 LSB\n" \
+"  return saturate(v+n*(1.0/255.0));\n" \
+"#else\n" \
+"  return v;\n" \
+"#endif\n" \
+"}\n" \
+"kernel void cas(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n" \
+"  uint2 id [[thread_position_in_grid]]){ uint W=dst.get_width(),H=dst.get_height(); if(id.x>=W||id.y>=H)return;\n" \
+"  int sw=int(W),sh=int(H); int2 p=int2(id);\n" \
+"#define T(dx,dy) src.read(uint2(clamp(p.x+(dx),0,sw-1),clamp(p.y+(dy),0,sh-1))).rgb\n" \
+"  float3 a=T(-1,-1),b=T(0,-1),c=T(1,-1),d=T(-1,0),e=T(0,0),f=T(1,0),g=T(-1,1),h=T(0,1),i=T(1,1);\n" \
+"  float3 mn=min(min(min(d,e),min(f,b)),h); float3 mn2=min(mn,min(min(a,c),min(g,i))); mn+=mn2;\n" \
+"  float3 mx=max(max(max(d,e),max(f,b)),h); float3 mx2=max(mx,max(max(a,c),max(g,i))); mx+=mx2;\n" \
+"  float3 rcpM=1.0/max(mx,float3(1e-5)); float3 amp=clamp(min(mn,2.0-mx)*rcpM,0.0,1.0); amp=rsqrt(max(amp,float3(1e-5)));\n" \
+"  float peak=-3.0*SHARP+8.0; float3 w=-1.0/(amp*peak); float3 rcpW=1.0/(1.0+4.0*w);\n" \
+"  float3 win=(b+d)+(f+h); float3 o=clamp((win*w+e)*rcpW,0.0,1.0); dst.write(float4(kk_dither(o,id),1.0),id);}\n"
+static const char *CAS_MSL   = "#define KK_DITHER 0\n" CAS_SRC;
+static const char *CAS_D_MSL = "#define KK_DITHER 1\n" CAS_SRC;   // + Dither (8-Bit-Ziel)
 // DELINCAS: Delin+CAS fusioniert (HD-Light) — der c_srgb-Roundtrip in voller Output-
 // Auflösung entfällt; das sRGB-Encode läuft pro Tap inline (9x3 pow, ALU gegen
 // Bandbreite getauscht — der Renderer ist bandbreiten-gebunden). Identische Mathe.
-static const char *DELINCAS_MSL =
-"#include <metal_stdlib>\nusing namespace metal;\n#define SHARP 0.5\n"
-"static inline float srgb(float c){ return c<=0.0031308 ? 12.92*c : 1.055*pow(c,1.0/2.4)-0.055; }\n"
-"static inline float3 srgb3(float3 c){ c=clamp(c,0.0,1.0); return float3(srgb(c.r),srgb(c.g),srgb(c.b)); }\n"
-"kernel void delincas(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
-"  uint2 id [[thread_position_in_grid]]){ uint W=dst.get_width(),H=dst.get_height(); if(id.x>=W||id.y>=H)return;\n"
-"  int sw=int(W),sh=int(H); int2 p=int2(id);\n"
-"#define T(dx,dy) srgb3(src.read(uint2(clamp(p.x+(dx),0,sw-1),clamp(p.y+(dy),0,sh-1))).rgb)\n"
-"  float3 a=T(-1,-1),b=T(0,-1),c=T(1,-1),d=T(-1,0),e=T(0,0),f=T(1,0),g=T(-1,1),h=T(0,1),i=T(1,1);\n"
-"  float3 mn=min(min(min(d,e),min(f,b)),h); float3 mn2=min(mn,min(min(a,c),min(g,i))); mn+=mn2;\n"
-"  float3 mx=max(max(max(d,e),max(f,b)),h); float3 mx2=max(mx,max(max(a,c),max(g,i))); mx+=mx2;\n"
-"  float3 rcpM=1.0/max(mx,float3(1e-5)); float3 amp=clamp(min(mn,2.0-mx)*rcpM,0.0,1.0); amp=rsqrt(max(amp,float3(1e-5)));\n"
-"  float peak=-3.0*SHARP+8.0; float3 w=-1.0/(amp*peak); float3 rcpW=1.0/(1.0+4.0*w);\n"
-"  float3 win=(b+d)+(f+h); float3 o=clamp((win*w+e)*rcpW,0.0,1.0); dst.write(float4(o,1.0),id);}\n";
+#define DELINCAS_SRC \
+"#include <metal_stdlib>\nusing namespace metal;\n#define SHARP 0.5\n" \
+"static inline float3 kk_dither(float3 v, uint2 p){\n" \
+"#if KK_DITHER\n" \
+"  uint x=p.x*1973u+p.y*9277u; x^=x>>15; x*=0x2c1b3c6du; x^=x>>12; x*=0x297a2d39u; x^=x>>15;\n" \
+"  float n=(float(x&0xFFFFu)+float(x>>16))*(1.0/65536.0)-1.0;   // TPDF, -1..+1 LSB\n" \
+"  return saturate(v+n*(1.0/255.0));\n" \
+"#else\n" \
+"  return v;\n" \
+"#endif\n" \
+"}\n" \
+"static inline float srgb(float c){ return c<=0.0031308 ? 12.92*c : 1.055*pow(c,1.0/2.4)-0.055; }\n" \
+"static inline float3 srgb3(float3 c){ c=clamp(c,0.0,1.0); return float3(srgb(c.r),srgb(c.g),srgb(c.b)); }\n" \
+"kernel void delincas(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n" \
+"  uint2 id [[thread_position_in_grid]]){ uint W=dst.get_width(),H=dst.get_height(); if(id.x>=W||id.y>=H)return;\n" \
+"  int sw=int(W),sh=int(H); int2 p=int2(id);\n" \
+"#define T(dx,dy) srgb3(src.read(uint2(clamp(p.x+(dx),0,sw-1),clamp(p.y+(dy),0,sh-1))).rgb)\n" \
+"  float3 a=T(-1,-1),b=T(0,-1),c=T(1,-1),d=T(-1,0),e=T(0,0),f=T(1,0),g=T(-1,1),h=T(0,1),i=T(1,1);\n" \
+"  float3 mn=min(min(min(d,e),min(f,b)),h); float3 mn2=min(mn,min(min(a,c),min(g,i))); mn+=mn2;\n" \
+"  float3 mx=max(max(max(d,e),max(f,b)),h); float3 mx2=max(mx,max(max(a,c),max(g,i))); mx+=mx2;\n" \
+"  float3 rcpM=1.0/max(mx,float3(1e-5)); float3 amp=clamp(min(mn,2.0-mx)*rcpM,0.0,1.0); amp=rsqrt(max(amp,float3(1e-5)));\n" \
+"  float peak=-3.0*SHARP+8.0; float3 w=-1.0/(amp*peak); float3 rcpW=1.0/(1.0+4.0*w);\n" \
+"  float3 win=(b+d)+(f+h); float3 o=clamp((win*w+e)*rcpW,0.0,1.0); dst.write(float4(kk_dither(o,id),1.0),id);}\n"
+static const char *DELINCAS_MSL   = "#define KK_DITHER 0\n" DELINCAS_SRC;
+static const char *DELINCAS_D_MSL = "#define KK_DITHER 1\n" DELINCAS_SRC;   // + Dither (8-Bit-Ziel)
 // EWA-lanczossharp (libplacebos Default-Upscaler) — radiale Filter-LUT (pl_filter_generate,
 // 64 Einträge) EINGEBACKEN (konstant, kein Runtime-libplacebo). Headless vs libplacebo verifiziert.
 #define KK_EWA_RADIUS 3.17759895f
@@ -210,10 +248,10 @@ static const float KK_EWA_LUT[64]={
 // (center=0.75 slope=6.5, libplacebos Default-Upscale-Pre). Ergebnis identisch zur
 // LIN->SIG-Kette (SIG clampte eh auf [0,1]).
 static const char *LINSIG_MSL =
-"#include <metal_stdlib>\nusing namespace metal;\nstruct L{float a,b;float m[9];};\n"
+"#include <metal_stdlib>\nusing namespace metal;\nstruct L{float a,b;float m[9];float o;};\n"
 "kernel void linsig(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
 "  constant L& l [[buffer(0)]], uint2 id [[thread_position_in_grid]]){ uint w=dst.get_width(),h=dst.get_height(); if(id.x>=w||id.y>=h)return;\n"
-"  float3 c=max(src.read(id).rgb,0.0); float3 v=l.a*pow(c+l.b,float3(2.4));\n"
+"  float3 c=max(src.read(id).rgb,0.0); float3 v=l.a*pow(c+l.b,float3(2.4))-l.o;\n"
 "  float3 o=float3(l.m[0]*v.x+l.m[1]*v.y+l.m[2]*v.z, l.m[3]*v.x+l.m[4]*v.y+l.m[5]*v.z, l.m[6]*v.x+l.m[7]*v.y+l.m[8]*v.z);\n"
 "  o=clamp(o,0.0,1.0); o=0.75-(1.0/6.5)*log(1.0/(o*0.82796854+0.00757286)-1.0);\n"
 "  dst.write(float4(o,1.0),id);}\n";
@@ -234,13 +272,24 @@ static const char *EWA_MSL =
 "    int cx=clamp(sx,0,sw-1),cy=clamp(sy,0,sh-1); acc+=w*src.read(uint2(cx,cy)); wsum+=w; }\n"
 "  dst.write(wsum>0.0?acc/wsum:float4(0.0),id);}\n";
 // Unsigmoidize + sRGB-Delin fusioniert (Upscale-Post).
-static const char *DELINU_MSL =
-"#include <metal_stdlib>\nusing namespace metal;\n"
-"static inline float srgb(float c){ return c<=0.0031308 ? 12.92*c : 1.055*pow(c,1.0/2.4)-0.055; }\n"
-"kernel void delinu(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
-"  uint2 id [[thread_position_in_grid]]){ uint w=dst.get_width(),h=dst.get_height(); if(id.x>=w||id.y>=h)return;\n"
-"  float3 c=src.read(id).rgb; c=1.20778572/(1.0+exp(6.5*(0.75-c)))-0.00914634; c=clamp(c,0.0,1.0);\n"
-"  dst.write(float4(srgb(c.r),srgb(c.g),srgb(c.b),1.0),id);}\n";
+#define DELINU_SRC \
+"#include <metal_stdlib>\nusing namespace metal;\n" \
+"static inline float3 kk_dither(float3 v, uint2 p){\n" \
+"#if KK_DITHER\n" \
+"  uint x=p.x*1973u+p.y*9277u; x^=x>>15; x*=0x2c1b3c6du; x^=x>>12; x*=0x297a2d39u; x^=x>>15;\n" \
+"  float n=(float(x&0xFFFFu)+float(x>>16))*(1.0/65536.0)-1.0;   // TPDF, -1..+1 LSB\n" \
+"  return saturate(v+n*(1.0/255.0));\n" \
+"#else\n" \
+"  return v;\n" \
+"#endif\n" \
+"}\n" \
+"static inline float srgb(float c){ return c<=0.0031308 ? 12.92*c : 1.055*pow(c,1.0/2.4)-0.055; }\n" \
+"kernel void delinu(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n" \
+"  uint2 id [[thread_position_in_grid]]){ uint w=dst.get_width(),h=dst.get_height(); if(id.x>=w||id.y>=h)return;\n" \
+"  float3 c=src.read(id).rgb; c=1.20778572/(1.0+exp(6.5*(0.75-c)))-0.00914634; c=clamp(c,0.0,1.0);\n" \
+"  dst.write(float4(kk_dither(float3(srgb(c.r),srgb(c.g),srgb(c.b)),id),1.0),id);}\n"
+static const char *DELINU_MSL   = "#define KK_DITHER 0\n" DELINU_SRC;
+static const char *DELINU_D_MSL = "#define KK_DITHER 1\n" DELINU_SRC;   // + Dither (8-Bit-Ziel)
 
 // ===== HDR (P010 -> IPT-Tonemap -> PQ/2020-Output) =====
 // MKPQ: BT.2020-limited-10bit-Decode (Y r16 + Chroma rg16) -> PQ-RGB -> PQ-EOTF ->
@@ -249,9 +298,10 @@ static const char *MKPQ_MSL =
 "#include <metal_stdlib>\nusing namespace metal;\n"
 "static inline float3 pqe(float3 e){ const float m1=0.1593017578125,m2=78.84375,c1=0.8359375,c2=18.8515625,c3=18.6875;\n"
 "  float3 ep=pow(max(e,0.0),float3(1.0/m2)); float3 n=max(ep-c1,0.0); float3 d=c2-c3*ep; return pow(n/d,float3(1.0/m1)); }\n"
+"struct K{float co[2];};\n"
 "kernel void mk(texture2d<float> y [[texture(0)]],texture2d<float> c [[texture(1)]],texture2d<float,access::write> o [[texture(2)]],\n"
-" sampler near [[sampler(0)]], sampler lin [[sampler(1)]], uint2 id [[thread_position_in_grid]]){uint w=o.get_width(),h=o.get_height();if(id.x>=w||id.y>=h)return;\n"
-" float2 uv=(float2(id)+0.5)/float2(w,h); float Yc=y.read(id).r*65535.0/64.0; float2 C=c.sample(lin,uv).rg*65535.0/64.0;\n"
+" sampler near [[sampler(0)]], sampler lin [[sampler(1)]], constant K& k [[buffer(0)]], uint2 id [[thread_position_in_grid]]){uint w=o.get_width(),h=o.get_height();if(id.x>=w||id.y>=h)return;\n"
+" float2 uv=(float2(id)+0.5)/float2(w,h); float Yc=y.read(id).r*65535.0/64.0; float2 C=c.sample(lin,uv+float2(k.co[0],k.co[1])/float2(c.get_width(),c.get_height())).rg*65535.0/64.0;\n"
 " float Y=(Yc-64.0)/876.0, Cb=(C.r-512.0)/896.0, Cr=(C.g-512.0)/896.0;\n"
 " float3 rgb=clamp(float3(Y+1.4746*Cr, Y-0.16455*Cb-0.57135*Cr, Y+1.8814*Cb),0.0,1.0);\n"
 " o.write(float4(pqe(rgb),1.0),id);}\n";
@@ -324,6 +374,61 @@ static kk_tex *c_a2rgb = NULL;                   // ArtCNN: 2×-Luma decodet zu 
 static kk_tex *c_adeb = NULL;                    // ArtCNN-Pfad: entbandete 2×-RGB
 static kk_tex *c_dbl = NULL;                     // Deblock: H-Zwischenstufe (W×H), nur bei ~deblock
 static int c_W = 0, c_H = 0, c_OW = 0, c_OH = 0;
+
+// ---- Bildqualität (2026-09-22, gemessen mit kk_iq_probe) ------------------------
+//
+// SCHWARZPUNKT: BT.1886 mit Kontrast 1000:1 (a/b unten) legt Video-Schwarz auf
+// 0,001 Linearlicht. DELIN kodierte das unverändert nach sRGB -> Y=16 landete bei
+// Code 3 statt 0, auf OLED sichtbar grau neben den echten schwarzen Balken der
+// Display-Ebene. Ausgleich (lin-Lb)/(1-Lb), gefaltet in a und einen Abzug o:
+// Y=16 -> 0, Y=20 -> 3 (statt 6), ab Y~40 praktisch unverändert.
+// KUCKUCK_BLACKPOINT=0 -> alter Zustand (o=0, rohes a).
+static void kk_lin_params(float *a, float *o) {
+    const float a0 = 0.8704f, b0 = 0.0595f;
+    const char *e = getenv("KUCKUCK_BLACKPOINT");
+    if (e && e[0] == '0') { *a = a0; *o = 0.0f; return; }
+    float lb = a0 * powf(b0, 2.4f);
+    *a = a0 / (1.0f - lb);
+    *o = lb / (1.0f - lb);
+}
+
+// CHROMA-ORT: 4:2:0-Chroma sitzt bei H.264/HEVC-Broadcast LINKS (horizontal auf den
+// geraden Luma-Spalten) — gemessen per ffprobe an Tuner, Aufnahmen und ZDF-Mediathek,
+// alle `left`. Abgetastet wurde mittig -> Farbe 0,5 Luma-Pixel versetzt (Farbfehler
+// an Kanten rms 62 -> 49 mit Korrektur). Rückgabe in CHROMA-Texeln (left = +0,25).
+// Quelle: Pixelbuffer-Attachment; fehlt es, gilt left (Default der Codec-Specs für
+// 4:2:0 und der von mpv). KUCKUCK_CHROMA_LOC=center|left erzwingt.
+static void kk_chroma_offset(CVPixelBufferRef pb, float co[2]) {
+    co[0] = 0.25f; co[1] = 0.0f;                  // left
+    const char *e = getenv("KUCKUCK_CHROMA_LOC");
+    if (e && e[0] == 'c') { co[0] = 0.0f; return; }
+    if (e && e[0] == 'l') return;
+    CFTypeRef loc = NULL;
+    // Slice-Minimum ist iOS 14, die App läuft ab 27 — der Zweig ist dort immer wahr.
+    if (__builtin_available(iOS 15.0, macOS 12.0, *))
+        loc = CVBufferCopyAttachment(pb, kCVImageBufferChromaLocationTopFieldKey, NULL);
+    if (!loc) return;
+    if (CFGetTypeID(loc) == CFStringGetTypeID()) {
+        CFStringRef l = (CFStringRef) loc;
+        if      (CFEqual(l, kCVImageBufferChromaLocation_Center))     { co[0] = 0.0f;  co[1] = 0.0f; }
+        else if (CFEqual(l, kCVImageBufferChromaLocation_Top))        { co[0] = 0.0f;  co[1] = 0.25f; }
+        else if (CFEqual(l, kCVImageBufferChromaLocation_Bottom))     { co[0] = 0.0f;  co[1] = -0.25f; }
+        else if (CFEqual(l, kCVImageBufferChromaLocation_TopLeft))    { co[0] = 0.25f; co[1] = 0.25f; }
+        else if (CFEqual(l, kCVImageBufferChromaLocation_BottomLeft)) { co[0] = 0.25f; co[1] = -0.25f; }
+        else if (CFEqual(l, kCVImageBufferChromaLocation_DV420))      { co[0] = 0.0f;  co[1] = 0.0f; }
+        // Left und Unbekanntes: bleibt left
+    }
+    CFRelease(loc);
+}
+
+// DITHER: TPDF ±1 LSB vor der 8-Bit-Rundung, nur beim Schreiben ins BGRA8-Ziel
+// (nie in eine Float-Zwischenstufe — CAS würde das Rauschen mitschärfen). Statisches
+// Muster: kein Flimmern im Standbild. Gewinn klein (Flächen-Bias 0,57 -> 0,14 LSB),
+// Quell-Stufen einer 8-Bit-Quelle kann Dither nicht beheben. KUCKUCK_DITHER=0 -> aus.
+static bool kk_dither_an(void) {
+    const char *e = getenv("KUCKUCK_DITHER");
+    return !(e && e[0] == '0');
+}
 static unsigned g_frame = 0;   // temporaler Grain-Index (Deband)
 
 // yuv2rgb = 12 floats (9 Matrix row-major + 3 Offset) aus libplacebos pl_color_repr_decode
@@ -394,7 +499,9 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
       if (!(gl && strcasestr(gl, "artcnn")))  kk_gpu_artcnn_release(g); }
 
     // Decode -> encodete RGB (echte YUV->RGB-Matrix vom Hook, Fallback BT.709 limited).
-    struct { float m[12]; } D;
+    struct { float m[12]; float co[2]; } D;
+    kk_chroma_offset(pb, D.co);
+    bool dith = kk_dither_an();
     if (yuv2rgb) { for (int i=0;i<12;i++) D.m[i]=yuv2rgb[i]; }
     else { float f[12]={1.1643f,0.0f,1.7927f, 1.1643f,-0.2132f,-0.5329f, 1.1643f,2.1124f,0.0f, -0.9729f,0.3015f,-1.1334f};
            for (int i=0;i<12;i++) D.m[i]=f[i]; }
@@ -442,8 +549,9 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
     }
 
     // BT.1886 a/b + Primaries-Matrix (vom Hook; identity-Fallback bei 709/NULL).
-    struct { float a, b; float m[9]; } L = { 0.8704f, 0.0595f, {1,0,0, 0,1,0, 0,0,1} };
+    struct { float a, b; float m[9]; float o; } L = { 0.8704f, 0.0595f, {1,0,0, 0,1,0, 0,0,1}, 0.0f };
     if (prim2disp) for (int i=0;i<9;i++) L.m[i]=prim2disp[i];
+    kk_lin_params(&L.a, &L.o);
 
     // Anime4K-Cartoon-Upscaler (gated via KUCKUCK_GLSL_SHADER~anime4k). Eigener Post-Scale
     // (2×-Output -> Ziel). Bei Fehler (Weights/Alloc) Fallback auf den Lanczos-Pfad unten.
@@ -462,7 +570,7 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
             kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &aya);            // Y: 2H -> OH
             bool dw = kk_tex_can_write(tgt);   // Target ShaderWrite-fähig -> Blit sparen
             kk_compute_args ala = { .out=dw?tgt:c_out, .in={c_liny}, .n_in=1 };
-            kk_gpu_compute(g, DELIN_MSL, "delin", &ala);
+            kk_gpu_compute(g, dith ? DELIN_D_MSL : DELIN_MSL, "delin", &ala);
             if (!dw) kk_gpu_blit(g, c_out, tgt);
             return kk_finish_or_submit(g, &luma, &chroma, &tgt, done, done_ud);
         }
@@ -496,7 +604,7 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
             kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &aya);
             bool dw = kk_tex_can_write(tgt);   // Target ShaderWrite-fähig -> Blit sparen
             kk_compute_args ala = { .out=dw?tgt:c_out, .in={c_liny}, .n_in=1 };
-            kk_gpu_compute(g, DELIN_MSL, "delin", &ala);
+            kk_gpu_compute(g, dith ? DELIN_D_MSL : DELIN_MSL, "delin", &ala);
             if (!dw) kk_gpu_blit(g, c_out, tgt);
             return kk_finish_or_submit(g, &luma, &chroma, &tgt, done, done_ud);
         }
@@ -515,8 +623,9 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
     if (hdLight && c_tmpx) {
         // HD: DECLIN (fusioniert) -> Lanczos X -> Lanczos Y -> Delin[+CAS fusioniert].
         if (fusedDec) {
-            struct { float d[12]; float a, b; float m[9]; } DL2;
+            struct { float d[12]; float a, b; float m[9]; float o; float co[2]; } DL2;
             memcpy(DL2.d, D.m, sizeof DL2.d); DL2.a = L.a; DL2.b = L.b; memcpy(DL2.m, L.m, sizeof DL2.m);
+            DL2.o = L.o; DL2.co[0] = D.co[0]; DL2.co[1] = D.co[1];
             kk_compute_args la0 = { .out=c_lin, .in={luma,chroma}, .n_in=2, .linear={false,true}, .uniforms=&DL2, .uniforms_size=sizeof DL2 };
             kk_gpu_compute(g, DECLIN_MSL, "declin", &la0);
         } else {   // CNN-Gate an, aber CNN-Pfad oben gescheitert -> c_dec existiert
@@ -542,10 +651,11 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
             kk_compute_args ld = { .out=c_srgb, .in={c_liny}, .n_in=1 };
             kk_gpu_compute(g, DELIN_MSL, "delin", &ld);
             kk_compute_args lc = { .out=fin, .in={c_srgb}, .n_in=1 };
-            kk_gpu_compute(g, CAS_MSL, "cas", &lc);
+            kk_gpu_compute(g, dith ? CAS_D_MSL : CAS_MSL, "cas", &lc);
         } else {
             kk_compute_args la = { .out=fin, .in={c_liny}, .n_in=1 };
-            kk_gpu_compute(g, cas ? DELINCAS_MSL : DELIN_MSL, cas ? "delincas" : "delin", &la);
+            const char *k = cas ? (dith ? DELINCAS_D_MSL : DELINCAS_MSL) : (dith ? DELIN_D_MSL : DELIN_MSL);
+            kk_gpu_compute(g, k, cas ? "delincas" : "delin", &la);
         }
         if (!dw) kk_gpu_blit(g, c_out, tgt);
         return kk_finish_or_submit(g, &luma, &chroma, &tgt, done, done_ud);
@@ -561,12 +671,14 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
         kk_compute_args ea = { .out=c_liny, .in={c_lin}, .n_in=1, .uniforms=&ew, .uniforms_size=sizeof ew };
         kk_gpu_compute(g, EWA_MSL, "ewa", &ea);
         kk_compute_args la = { .out=dout, .in={c_liny}, .n_in=1 };
-        kk_gpu_compute(g, up ? DELINU_MSL : DELIN_MSL, up ? "delinu" : "delin", &la);
+        bool d8 = dith && !cas;   // mit CAS geht es erst in die Float-Stufe c_srgb
+        kk_gpu_compute(g, up ? (d8 ? DELINU_D_MSL : DELINU_MSL) : (d8 ? DELIN_D_MSL : DELIN_MSL),
+                       up ? "delinu" : "delin", &la);
     }
     // CAS-Sharpen (HD/Tuner, gated ~cas): encodete Ausgabe -> CAS -> Target.
     if (cas) {
         kk_compute_args ca = { .out=fin, .in={c_srgb}, .n_in=1 };
-        kk_gpu_compute(g, CAS_MSL, "cas", &ca);
+        kk_gpu_compute(g, dith ? CAS_D_MSL : CAS_MSL, "cas", &ca);
     }
     if (!dw) kk_gpu_blit(g, c_out, tgt); // nur falls Target nicht direkt beschreibbar
     return kk_finish_or_submit(g, &luma, &chroma, &tgt, done, done_ud);
@@ -618,7 +730,8 @@ bool kk_gpu_render_hdr(void *metal_device, void *cv_pixbuf, void *target_texture
     // Speicher: HDR-Pfad nutzt nur h_* → SDR- + CNN-Caches freigeben (idempotent).
     kk_gpu_sdr_release(g); kk_gpu_anime4k_release(g); kk_gpu_artcnn_release(g);
 
-    kk_compute_args mk = { .out=h_pq, .in={luma,chroma}, .n_in=2, .linear={false,true} };
+    struct { float co[2]; } K; kk_chroma_offset(pb, K.co);
+    kk_compute_args mk = { .out=h_pq, .in={luma,chroma}, .n_in=2, .linear={false,true}, .uniforms=&K, .uniforms_size=sizeof K };
     kk_gpu_compute(g, MKPQ_MSL, "mk", &mk);                           // P010 -> linear 2020 (10000-norm)
     // HD-Light auch für HDR (renderpl.69): 1440p-HDR ist am iPhone ein DOWNSCALE
     // (~0,84x) -> die EWA-Box wächst auf ~9x9=81 Taps = gemessen ~33ms avg (2x über
@@ -677,6 +790,7 @@ void kk_gpu_prewarm(void *metal_device) {
     kk_gpu_compile(g, DEC_MSL,    "dec");
     kk_gpu_compile(g, DECLIN_MSL, "declin");
     kk_gpu_compile(g, DELINCAS_MSL, "delincas");
+    kk_gpu_compile(g, DELINCAS_D_MSL, "delincas");
     kk_gpu_compile(g, DEBAND_MSL, "deband");
     kk_gpu_compile(g, DEBLOCK_MSL, "deblock");
     kk_gpu_compile(g, LIN_MSL,    "lin");
@@ -685,6 +799,9 @@ void kk_gpu_prewarm(void *metal_device) {
     kk_gpu_compile(g, DELIN_MSL,  "delin");
     kk_gpu_compile(g, DELINU_MSL, "delinu");
     kk_gpu_compile(g, CAS_MSL,    "cas");
+    kk_gpu_compile(g, DELIN_D_MSL,  "delin");
+    kk_gpu_compile(g, DELINU_D_MSL, "delinu");
+    kk_gpu_compile(g, CAS_D_MSL,    "cas");
     kk_gpu_compile(g, EWA_MSL,    "ewa");
     kk_gpu_compile(g, MKPQ_MSL,   "mk");
     kk_gpu_compile(g, CMHDR_MSL,  "cmh");

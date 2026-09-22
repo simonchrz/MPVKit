@@ -22,7 +22,7 @@
 #include "kk_gpu.h"
 #include "kk_gpu_render.c"
 
-typedef struct { float a, b; float m[9]; } L_uniform;
+typedef struct { float a, b; float m[9]; float o; } L_uniform;   // o = Schwarzpunkt-Abzug (0 = alt)
 typedef struct { float radius, threshold, grain; uint32_t iters, index; } DB_uniform;
 
 static int sigmoid_rundlauf(kk_gpu *g) {
