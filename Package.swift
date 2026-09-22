@@ -38,8 +38,9 @@ let package = Package(
             // libplacebo-frei, self-contained. Gebaut von kkrender/build-kkrender.sh.
             // renderpl.71 = echter SD-Deblock als MSL-Pass (~deblock-Gate) + die
             // Pass-Zeitmessung, die seit .70 im Branch lag, aber nie released war.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.72/Libkkrender.xcframework.zip",
-            checksum: "ae71f3035853593d0e2aacaa102985acee85e4799f775a592dc00bc6e30b787a"
+            // renderpl.73 = Bildqualität: Schwarzpunkt, Chroma-Ort (left), Dither.
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.73/Libkkrender.xcframework.zip",
+            checksum: "37c712d9e2998bb07d50fd625620efe5c0b74ebeed7760ea9981a3829b5e7a55"
         ),
     ]
 )
