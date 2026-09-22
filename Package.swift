@@ -39,8 +39,9 @@ let package = Package(
             // renderpl.71 = echter SD-Deblock als MSL-Pass (~deblock-Gate) + die
             // Pass-Zeitmessung, die seit .70 im Branch lag, aber nie released war.
             // renderpl.73 = Bildqualität: Schwarzpunkt, Chroma-Ort (left), Dither.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.73/Libkkrender.xcframework.zip",
-            checksum: "37c712d9e2998bb07d50fd625620efe5c0b74ebeed7760ea9981a3829b5e7a55"
+            // renderpl.74 = Chroma per Lanczos3 (separabel, CHH-Vorpass; App gibt per Env vor).
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.74/Libkkrender.xcframework.zip",
+            checksum: "0d9448b58153561c2e2cdb87b03a4e0fbd8055f214c3c965d8ff16bbb490976a"
         ),
     ]
 )
