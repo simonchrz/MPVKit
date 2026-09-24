@@ -250,6 +250,69 @@ static int pruefe_chroma_l3(kk_gpu *g) {
     return schlecht;
 }
 
+/// HDR: MKPQ_L3 (CHH auf P010-Chroma) gegen MKPQ bilinear. Flache Fläche muss
+/// gleich bleiben (fängt Fehler in der 10-bit-Skalierung ×65535/64 durch CHH), an
+/// einer Farbkante in y muss L3 die exakte CPU-Referenz treffen (≤1 LSB).
+static int pruefe_hdr_l3(kk_gpu *g) {
+    const int W = 64, H = 16, CW = W/2, CH = H/2;
+    uint16_t *l = malloc(2*W*H), *cf = malloc(4*CW*CH), *ck = malloc(4*CW*CH);
+    for (int i = 0; i < W*H; i++) l[i] = (uint16_t)(500 << 6);              // 10-bit Code 500
+    for (int j = 0; j < CH; j++) for (int i = 0; i < CW; i++) {
+        cf[2*(j*CW+i)] = 300 << 6; cf[2*(j*CW+i)+1] = 700 << 6;              // flach
+        ck[2*(j*CW+i)] = (j < CH/2 ? 200 : 800) << 6; ck[2*(j*CW+i)+1] = 512 << 6;  // Kante in y
+    }
+    kk_tex *tl = kk_tex_create(g, W, H, KK_FMT_R16, KK_TEX_SAMPLE | KK_TEX_DOWNLOAD, l);
+    double diff[2];
+    for (int kante = 0; kante < 2; kante++) {
+        kk_tex *tc = kk_tex_create(g, CW, CH, KK_FMT_RG16, KK_TEX_SAMPLE | KK_TEX_DOWNLOAD, kante ? ck : cf);
+        struct { float co[2]; } K = { { 0.25f, 0.0f } };
+        unsigned char *px[2];
+        for (int v = 0; v < 2; v++) {
+            kk_tex *in = v ? kk_chroma_h(g, tc, &h_chh, W, K.co[0]) : tc;
+            // PQ-Linearlicht ist 10000-normiert und klein -> über RGBA8-Download
+            // nicht auflösbar. Darum ×40 skaliert in ein RGBA8 schreiben lassen
+            // geht nicht ohne Kernel-Änderung; stattdessen Float-Textur + eigener Readback.
+            kk_tex *o = kk_tex_create(g, W, H, KK_FMT_RGBA16F, KK_TEX_STORAGE | KK_TEX_SAMPLE, NULL);
+            kk_gpu_compute(g, v ? MKPQ_L3_MSL : MKPQ_MSL, "mk", &(kk_compute_args){ .out = o, .in = { tl, in },
+                .n_in = 2, .linear = { false, true }, .uniforms = &K, .uniforms_size = sizeof K });
+            // PQ-codieren zurück in RGBA8 (0..1 = voller PQ-Bereich), dann vergleichen.
+            kk_tex *o8 = kk_tex_create(g, W, H, KK_FMT_RGBA8, KK_TEX_STORAGE | KK_TEX_DOWNLOAD, NULL);
+            kk_gpu_compute(g,
+                "#include <metal_stdlib>\nusing namespace metal;\n"
+                "kernel void enc(texture2d<float> s [[texture(0)]], texture2d<float,access::write> d [[texture(1)]], uint2 id [[thread_position_in_grid]]){\n"
+                "  if(id.x>=d.get_width()||id.y>=d.get_height())return; float3 L=max(s.read(id).rgb,0.0);\n"
+                "  const float m1=0.1593017578125,m2=78.84375,c1=0.8359375,c2=18.8515625,c3=18.6875;\n"
+                "  float3 p=pow(L,float3(m1)); d.write(float4(pow((c1+c2*p)/(1.0+c3*p),float3(m2)),1.0),id);}\n",
+                "enc", &(kk_compute_args){ .out = o8, .in = { o }, .n_in = 1 });
+            kk_gpu_finish(g);
+            px[v] = malloc(4*W*H); kk_tex_download(g, o8, px[v]);
+            kk_tex_destroy(g, &o); kk_tex_destroy(g, &o8);
+        }
+        double md = 0;
+        if (!kante) {   // flach: L3 == bilinear
+            for (int y = 2; y < H-2; y++) for (int x = 4; x < W-4; x++) for (int k = 0; k < 3; k++)
+                md = fmax(md, fabs((double)px[0][4*(y*W+x)+k] - px[1][4*(y*W+x)+k]));
+        } else {        // Kante in y: L3 gegen exakte CPU-Referenz (enc(pqe(rgb)) = rgb)
+            double col[8]; for (int j = 0; j < CH; j++) col[j] = j < CH/2 ? 200 : 800;
+            for (int y = 0; y < H; y++) {
+                double sy = (y + 0.5) * CH / (double)H - 0.5;
+                double Cb = (l3_1d(col, CH, 1, sy) - 512.0) / 896.0, Cr = 0.0, Y = (500 - 64) / 876.0;
+                double rgb[3] = { Y + 1.4746*Cr, Y - 0.16455*Cb - 0.57135*Cr, Y + 1.8814*Cb };
+                for (int x = 4; x < W-4; x++) for (int k = 0; k < 3; k++) {
+                    double t = 255.0 * fmin(fmax(rgb[k], 0.0), 1.0);
+                    md = fmax(md, fabs(px[1][4*(y*W+x)+k] - t));
+                }
+            }
+        }
+        diff[kante] = md; free(px[0]); free(px[1]); kk_tex_destroy(g, &tc);
+    }
+    free(l); free(cf); free(ck); kk_tex_destroy(g, &tl);
+    int schlecht = diff[0] > 1.0 || diff[1] > 1.0;
+    printf("  HDR-Chroma-Lanczos3: flach L3==bilinear max %.0f LSB, Kante gegen CPU-Referenz max %.2f LSB%s\n",
+           diff[0], diff[1], schlecht ? "   FEHLER" : "   ok");
+    return schlecht;
+}
+
 int main(void) { @autoreleasepool {
     setvbuf(stdout, NULL, _IONBF, 0);
     unsetenv("KUCKUCK_CHROMA_LOC"); unsetenv("KUCKUCK_DITHER");
@@ -259,8 +322,9 @@ int main(void) { @autoreleasepool {
     f |= pruefe_dither(g);
     f |= pruefe_chroma(g);
     f |= pruefe_chroma_l3(g);
+    f |= pruefe_hdr_l3(g);
     kk_gpu_destroy(&g);
     printf(f ? "kk_iq_test: FEHLGESCHLAGEN\n"
-             : "kk_iq_test: Schwarzpunkt, Dither, Chroma-Ort und Chroma-Lanczos3 halten  PASS\n");
+             : "kk_iq_test: Schwarzpunkt, Dither, Chroma-Ort und Chroma-Lanczos3 (SDR+HDR) halten  PASS\n");
     return f ? 1 : 0;
 } }

@@ -335,17 +335,23 @@ static const char *DELINU_D_MSL = "#define KK_DITHER 1\n" DELINU_SRC;   // + Dit
 // ===== HDR (P010 -> IPT-Tonemap -> PQ/2020-Output) =====
 // MKPQ: BT.2020-limited-10bit-Decode (Y r16 + Chroma rg16) -> PQ-RGB -> PQ-EOTF ->
 // linear (10000-norm). Aus kk_hdr_render_ab (verifiziert).
-static const char *MKPQ_MSL =
-"#include <metal_stdlib>\nusing namespace metal;\n"
-"static inline float3 pqe(float3 e){ const float m1=0.1593017578125,m2=78.84375,c1=0.8359375,c2=18.8515625,c3=18.6875;\n"
-"  float3 ep=pow(max(e,0.0),float3(1.0/m2)); float3 n=max(ep-c1,0.0); float3 d=c2-c3*ep; return pow(n/d,float3(1.0/m1)); }\n"
-"struct K{float co[2];};\n"
-"kernel void mk(texture2d<float> y [[texture(0)]],texture2d<float> c [[texture(1)]],texture2d<float,access::write> o [[texture(2)]],\n"
-" sampler near [[sampler(0)]], sampler lin [[sampler(1)]], constant K& k [[buffer(0)]], uint2 id [[thread_position_in_grid]]){uint w=o.get_width(),h=o.get_height();if(id.x>=w||id.y>=h)return;\n"
-" float2 uv=(float2(id)+0.5)/float2(w,h); float Yc=y.read(id).r*65535.0/64.0; float2 C=c.sample(lin,uv+float2(k.co[0],k.co[1])/float2(c.get_width(),c.get_height())).rg*65535.0/64.0;\n"
-" float Y=(Yc-64.0)/876.0, Cb=(C.r-512.0)/896.0, Cr=(C.g-512.0)/896.0;\n"
-" float3 rgb=clamp(float3(Y+1.4746*Cr, Y-0.16455*Cb-0.57135*Cr, Y+1.8814*Cb),0.0,1.0);\n"
-" o.write(float4(pqe(rgb),1.0),id);}\n";
+// KK_CHROMA_L3 wie bei DEC: 1 = `c` ist die CHH-Stufe (P010-Chroma horizontal schon
+// per Lanczos3 auf Lumabreite), hier nur die 6 vertikalen Taps. CHH arbeitet auf dem
+// RG16Unorm-Wert, die ×65535/64-Skalierung auf 10-bit-Codes bleibt danach dieselbe.
+#define MKPQ_SRC \
+"#include <metal_stdlib>\nusing namespace metal;\n" \
+"static inline float3 pqe(float3 e){ const float m1=0.1593017578125,m2=78.84375,c1=0.8359375,c2=18.8515625,c3=18.6875;\n" \
+"  float3 ep=pow(max(e,0.0),float3(1.0/m2)); float3 n=max(ep-c1,0.0); float3 d=c2-c3*ep; return pow(n/d,float3(1.0/m1)); }\n" \
+"struct K{float co[2];};\n" \
+KK_CHROMA_FN \
+"kernel void mk(texture2d<float> y [[texture(0)]],texture2d<float> c [[texture(1)]],texture2d<float,access::write> o [[texture(2)]],\n" \
+" sampler near [[sampler(0)]], sampler lin [[sampler(1)]], constant K& k [[buffer(0)]], uint2 id [[thread_position_in_grid]]){uint w=o.get_width(),h=o.get_height();if(id.x>=w||id.y>=h)return;\n" \
+" float Yc=y.read(id).r*65535.0/64.0; float2 C=kk_chroma(c,lin,id,w,h,k.co[0],k.co[1])*65535.0/64.0;\n" \
+" float Y=(Yc-64.0)/876.0, Cb=(C.r-512.0)/896.0, Cr=(C.g-512.0)/896.0;\n" \
+" float3 rgb=clamp(float3(Y+1.4746*Cr, Y-0.16455*Cb-0.57135*Cr, Y+1.8814*Cb),0.0,1.0);\n" \
+" o.write(float4(pqe(rgb),1.0),id);}\n"
+static const char *MKPQ_MSL    = "#define KK_CHROMA_L3 0\n" MKPQ_SRC;
+static const char *MKPQ_L3_MSL = "#define KK_CHROMA_L3 1\n" MKPQ_SRC;   // c = CHH-Stufe
 // CMHDR: IPT-color_map -> PQ/2020-Output (statt sRGB). Tone-Map I via LUT + Chroma-Hull;
 // 3D-Gamut-LUT weggelassen (HDR->HDR, 2020->2020 = in-gamut; Hull+Clip). lms2rgb=2020,
 // KEIN ×10000/SDRW (PQ-absolut), pq_oetf-Output. IPT-Machinerie aus kk_colormap_ab (verifiziert).
@@ -479,6 +485,7 @@ static bool kk_dither_an(void) {
 // Die horizontale Stufe (Ausgabebreite × Chroma-Höhe) wird je Ziel gecacht; NULL =
 // Allokation gescheitert -> bilinear.
 static kk_tex *c_chh = NULL, *c_chh2 = NULL;   // DEC/DECLIN-Breite bzw. ArtCNN-2×-Breite
+static kk_tex *h_chh = NULL;                   // HDR (MKPQ), eigener Cache (s. kk_gpu_render_hdr)
 static bool kk_chroma_l3_an(bool hdLight) {
     const char *e = getenv("KUCKUCK_CHROMA_UP");
     if (e && e[0] == 'b') return false;
@@ -800,8 +807,13 @@ bool kk_gpu_render_hdr(void *metal_device, void *cv_pixbuf, void *target_texture
     kk_gpu_sdr_release(g); kk_gpu_anime4k_release(g); kk_gpu_artcnn_release(g);
 
     struct { float co[2]; } K; kk_chroma_offset(pb, K.co);
-    kk_compute_args mk = { .out=h_pq, .in={luma,chroma}, .n_in=2, .linear={false,true}, .uniforms=&K, .uniforms_size=sizeof K };
-    kk_gpu_compute(g, MKPQ_MSL, "mk", &mk);                           // P010 -> linear 2020 (10000-norm)
+    // Chroma-Lanczos3 (renderpl.75): HDR-Quellen liegen ab 1080p immer im Sparpfad,
+    // der Renderer-Default nimmt es hier also nie — nur auf App-Vorgabe
+    // (KUCKUCK_CHROMA_UP=lanczos). Eigener Cache h_chh: der SDR-Cache c_chh wird beim
+    // HDR-Rendern freigegeben und würde sonst jedes Bild neu angelegt.
+    kk_tex *hchh = kk_chroma_l3_an(true) ? kk_chroma_h(g, chroma, &h_chh, W, K.co[0]) : NULL;
+    kk_compute_args mk = { .out=h_pq, .in={luma, hchh ? hchh : chroma}, .n_in=2, .linear={false,true}, .uniforms=&K, .uniforms_size=sizeof K };
+    kk_gpu_compute(g, hchh ? MKPQ_L3_MSL : MKPQ_MSL, "mk", &mk);       // P010 -> linear 2020 (10000-norm)
     // HD-Light auch für HDR (renderpl.69): 1440p-HDR ist am iPhone ein DOWNSCALE
     // (~0,84x) -> die EWA-Box wächst auf ~9x9=81 Taps = gemessen ~33ms avg (2x über
     // dem 60Hz-Budget, jeder 2. Frame gedroppt). Separabler band-limitierter Lanczos
@@ -840,6 +852,7 @@ static void kk_gpu_sdr_release(kk_gpu *g) {
 // HDR-Pfad-Caches. Reset h_W → lazy Re-Alloc bei nächstem HDR-Frame.
 static void kk_gpu_hdr_release(kk_gpu *g) {
     kk_tex_destroy(g,&h_pq); kk_tex_destroy(g,&h_ewa); kk_tex_destroy(g,&h_out); kk_tex_destroy(g,&h_tmpx);
+    kk_tex_destroy(g,&h_chh);
     h_W = h_H = h_OW = h_OH = 0;
 }
 // Alle kk_gpu-Caches freigeben (Teardown / Player-Close): SDR + HDR + beide CNN. g_kk bleibt.
@@ -877,6 +890,7 @@ void kk_gpu_prewarm(void *metal_device) {
     kk_gpu_compile(g, CAS_D_MSL,    "cas");
     kk_gpu_compile(g, EWA_MSL,    "ewa");
     kk_gpu_compile(g, MKPQ_MSL,   "mk");
+    kk_gpu_compile(g, MKPQ_L3_MSL, "mk");
     kk_gpu_compile(g, CMHDR_MSL,  "cmh");
 }
 
