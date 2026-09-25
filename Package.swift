@@ -40,8 +40,10 @@ let package = Package(
             // Pass-Zeitmessung, die seit .70 im Branch lag, aber nie released war.
             // renderpl.73 = Bildqualität: Schwarzpunkt, Chroma-Ort (left), Dither.
             // renderpl.74 = Chroma per Lanczos3 (separabel, CHH-Vorpass; App gibt per Env vor).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.74/Libkkrender.xcframework.zip",
-            checksum: "0d9448b58153561c2e2cdb87b03a4e0fbd8055f214c3c965d8ff16bbb490976a"
+            // renderpl.75 = Render-Sperre/Kontextzähler, H.273-Codepunkte, HD-Light 1:1 +
+            // sRGB im letzten Pass, HDR-Peak aus MaxRGB (kk_gpu-Sweep 2026-09-25).
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.75/Libkkrender.xcframework.zip",
+            checksum: "edaf184edb708326c0c446f4e8fdebbacc24584c67e6bf34792e1e5f6bdde392"
         ),
     ]
 )
