@@ -92,9 +92,16 @@ KK_CHROMA_FN \
 "  float3 rgb=float3(p.d[0]*v.x+p.d[1]*v.y+p.d[2]*v.z, p.d[3]*v.x+p.d[4]*v.y+p.d[5]*v.z, p.d[6]*v.x+p.d[7]*v.y+p.d[8]*v.z)+float3(p.d[9],p.d[10],p.d[11]);\n" \
 "  float3 c=max(rgb,0.0); float3 vl=p.a*pow(c+p.b,float3(2.4))-p.o;\n" \
 "  float3 o=float3(p.m[0]*vl.x+p.m[1]*vl.y+p.m[2]*vl.z, p.m[3]*vl.x+p.m[4]*vl.y+p.m[5]*vl.z, p.m[6]*vl.x+p.m[7]*vl.y+p.m[8]*vl.z);\n" \
+"#if KK_SRGB_OUT\n" \
+"  o=clamp(o,0.0,1.0); o=select(1.055*pow(o,float3(1.0/2.4))-0.055, 12.92*o, o<=float3(0.0031308));\n" \
+"#endif\n" \
 "  dst.write(float4(o,1.0),id);}\n"
-static const char *DECLIN_MSL    = "#define KK_CHROMA_L3 0\n" DECLIN_SRC;
-static const char *DECLIN_L3_MSL = "#define KK_CHROMA_L3 1\n" DECLIN_SRC;   // chroma = CHH-Stufe
+static const char *DECLIN_MSL    = "#define KK_CHROMA_L3 0\n#define KK_SRGB_OUT 0\n" DECLIN_SRC;
+static const char *DECLIN_L3_MSL = "#define KK_CHROMA_L3 1\n#define KK_SRGB_OUT 0\n" DECLIN_SRC;   // chroma = CHH-Stufe
+// Mit sRGB-Kodierung am Ende (HD-Light 1:1, s. unten): Dekodieren + Linearisieren +
+// Kodieren in EINEM Pass, danach nur noch CAS.
+static const char *DECLIN_SRGB_MSL    = "#define KK_CHROMA_L3 0\n#define KK_SRGB_OUT 1\n" DECLIN_SRC;
+static const char *DECLIN_L3_SRGB_MSL = "#define KK_CHROMA_L3 1\n#define KK_SRGB_OUT 1\n" DECLIN_SRC;
 // DEBLOCK: separabler 1D-Bilateral (±3, Luma-Range-gewichtet) auf der encodeten
 // Quelle, Port von Resources/deblock_cas.glsl (App). Fuer SD-Privatsender am
 // Kabel-Tuner (VOX/RTL ~2,4-2,9 Mbit/s): die 16-px-DCT-Kacheln sind in die Pixel
@@ -165,24 +172,31 @@ static const char *LIN_MSL =
 "  float3 c=max(src.read(id).rgb,0.0); float3 v=l.a*pow(c+l.b,float3(2.4))-l.o;\n"
 "  float3 o=float3(l.m[0]*v.x+l.m[1]*v.y+l.m[2]*v.z, l.m[3]*v.x+l.m[4]*v.y+l.m[5]*v.z, l.m[6]*v.x+l.m[7]*v.y+l.m[8]*v.z);\n"
 "  dst.write(float4(o,1.0),id);}\n";
-static const char *LANCZOS_MSL =
-"#include <metal_stdlib>\nusing namespace metal;\nstruct P{float scale;uint axis;float lut[64];};\n"
 // Lanczos3-Gewichte als 64er-LUT (host-seitig gebacken, s. kk_lanczos_params) statt
 // 2x sin() pro Tap — gleiche LUT-Dichte/-Interpolation wie der verifizierte EWA-Pfad;
 // lut[63]=l3(3.0)=0, min() clampt Distanzen >=3 exakt auf 0.
-"static inline float l3lut(constant P& p, float x){ x=min(abs(x),3.0)*(63.0/3.0);\n"
-"  int i0=int(x); return mix(p.lut[i0], p.lut[min(i0+1,63)], x-float(i0)); }\n"
-"kernel void lanczos(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
-"  constant P& p [[buffer(0)]], uint2 id [[thread_position_in_grid]]){ uint W=dst.get_width(),H=dst.get_height(); if(id.x>=W||id.y>=H)return;\n"
-"  int sw=int(src.get_width()),sh=int(src.get_height()); float coord=(p.axis==0u?float(id.x):float(id.y));\n"
 // Band-limitiert für Downscale (HDR 1440p -> Display ~0,84x): Filter in den Quellraum
 // gestreckt (sf<1, Fenster 3/sf). Upscale (sf=1): Gewichte identisch zu vorher — die
 // alten Rand-Taps -3/+4 hatten exakt Gewicht 0 (l3>=3 -> 0), R=3 lässt sie nur weg.
-"  float sf=min(p.scale,1.0); int R=int(ceil(3.0/sf));\n"
-"  float s=(coord+0.5)/p.scale-0.5; int base=int(floor(s)); float4 acc=float4(0.0); float wsum=0.0;\n"
-"  for(int t=1-R;t<=R;t++){ int tap=base+t; float w=l3lut(p,(s-float(tap))*sf);\n"
-"    int cx=(p.axis==0u)?clamp(tap,0,sw-1):int(id.x); int cy=(p.axis==1u)?clamp(tap,0,sh-1):int(id.y);\n"
-"    acc+=w*src.read(uint2(cx,cy)); wsum+=w; } dst.write(acc/wsum,id);}\n";
+#define LANCZOS_SRC \
+"#include <metal_stdlib>\nusing namespace metal;\nstruct P{float scale;uint axis;float lut[64];};\n" \
+"static inline float l3lut(constant P& p, float x){ x=min(abs(x),3.0)*(63.0/3.0);\n" \
+"  int i0=int(x); return mix(p.lut[i0], p.lut[min(i0+1,63)], x-float(i0)); }\n" \
+"kernel void lanczos(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n" \
+"  constant P& p [[buffer(0)]], uint2 id [[thread_position_in_grid]]){ uint W=dst.get_width(),H=dst.get_height(); if(id.x>=W||id.y>=H)return;\n" \
+"  int sw=int(src.get_width()),sh=int(src.get_height()); float coord=(p.axis==0u?float(id.x):float(id.y));\n" \
+"  float sf=min(p.scale,1.0); int R=int(ceil(3.0/sf));\n" \
+"  float s=(coord+0.5)/p.scale-0.5; int base=int(floor(s)); float4 acc=float4(0.0); float wsum=0.0;\n" \
+"  for(int t=1-R;t<=R;t++){ int tap=base+t; float w=l3lut(p,(s-float(tap))*sf);\n" \
+"    int cx=(p.axis==0u)?clamp(tap,0,sw-1):int(id.x); int cy=(p.axis==1u)?clamp(tap,0,sh-1):int(id.y);\n" \
+"    acc+=w*src.read(uint2(cx,cy)); wsum+=w; } float4 o=acc/wsum;\n" \
+"#if KK_SRGB_OUT\n" \
+"  float3 c=clamp(o.rgb,0.0,1.0); o=float4(select(1.055*pow(c,float3(1.0/2.4))-0.055, 12.92*c, c<=float3(0.0031308)),1.0);\n" \
+"#endif\n" \
+"  dst.write(o,id);}\n"
+static const char *LANCZOS_MSL      = "#define KK_SRGB_OUT 0\n" LANCZOS_SRC;
+// Letzter Scaler-Pass schreibt gleich sRGB-kodiert (HD-Light vor CAS, s. unten).
+static const char *LANCZOS_SRGB_MSL = "#define KK_SRGB_OUT 1\n" LANCZOS_SRC;
 // Host-Seite: Lanczos-Uniforms inkl. gebackener l3-LUT (einmal berechnet, dann memcpy).
 typedef struct { float scale; uint32_t axis; float lut[64]; } kk_lanczos_p;
 static kk_lanczos_p kk_lanczos_params(float scale, uint32_t axis) {
@@ -547,16 +561,19 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
         c_tmpx = kk_tex_create(g, OW, H,  KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
         c_liny = kk_tex_create(g, OW, OH, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
         c_out  = kk_tex_create(g, OW, OH, KK_FMT_BGRA8,   KK_TEX_STORAGE, NULL);
+        // CNN-Zwischenstufen (2×-Größen) nur noch freigeben — angelegt werden sie erst
+        // im CNN-Zweig (kk_cnn_zwischen). Vorher entstanden sie bei JEDEM Größenwechsel
+        // (ABR, Drehung), auch ohne Anime4K/ArtCNN: ~120–280 MB Spitze auf A16.
         kk_tex_destroy(g,&c_alin); kk_tex_destroy(g,&c_atmpx);
-        c_alin  = kk_tex_create(g, W*2, H*2, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL); // linearisierter Anime4K-2×
-        c_atmpx = kk_tex_create(g, OW,  H*2, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL); // X-skaliert (2H)
-        kk_tex_destroy(g,&c_srgb); kk_tex_destroy(g,&c_a2rgb);
+        kk_tex_destroy(g,&c_a2rgb); kk_tex_destroy(g,&c_adeb);
+        kk_tex_destroy(g,&c_srgb);
         c_srgb  = kk_tex_create(g, OW, OH, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);   // CAS-Input
-        c_a2rgb = kk_tex_create(g, W*2, H*2, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL); // ArtCNN-2×-RGB
-        kk_tex_destroy(g,&c_adeb);
-        c_adeb  = kk_tex_create(g, W*2, H*2, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL); // ArtCNN-Deband-2×
         kk_tex_destroy(g,&c_dbl);   // lazy im Deblock-Block
-        c_W=W; c_H=H; c_OW=OW; c_OH=OH;
+        // Maße nur bei vollständigem Erfolg merken: sonst hielt ein einziger Alloc-Fehler
+        // (Speicherdruck) den Renderer bis zum nächsten Größenwechsel fest — jedes Bild
+        // brach ab, das Bild stand (Selbstsperre). Mit 0 versucht das nächste Bild neu.
+        bool ok = c_dec && c_deb && c_lin && c_tmpx && c_liny && c_out && c_srgb;
+        if (ok) { c_W=W; c_H=H; c_OW=OW; c_OH=OH; } else { c_W=c_H=c_OW=c_OH=0; }
     }
     if (!c_dec || !c_deb || !c_lin || !c_tmpx || !c_liny || !c_out) {
         kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt); return false;
@@ -630,7 +647,20 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
     // Anime4K-Cartoon-Upscaler (gated via KUCKUCK_GLSL_SHADER~anime4k). Eigener Post-Scale
     // (2×-Output -> Ziel). Bei Fehler (Weights/Alloc) Fallback auf den Lanczos-Pfad unten.
     const char *glsl = getenv("KUCKUCK_GLSL_SHADER");
-    if (glsl && strcasestr(glsl, "anime4k") && c_alin && c_atmpx) {
+    bool willA4k = glsl && strcasestr(glsl, "anime4k"), willAc = glsl && strcasestr(glsl, "artcnn");
+    if (willA4k || willAc) {   // lazy (s. Größenwechsel oben); NULL → Fallback auf den Lanczos-Pfad
+        if (!c_alin)  c_alin  = kk_tex_create(g, W*2, H*2, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
+        if (!c_atmpx) c_atmpx = kk_tex_create(g, OW,  H*2, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
+    }
+    if (willAc) {
+        if (!c_a2rgb) c_a2rgb = kk_tex_create(g, W*2, H*2, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
+        if (!c_adeb)  c_adeb  = kk_tex_create(g, W*2, H*2, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
+    }
+    if (!willA4k && !willAc) {   // Pfad ohne CNN: 2×-Stufen nicht resident halten
+        kk_tex_destroy(g,&c_alin); kk_tex_destroy(g,&c_atmpx);
+        kk_tex_destroy(g,&c_a2rgb); kk_tex_destroy(g,&c_adeb);
+    }
+    if (willA4k && c_alin && c_atmpx) {
         const char *res = getenv("KUCKUCK_KK_CAPTURE_SHADERS");
         char wp[1200]; snprintf(wp, sizeof wp, "%s/anime4k_a_m.weights", res ? res : ".");
         kk_tex *a = kk_gpu_anime4k(g, src_lin, wp);   // 2W×2H encodete RGB
@@ -696,40 +726,60 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
     kk_tex *dout = cas ? c_srgb : fin;
 
     if (hdLight && c_tmpx) {
-        // HD: DECLIN (fusioniert) -> Lanczos X -> Lanczos Y -> Delin[+CAS fusioniert].
+        // HD-Light (renderpl.75). Zwei Hebel aus dem kk_gpu-Sweep 2026-09-25:
+        //  P1: Skaliert eine Achse nicht (VT-SR mit Ziel-Deckel: 1280×704 → 1280×704),
+        //      entfällt ihr Lanczos-Pass — der lief bisher als reine Identität
+        //      (gemessen 2 × 0,68 ms bei ZDF live).
+        //  P2: Die sRGB-Kodierung läuft im LETZTEN Pass vor CAS (3 pow/Pixel) statt
+        //      in DELINCAS pro CAS-Abtastpunkt (27 pow/Pixel, teuerster Pass). Danach
+        //      reines CAS. Rechnung = die frühere NO_FUSION-Kette (DELIN → CAS),
+        //      nur ohne deren Extra-Pass.
+        // A/B am Gerät: KUCKUCK_KK_ALT=1 fährt die alte Kette (beide Scaler + DELINCAS).
+        const char *alt = getenv("KUCKUCK_KK_ALT");
+        bool altKette = alt && alt[0] == '1';
+        bool sx = altKette || OW != W, sy = altKette || OH != H;
+        bool encFrueh = cas && !altKette;   // sRGB im letzten Pass vor CAS
+        bool declinSrgb = encFrueh && fusedDec && !sx && !sy;
+        kk_tex *cur;
         if (fusedDec) {
             struct { float d[12]; float a, b; float m[9]; float o; float co[2]; } DL2;
             memcpy(DL2.d, D.m, sizeof DL2.d); DL2.a = L.a; DL2.b = L.b; memcpy(DL2.m, L.m, sizeof DL2.m);
             DL2.o = L.o; DL2.co[0] = D.co[0]; DL2.co[1] = D.co[1];
             kk_tex *chh = l3 ? kk_chroma_h(g, chroma, &c_chh, W, D.co[0]) : NULL;
-            kk_compute_args la0 = { .out=c_lin, .in={luma, chh ? chh : chroma}, .n_in=2, .linear={false,true}, .uniforms=&DL2, .uniforms_size=sizeof DL2 };
-            kk_gpu_compute(g, chh ? DECLIN_L3_MSL : DECLIN_MSL, "declin", &la0);
+            cur = declinSrgb ? c_srgb : c_lin;
+            kk_compute_args la0 = { .out=cur, .in={luma, chh ? chh : chroma}, .n_in=2, .linear={false,true}, .uniforms=&DL2, .uniforms_size=sizeof DL2 };
+            const char *k = chh ? (declinSrgb ? DECLIN_L3_SRGB_MSL : DECLIN_L3_MSL)
+                                : (declinSrgb ? DECLIN_SRGB_MSL : DECLIN_MSL);
+            kk_gpu_compute(g, k, "declin", &la0);
         } else {   // CNN-Gate an, aber CNN-Pfad oben gescheitert -> c_dec existiert
             kk_compute_args la0 = { .out=c_lin, .in={c_dec}, .n_in=1, .uniforms=&L, .uniforms_size=sizeof L };
             kk_gpu_compute(g, LIN_MSL, "lin", &la0);
+            cur = c_lin;
         }
-        kk_lanczos_p px = kk_lanczos_params((float)OW/W, 0), py = kk_lanczos_params((float)OH/H, 1);
-        kk_compute_args xa = { .out=c_tmpx, .in={c_lin}, .n_in=1, .uniforms=&px, .uniforms_size=sizeof px };
-        kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &xa);
-        kk_compute_args ya = { .out=c_liny, .in={c_tmpx}, .n_in=1, .uniforms=&py, .uniforms_size=sizeof py };
-        kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &ya);
-        // Delin+CAS in EINEM Pass direkt -> fin (c_srgb-Roundtrip entfällt).
-        //
-        // ⚠️ KUCKUCK_NO_FUSION=1 fährt stattdessen DELIN -> CAS getrennt, mit
-        // c_srgb als Zwischenstufe (der Zustand vor renderpl.70). Nur zum MESSEN:
-        // die Fusion wurde 2026-07 am Mac verglichen (dort 9 % besser) und nie auf
-        // einem Gerät. Die Pass-Zeitmessung vom 2026-09-02 legt nahe, dass der
-        // Tausch „ALU gegen Bandbreite" dort anders ausgeht — delincas war mit
-        // 2,567 ms der teuerste Pass, weil es je Pixel NEUN pow() rechnet (sRGB
-        // pro CAS-Abtastpunkt) statt einem.
-        const char *nofus = getenv("KUCKUCK_NO_FUSION");
-        if (cas && nofus && nofus[0] == '1') {
-            kk_compute_args ld = { .out=c_srgb, .in={c_liny}, .n_in=1 };
-            kk_gpu_compute(g, DELIN_MSL, "delin", &ld);
+        if (sx) {
+            kk_lanczos_p px = kk_lanczos_params((float)OW/W, 0);
+            bool letzter = encFrueh && !sy;          // X ist der letzte Scaler → gleich kodieren
+            kk_tex *ziel = letzter ? c_srgb : c_tmpx;   // !sy ⇒ H == OH, c_srgb passt
+            kk_compute_args xa = { .out=ziel, .in={cur}, .n_in=1, .uniforms=&px, .uniforms_size=sizeof px };
+            kk_gpu_compute(g, letzter ? LANCZOS_SRGB_MSL : LANCZOS_MSL, "lanczos", &xa);
+            cur = ziel;
+        }
+        if (sy) {
+            kk_lanczos_p py = kk_lanczos_params((float)OH/H, 1);
+            kk_tex *ziel = encFrueh ? c_srgb : c_liny;
+            kk_compute_args ya = { .out=ziel, .in={cur}, .n_in=1, .uniforms=&py, .uniforms_size=sizeof py };
+            kk_gpu_compute(g, encFrueh ? LANCZOS_SRGB_MSL : LANCZOS_MSL, "lanczos", &ya);
+            cur = ziel;
+        }
+        if (encFrueh) {
+            if (cur != c_srgb) {   // 1:1 ohne DECLIN-Fusion (CNN-/Deblock-Rückfall): einmal kodieren
+                kk_compute_args ld = { .out=c_srgb, .in={cur}, .n_in=1 };
+                kk_gpu_compute(g, DELIN_MSL, "delin", &ld);
+            }
             kk_compute_args lc = { .out=fin, .in={c_srgb}, .n_in=1 };
             kk_gpu_compute(g, dith ? CAS_D_MSL : CAS_MSL, "cas", &lc);
         } else {
-            kk_compute_args la = { .out=fin, .in={c_liny}, .n_in=1 };
+            kk_compute_args la = { .out=fin, .in={cur}, .n_in=1 };
             const char *k = cas ? (dith ? DELINCAS_D_MSL : DELINCAS_MSL) : (dith ? DELIN_D_MSL : DELIN_MSL);
             kk_gpu_compute(g, k, cas ? "delincas" : "delin", &la);
         }
@@ -798,7 +848,8 @@ bool kk_gpu_render_hdr(void *metal_device, void *cv_pixbuf, void *target_texture
         h_ewa = kk_tex_create(g, OW, OH, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
         h_out = kk_tex_create(g, OW, OH, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL); // PQ-Float
         h_tmpx = kk_tex_create(g, OW, H, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL); // HD-Light Lanczos-X
-        h_W=W; h_H=H; h_OW=OW; h_OH=OH;
+        // Maße nur bei Erfolg merken (s. SDR: sonst Selbstsperre nach einem Alloc-Fehler).
+        if (h_pq && h_ewa && h_out && h_tmpx) { h_W=W; h_H=H; h_OW=OW; h_OH=OH; } else { h_W=h_H=h_OW=h_OH=0; }
     }
     if (!h_pq || !h_ewa || !h_out) {
         kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt); return false;
@@ -845,7 +896,7 @@ static void kk_gpu_sdr_release(kk_gpu *g) {
     kk_tex_destroy(g,&c_dec); kk_tex_destroy(g,&c_deb); kk_tex_destroy(g,&c_lin);
     kk_tex_destroy(g,&c_tmpx); kk_tex_destroy(g,&c_liny); kk_tex_destroy(g,&c_out);
     kk_tex_destroy(g,&c_alin); kk_tex_destroy(g,&c_atmpx); kk_tex_destroy(g,&c_srgb);
-    kk_tex_destroy(g,&c_a2rgb); kk_tex_destroy(g,&c_dbl);
+    kk_tex_destroy(g,&c_a2rgb); kk_tex_destroy(g,&c_adeb); kk_tex_destroy(g,&c_dbl);
     kk_tex_destroy(g,&c_chh); kk_tex_destroy(g,&c_chh2);
     c_W = c_H = c_OW = c_OH = 0;
 }
@@ -860,6 +911,7 @@ void kk_gpu_release_all(void) {
     if (!g_kk) return;
     kk_gpu_sdr_release(g_kk); kk_gpu_hdr_release(g_kk);
     kk_gpu_anime4k_release(g_kk); kk_gpu_artcnn_release(g_kk);
+    kk_gpu_cache_flush(g_kk);   // g_dbl NICHT: gehört zur Deblock-Sperre (srQueue)
 }
 
 // PSO-Prewarm (gegen Erst-Frame-Hitch): alle statischen Kernel einmal kompilieren
@@ -873,6 +925,9 @@ void kk_gpu_prewarm(void *metal_device) {
     kk_gpu_compile(g, DEC_MSL,    "dec");
     kk_gpu_compile(g, DECLIN_MSL, "declin");
     kk_gpu_compile(g, DECLIN_L3_MSL, "declin");
+    kk_gpu_compile(g, DECLIN_SRGB_MSL, "declin");
+    kk_gpu_compile(g, DECLIN_L3_SRGB_MSL, "declin");
+    kk_gpu_compile(g, LANCZOS_SRGB_MSL, "lanczos");
     kk_gpu_compile(g, DEC_L3_MSL, "dec");
     kk_gpu_compile(g, CHH_MSL, "chh");
     kk_gpu_compile(g, DELINCAS_MSL, "delincas");
@@ -920,8 +975,11 @@ bool kk_gpu_deblock_nv12(void *metal_device, void *src_pb, void *dst_pb) {
     kk_tex *sc = kk_tex_wrap_pixbuf(g, s, 1, KK_FMT_RG8);
     if (!sy && ssurf) sy = kk_tex_wrap_iosurface(g, (void*) ssurf, 0, KK_FMT_R8,  KK_TEX_SAMPLE);
     if (!sc && ssurf) sc = kk_tex_wrap_iosurface(g, (void*) ssurf, 1, KK_FMT_RG8, KK_TEX_SAMPLE);
-    kk_tex *dy = kk_tex_wrap_iosurface(g, (void*) dsurf, 0, KK_FMT_R8,  KK_TEX_STORAGE | KK_TEX_SAMPLE);
-    kk_tex *dc = kk_tex_wrap_iosurface(g, (void*) dsurf, 1, KK_FMT_RG8, KK_TEX_STORAGE | KK_TEX_SAMPLE);
+    // Ziel über den Texture-Cache (beschreibbar) statt pro Bild frisch zu wrappen.
+    kk_tex *dy = kk_tex_wrap_pixbuf_rw(g, d, 0, KK_FMT_R8);
+    kk_tex *dc = kk_tex_wrap_pixbuf_rw(g, d, 1, KK_FMT_RG8);
+    if (!dy) dy = kk_tex_wrap_iosurface(g, (void*) dsurf, 0, KK_FMT_R8,  KK_TEX_STORAGE | KK_TEX_SAMPLE);
+    if (!dc) dc = kk_tex_wrap_iosurface(g, (void*) dsurf, 1, KK_FMT_RG8, KK_TEX_STORAGE | KK_TEX_SAMPLE);
     bool ok = false;
     if (sy && sc && dy && dc) {
         if (!c_dblY || c_dblW != W || c_dblH != H) {

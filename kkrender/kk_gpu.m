@@ -320,6 +320,40 @@ kk_tex *kk_tex_wrap_pixbuf(kk_gpu *g, void *cv_pixbuf, int plane, kk_fmt fmt) {
     }
 }
 
+/// Wie kk_tex_wrap_pixbuf, aber beschreibbar (ShaderRead|ShaderWrite) — für Ziele aus
+/// recycelten Pools (Deblock vor VT-SR). Vorher entstand dort pro Bild eine frische
+/// IOSurface-Textur (`newTextureWithDescriptor:iosurface:`, gemessen 0,4–1 ms auf einer
+/// recycelten Surface); der Cache liefert für dieselbe Surface dieselbe Textur.
+kk_tex *kk_tex_wrap_pixbuf_rw(kk_gpu *g, void *cv_pixbuf, int plane, kk_fmt fmt) {
+    @autoreleasepool {
+        CVPixelBufferRef pb = (CVPixelBufferRef) cv_pixbuf;
+        if (!pb || !g->texCache) return NULL;
+        size_t w = CVPixelBufferGetWidthOfPlane(pb, plane);
+        size_t h = CVPixelBufferGetHeightOfPlane(pb, plane);
+        NSDictionary *attr = @{ (__bridge NSString *) kCVMetalTextureUsage:
+                                    @(MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite) };
+        CVMetalTextureRef cvref = NULL;
+        CVReturn rc = CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault, g->texCache, pb, (__bridge CFDictionaryRef) attr, mtl_fmt(fmt), w, h, plane, &cvref);
+        if (rc != kCVReturnSuccess || !cvref) return NULL;
+        id<MTLTexture> mt = CVMetalTextureGetTexture(cvref);
+        if (!mt || !(mt.usage & MTLTextureUsageShaderWrite)) { CFRelease(cvref); return NULL; }
+        struct kk_tex *t = calloc(1, sizeof(*t));
+        if (!t) { CFRelease(cvref); return NULL; }
+        t->w = (int) w; t->h = (int) h;
+        t->tex = mt;
+        CFRetain((__bridge CFTypeRef) t->tex);
+        t->cvref = cvref;
+        return t;
+    }
+}
+
+/// Texture-Cache leeren (Einträge alter Decoder-Pools hielten sonst IOSurfaces über
+/// Sitzungen hinweg fest). Nur aufrufen, wenn kein Frame mehr encodet wird.
+void kk_gpu_cache_flush(kk_gpu *g) {
+    if (g && g->texCache) CVMetalTextureCacheFlush(g->texCache, 0);
+}
+
 kk_tex *kk_tex_wrap_mtltexture(kk_gpu *g, void *mtltexture) {
     @autoreleasepool {
         id<MTLTexture> mt = (__bridge id<MTLTexture>) mtltexture;
@@ -407,6 +441,9 @@ bool kk_gpu_compute(kk_gpu *g, const char *msl_source, const char *entry,
     @autoreleasepool {
         id<MTLComputePipelineState> pso = get_pso(g, msl_source, entry);
         if (!pso || !a->out) return false;
+        // NULL-Eingang (Alloc unter Speicherdruck gescheitert) → Pass auslassen statt
+        // `a->in[i]->tex` auf NULL zu lesen (SIGSEGV in den CNN-Ketten auf A16).
+        for (int i = 0; i < a->n_in; i++) if (!a->in[i]) return false;
         id<MTLComputeCommandEncoder> enc = get_enc(g);
         [enc setComputePipelineState:pso];
         // Eingänge: texture(0..n_in-1) + sampler(0)=nearest, sampler(1)=linear.

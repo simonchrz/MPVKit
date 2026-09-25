@@ -64,9 +64,11 @@ kk_tex *kk_gpu_anime4k(kk_gpu *g, kk_tex *in, const char *weights_path) {
         a4kOut=kk_tex_create(g,OW,OH,KK_FMT_RGBA16F,KK_TEX_SAMPLE|KK_TEX_STORAGE,NULL);
         for(int i=0;i<7;i++){cv[i]=kk_tex_create(g,W,H,KK_FMT_RGBA16F,KK_TEX_SAMPLE|KK_TEX_STORAGE,NULL);
                              cv2[i]=kk_tex_create(g,W,H,KK_FMT_RGBA16F,KK_TEX_SAMPLE|KK_TEX_STORAGE,NULL);}
-        cW=W; cH=H;
+        bool ok = s1 && s2 && dering && restored && lastT && a4kOut;
+        for (int i=0;i<7;i++) ok = ok && cv[i] && cv2[i];
+        cW = ok ? W : 0; cH = ok ? H : 0;   // nur bei Erfolg merken (sonst Selbstsperre / NULL-Eingang)
     }
-    if (!a4kOut) return NULL;
+    if (cW == 0) return NULL;
     // Offsets (floats): Restore rgb@0(148), crelu@148+k*292, combine@1900(228);
     //                   Upscale rgb@2128(148), crelu@2276+k*292, combine@4028(228).
     int Rrgb=0,Rcr[6],Rcomb=1900,Urgb=2128,Ucr[6],Ucomb=4028;
@@ -147,9 +149,11 @@ kk_tex *kk_gpu_artcnn(kk_gpu *g, kk_tex *luma, const char *weights_path) {
         for(int i=0;i<6;i++) ac[i]=kk_tex_create(g,IW,IH,KK_FMT_RGBA16F,KK_TEX_SAMPLE|KK_TEX_STORAGE,NULL);
         ac6=kk_tex_create(g,W,H,KK_FMT_RGBA16F,KK_TEX_SAMPLE|KK_TEX_STORAGE,NULL);
         acOut=kk_tex_create(g,IW,IH,KK_FMT_RGBA16F,KK_TEX_SAMPLE|KK_TEX_STORAGE,NULL);
-        acW=W; acH=H;
+        bool ok = ac6 && acOut;
+        for (int i=0;i<6;i++) ok = ok && ac[i];
+        acW = ok ? W : 0; acH = ok ? H : 0;   // nur bei Erfolg merken
     }
-    if (!acOut) return NULL;
+    if (acW == 0) return NULL;
     int OFF[7]={0,160,2480,4800,7120,9440,11760};
     kk_gpu_compute(g,A_K0,"ak0",&(kk_compute_args){.out=ac[0],.in={luma},.n_in=1,.uniforms=g_aw+OFF[0],.uniforms_size=160*4});
     for(int p=1;p<=5;p++) kk_gpu_compute(g,A_K16,"ak16",&(kk_compute_args){.out=ac[p],.in={ac[p-1]},.n_in=1,.uniforms=g_aw+OFF[p],.uniforms_size=2320*4});

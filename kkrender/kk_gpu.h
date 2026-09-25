@@ -57,6 +57,8 @@ kk_tex *kk_tex_wrap_iosurface(kk_gpu *gpu, void *iosurface, int plane,
 // recyclen → Cache-Hit statt newTextureWithDescriptor:iosurface: pro Frame; die
 // CVMetalTextureRef hängt am kk_tex und wird in kk_tex_destroy freigegeben).
 kk_tex *kk_tex_wrap_pixbuf(kk_gpu *gpu, void *cv_pixbuf, int plane, kk_fmt fmt);
+void kk_gpu_cache_flush(kk_gpu *g);
+kk_tex *kk_tex_wrap_pixbuf_rw(kk_gpu *g, void *cv_pixbuf, int plane, kk_fmt fmt);   // beschreibbar (Pool-Ziele)
 kk_tex *kk_tex_wrap_mtltexture(kk_gpu *gpu, void *mtltexture); // existierende MTLTexture (Display-Target, geteiltes Device)
 void    kk_tex_destroy(kk_gpu *gpu, kk_tex **ptex);
 int     kk_tex_w(const kk_tex *t);

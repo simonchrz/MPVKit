@@ -25,7 +25,8 @@ GEMEINSAM=("$ROOT/kk_gpu.m" "$ROOT/kk_gpu_genparams.c" "$ROOT/kk_gpu_cnn.c")
 RAHMEN=(-framework Metal -framework Foundation -framework CoreVideo -framework IOSurface)
 
 alle=(kk_tg_test kk_decode_test kk_iosurface_test kk_scale_test kk_cnn_test
-      kk_fusion_test kk_lut_test kk_ewa_test kk_hdr_test kk_rest_test kk_iq_test)
+      kk_fusion_test kk_lut_test kk_ewa_test kk_hdr_test kk_rest_test kk_iq_test
+      kk_matrix_test)
 tests=("$@"); [ ${#tests[@]} -eq 0 ] && tests=("${alle[@]}")
 
 fehler=0
@@ -33,8 +34,10 @@ for t in "${tests[@]}"; do
   if [ ! -f "$ROOT/$t.m" ]; then printf '%-18s ÜBERSPRUNGEN (fehlt)\n' "$t"; continue; fi
   # ⚠️ -Wall UND Warnungen anzeigen: ein weggefiltertes `warning:` hat beim Bau
   # dieser Prüfstände einen Doppelzeiger-Fehler verdeckt, der als Absturz endete.
-  if ! "$CLANG" -fobjc-arc -O1 -Wall -isysroot "$SDK" -I"$ROOT" \
-        "$ROOT/$t.m" "${GEMEINSAM[@]}" "${RAHMEN[@]}" -o "$TMP/$t" 2>"$TMP/$t.build"; then
+  # kk_matrix_test prüft die Etikett-Auswertung in hybrid_render.c (braucht den Renderer mit).
+  EXTRA=(); [ "$t" = kk_matrix_test ] && EXTRA=("$ROOT/hybrid_render.c" "$ROOT/kk_gpu_render.c")
+  if ! "$CLANG" -fobjc-arc -O1 -Wall -isysroot "$SDK" -I"$ROOT" -I"$ROOT/include" \
+        "$ROOT/$t.m" "${GEMEINSAM[@]}" ${EXTRA[@]+"${EXTRA[@]}"} "${RAHMEN[@]}" -o "$TMP/$t" 2>"$TMP/$t.build"; then
     printf '%-18s BAUT NICHT\n' "$t"; grep -E "error:|warning:" "$TMP/$t.build" | sed 's/^/    /' | head -4
     fehler=$((fehler+1)); continue
   fi

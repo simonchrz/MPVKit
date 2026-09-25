@@ -179,6 +179,78 @@ static int pruefe_delincas(kk_gpu *g) {
     return schlecht;
 }
 
+/// Vergleicht zwei RGBA8-Downloads: max. Abweichung + vorzeichenbehafteter Mittelwert.
+static int vergleiche(const char *name, const unsigned char *a, const unsigned char *b, int px,
+                      double maxErlaubt, double versatzErlaubt) {
+    double maxabs = 0.0, summe = 0.0; int n = 0;
+    for (int i = 0; i < px; i++)
+        for (int k = 0; k < 3; k++) {
+            double fa = a[4*i+k] / 255.0, fb = b[4*i+k] / 255.0;
+            maxabs = fmax(maxabs, fabs(fa - fb)); summe += fa - fb; n++;
+        }
+    double mittel = summe / n;
+    printf("  %-22s maxdiff=%.1f LSB  mittlerer Versatz=%+.3f LSB", name, maxabs*255.0, mittel*255.0);
+    int schlecht = (maxabs > maxErlaubt / 255.0) || (fabs(mittel) > versatzErlaubt / 255.0);
+    printf("%s\n", schlecht ? "   FEHLER" : "   ok");
+    return schlecht;
+}
+
+/// renderpl.75 (HD-Light): die sRGB-Kodierung wandert in den LETZTEN Pass vor CAS.
+/// Behauptung: LANCZOS_SRGB = LANCZOS → DELIN und DECLIN_SRGB = DECLIN → DELIN (bis
+/// auf die RGBA16F-Zwischenquantisierung). Ohne diesen Prüfstand fiele ein Fehler in
+/// der eingebauten Kodierung nur als leichte Helligkeitsverschiebung am Gerät auf.
+static int pruefe_srgb_varianten(kk_gpu *g) {
+    int fehler = 0;
+    // --- 1) Lanczos (X, 2×) mit Kodierung vs. Lanczos → DELIN
+    const int W = 48, H = 24, OW = 96;
+    unsigned char *lin = malloc(4 * W * H);
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) {
+            unsigned char v = (unsigned char)((x * 5 + y * 3) % 256);
+            if (x % 7 == 0) v = 250;                 // Kanten → Lanczos-Überschwinger
+            lin[4*(y*W+x)+0] = v; lin[4*(y*W+x)+1] = (unsigned char)(255 - v);
+            lin[4*(y*W+x)+2] = (unsigned char)(v / 2); lin[4*(y*W+x)+3] = 255;
+        }
+    kk_tex *src = kk_tex_create(g, W, H, KK_FMT_RGBA8, KK_TEX_SAMPLE, lin);
+    kk_lanczos_p px = kk_lanczos_params((float)OW / W, 0);
+    kk_tex *zw = kk_tex_create(g, OW, H, KK_FMT_RGBA16F, KK_TEX_SAMPLE | KK_TEX_STORAGE, NULL);
+    kk_tex *oA = kk_tex_create(g, OW, H, KK_FMT_RGBA8, KK_TEX_STORAGE | KK_TEX_DOWNLOAD, NULL);
+    kk_tex *oB = kk_tex_create(g, OW, H, KK_FMT_RGBA8, KK_TEX_STORAGE | KK_TEX_DOWNLOAD, NULL);
+    kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &(kk_compute_args){ .out = zw, .in = { src }, .n_in = 1, .uniforms = &px, .uniforms_size = sizeof px });
+    kk_gpu_compute(g, DELIN_MSL, "delin", &(kk_compute_args){ .out = oA, .in = { zw }, .n_in = 1 });
+    kk_gpu_compute(g, LANCZOS_SRGB_MSL, "lanczos", &(kk_compute_args){ .out = oB, .in = { src }, .n_in = 1, .uniforms = &px, .uniforms_size = sizeof px });
+    kk_gpu_finish(g);
+    unsigned char *a = malloc(4 * OW * H), *b = malloc(4 * OW * H);
+    kk_tex_download(g, oA, a); kk_tex_download(g, oB, b);
+    fehler |= vergleiche("LANCZOS_SRGB vs L->DELIN", a, b, OW * H, 1.5, 0.2);
+    free(lin); free(a); free(b);
+    kk_tex_destroy(g, &src); kk_tex_destroy(g, &zw); kk_tex_destroy(g, &oA); kk_tex_destroy(g, &oB);
+
+    // --- 2) DECLIN mit Kodierung vs. DECLIN → DELIN (1:1-Pfad)
+    const int DW = 64, DH = 32, CW = DW / 2, CH = DH / 2;
+    unsigned char *luma = malloc(DW * DH), *chroma = malloc(2 * CW * CH);
+    testbild(luma, DW, DH, chroma, CW, CH);
+    kk_tex *tl = kk_tex_create(g, DW, DH, KK_FMT_R8, KK_TEX_SAMPLE, luma);
+    kk_tex *tc = kk_tex_create(g, CW, CH, KK_FMT_RG8, KK_TEX_SAMPLE, chroma);
+    DL_uniform DL = {{ 1.1643f, 0.0f, 1.7927f, 1.1643f, -0.2132f, -0.5329f,
+                       1.1643f, 2.1124f, 0.0f, -0.9729f, 0.3015f, -1.1334f },
+                     0.8704f, 0.0595f, { 1,0,0, 0,1,0, 0,0,1 }, 0.0f, { 0.0f, 0.0f }};
+    kk_tex *zw2 = kk_tex_create(g, DW, DH, KK_FMT_RGBA16F, KK_TEX_SAMPLE | KK_TEX_STORAGE, NULL);
+    kk_tex *dA = kk_tex_create(g, DW, DH, KK_FMT_RGBA8, KK_TEX_STORAGE | KK_TEX_DOWNLOAD, NULL);
+    kk_tex *dB = kk_tex_create(g, DW, DH, KK_FMT_RGBA8, KK_TEX_STORAGE | KK_TEX_DOWNLOAD, NULL);
+    kk_gpu_compute(g, DECLIN_MSL, "declin", &(kk_compute_args){ .out = zw2, .in = { tl, tc }, .n_in = 2, .linear = { false, true }, .uniforms = &DL, .uniforms_size = sizeof DL });
+    kk_gpu_compute(g, DELIN_MSL, "delin", &(kk_compute_args){ .out = dA, .in = { zw2 }, .n_in = 1 });
+    kk_gpu_compute(g, DECLIN_SRGB_MSL, "declin", &(kk_compute_args){ .out = dB, .in = { tl, tc }, .n_in = 2, .linear = { false, true }, .uniforms = &DL, .uniforms_size = sizeof DL });
+    kk_gpu_finish(g);
+    unsigned char *c = malloc(4 * DW * DH), *d = malloc(4 * DW * DH);
+    kk_tex_download(g, dA, c); kk_tex_download(g, dB, d);
+    fehler |= vergleiche("DECLIN_SRGB vs D->DELIN", c, d, DW * DH, 1.5, 0.2);
+    free(luma); free(chroma); free(c); free(d);
+    kk_tex_destroy(g, &tl); kk_tex_destroy(g, &tc); kk_tex_destroy(g, &zw2);
+    kk_tex_destroy(g, &dA); kk_tex_destroy(g, &dB);
+    return fehler;
+}
+
 int main(void) { @autoreleasepool {
     setvbuf(stdout, NULL, _IONBF, 0);
     kk_gpu *g = kk_gpu_create(NULL);
@@ -186,6 +258,7 @@ int main(void) { @autoreleasepool {
 
     int fehler = pruefe_declin(g);
     fehler |= pruefe_delincas(g);
+    fehler |= pruefe_srgb_varianten(g);
 
     kk_gpu_destroy(&g);
     printf(fehler ? "kk_fusion_test: FEHLGESCHLAGEN\n"

@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <math.h>
 
+#include <pthread.h>
 #include <CoreVideo/CoreVideo.h>
 
 #include "render_mtl.h"   // öffentliche kuckuck_hybrid_*-Deklarationen
@@ -31,31 +32,60 @@ extern void kk_hdr_tone(float src_max_nits, float dst_max_nits, float min_nits,
                         float *in_min, float *in_max, float *out_min, float *out_max, float lut[256]);
 extern const float KK_IPT_RGB2LMS_2020[9], KK_IPT_LMS2RGB_2020[9], KK_IPT_LMS2IPT[9], KK_IPT_IPT2LMS[9];
 
+// kk_gpu ist PROZESSWEIT: ein `g_kk` (ein Command-Buffer/Encoder) und alle Zwischen-
+// texturen sind global. Mehrere Kontexte gibt es aber doch — beim Übergang zur nächsten
+// Folge rendert der neue Player schon, während der alte noch abgebaut wird (belegt:
+// `teardown` des alten nach `create ctx` des neuen im hybrid.log). Bis 2026-09-25 gab
+// `destroy` dann die Caches ALLER frei, während der neue sie benutzte (use-after-free),
+// und zwei renderQueues teilten sich unsynchronisiert Encoder und PSO-Cache.
+// Darum: jeder Einstieg in den Render-Kontext unter `g_render_lock`, Freigabe erst beim
+// LETZTEN Kontext. Deblock hat einen eigenen kk_gpu (`g_dbl`) → eigene Sperre, damit
+// Stufe A (srQueue) und Stufe B (renderQueue) desselben Players parallel bleiben.
+static pthread_mutex_t g_render_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_dbl_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_kontexte = 0;
+
 struct hybrid_priv {
+    float smoothPeak;   // geglätteter HDR-Bildpeak — PRO Kontext (vorher static: neues
+    unsigned hdrFrame;  // Video startete mit dem Peak des vorigen)
     void *device;   // app-MTLDevice (id<MTLTexture>-Quelle); an kk_gpu durchgereicht
 };
 
 // CoreVideo-YCbCr-Matrix-Attachment -> kk_sdr_decode_matrix-Index (0=601,1=709,2=240M,3=2020NC).
-// Fehlend = BT.709 (Mediathek-Live-Default). CVBufferGetAttachment = unretained.
+// Über den H.273-CODEPUNKT, nicht per Vergleich mit den benannten Konstanten: SD-
+// Aufnahmen (H.264, matrix_coefficients=5 = BT.470BG) tragen „YCbCrMatrix#5", wofür
+// CoreVideo keine Konstante hat — der Vergleich fiel auf 709 durch (gemessen
+// 2026-09-25, VOX-Aufnahme). Fehlt das Etikett ganz: 709 (Mediathek-Live-Default).
+int hybrid_sysidx_fuer(CFTypeRef m)
+{
+    if (!m || CFGetTypeID(m) != CFStringGetTypeID()) return 1;
+    switch (CVYCbCrMatrixGetIntegerCodePointForString((CFStringRef) m)) {
+        case 5: case 6: return 0;   // BT.470BG (625) / SMPTE 170M (525) = BT.601
+        case 7:         return 2;   // SMPTE 240M
+        case 9: case 10: return 3;  // BT.2020 NCL (CL näherungsweise wie NCL)
+        default:        return 1;   // 1 = BT.709, unbekannt → 709
+    }
+}
 static int hybrid_sysidx(CVPixelBufferRef pb)
 {
-    CFTypeRef m = CVBufferGetAttachment(pb, kCVImageBufferYCbCrMatrixKey, NULL);
-    if (!m) return 1;
-    if (CFEqual(m, kCVImageBufferYCbCrMatrix_ITU_R_601_4))      return 0;
-    if (CFEqual(m, kCVImageBufferYCbCrMatrix_SMPTE_240M_1995))  return 2;
-    if (CFEqual(m, kCVImageBufferYCbCrMatrix_ITU_R_2020))       return 3;
-    return 1;
+    return hybrid_sysidx_fuer(CVBufferGetAttachment(pb, kCVImageBufferYCbCrMatrixKey, NULL));
 }
 
 // CoreVideo-Primaries-Attachment -> kk_primaries_to709-Index (0=601-525,1=601-625,2=2020; -1=709/identity).
+// Ebenfalls über den Codepunkt (5 = BT.470BG/EBU, 6/7 = SMPTE 170M/240M = SMPTE-C).
+int hybrid_primidx_fuer(CFTypeRef pr)
+{
+    if (!pr || CFGetTypeID(pr) != CFStringGetTypeID()) return -1;
+    switch (CVColorPrimariesGetIntegerCodePointForString((CFStringRef) pr)) {
+        case 5:         return 1;   // EBU 3213 (601-625)
+        case 6: case 7: return 0;   // SMPTE-C (601-525)
+        case 9:         return 2;   // BT.2020
+        default:        return -1;  // 1 = BT.709 / unbekannt → Identität
+    }
+}
 static int hybrid_primidx(CVPixelBufferRef pb)
 {
-    CFTypeRef pr = CVBufferGetAttachment(pb, kCVImageBufferColorPrimariesKey, NULL);
-    if (!pr) return -1;
-    if (CFEqual(pr, kCVImageBufferColorPrimaries_EBU_3213)) return 1;  // 601-625
-    if (CFEqual(pr, kCVImageBufferColorPrimaries_SMPTE_C))  return 0;  // 601-525
-    if (CFEqual(pr, kCVImageBufferColorPrimaries_ITU_R_2020)) return 2;
-    return -1;
+    return hybrid_primidx_fuer(CVBufferGetAttachment(pb, kCVImageBufferColorPrimariesKey, NULL));
 }
 
 // Quell-Peak (nits) aus den HDR-Metadaten: Mastering-Display-Max (ST 2086) bevorzugt,
@@ -79,31 +109,45 @@ static float hybrid_src_peak(CVPixelBufferRef pb)
     return 1000.0f;
 }
 
-// Dynamischer Frame-Peak (nits): max-Luma per CPU-Grid-Sample der P010-Luma-Plane
-// (Plane 0, 16-bit, PQ-limited) -> PQ-EOTF -> nits. Grob (~48×48-Grid) aber + EMA-Glättung
-// im Aufrufer = per-Szene-Peak. -1 bei Fehler. Läuft auf der Render-Queue (off-main),
-// VOR dem GPU-Render (kein Concurrency mit dem IOSurface-GPU-Read).
-static float hybrid_frame_peak_nits(CVPixelBufferRef pb)
+// Dynamischer Frame-Peak (nits): per CPU-Raster (96×96) über Luma UND Chroma der P010-
+// Planes → R'G'B' (BT.2020-NCL) → max(R',G',B') → PQ-EOTF → nits.
+// Bis 2026-09-25 nur max-Luma auf 48×48: ein gesättigtes Rot mit 1000 nit hat Y' ≈ 0,2
+// (≈ 6 nit) — die Schätzung lag systematisch zu tief, und das Tonemapping schnitt die
+// Lichter bei der geschätzten Spitze hart ab (Sweep kk_gpu). -1 bei Fehler. Läuft auf
+// der Render-Queue (off-main), VOR dem GPU-Render.
+float hybrid_frame_peak_nits(CVPixelBufferRef pb)
 {
+    if (CVPixelBufferGetPlaneCount(pb) < 2) return -1;
     if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return -1;
     int w = (int) CVPixelBufferGetWidthOfPlane(pb, 0), h = (int) CVPixelBufferGetHeightOfPlane(pb, 0);
-    size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+    int cw = (int) CVPixelBufferGetWidthOfPlane(pb, 1), chh = (int) CVPixelBufferGetHeightOfPlane(pb, 1);
+    size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0), cbpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
     const uint8_t *base = (const uint8_t *) CVPixelBufferGetBaseAddressOfPlane(pb, 0);
-    uint16_t mx = 0;
-    if (base && w > 0 && h > 0) {
-        int sy = h > 48 ? h / 48 : 1, sx = w > 48 ? w / 48 : 1;
+    const uint8_t *cbase = (const uint8_t *) CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+    float mx = -1.0f;   // max R'G'B' (PQ-kodiert, 0..1)
+    if (base && cbase && w > 0 && h > 0 && cw > 0 && chh > 0) {
+        int sy = h > 96 ? h / 96 : 1, sx = w > 96 ? w / 96 : 1;
         for (int y = 0; y < h; y += sy) {
             const uint16_t *row = (const uint16_t *)(base + (size_t) y * bpr);
-            for (int x = 0; x < w; x += sx) { uint16_t v = row[x]; if (v > mx) mx = v; }
+            int cy = y * chh / h; if (cy >= chh) cy = chh - 1;
+            const uint16_t *crow = (const uint16_t *)(cbase + (size_t) cy * cbpr);
+            for (int x = 0; x < w; x += sx) {
+                int cx = x * cw / w; if (cx >= cw) cx = cw - 1;
+                // P010: Werte in den oberen 10 Bit; limited range (Y 64..940, C 64..960).
+                float Y = ((float)(row[x] >> 6) - 64.0f) / 876.0f;
+                float Cb = ((float)(crow[2*cx] >> 6) - 512.0f) / 896.0f;
+                float Cr = ((float)(crow[2*cx+1] >> 6) - 512.0f) / 896.0f;
+                float R = Y + 1.4746f * Cr, G = Y - 0.16455f * Cb - 0.57135f * Cr, B = Y + 1.8814f * Cb;
+                float m = R > G ? R : G; if (B > m) m = B;
+                if (m > mx) mx = m;
+            }
         }
     }
     CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
-    if (mx == 0) return -1;
-    float y10 = (float)(mx >> 6);                         // 16-bit P010 -> 10-bit
-    float ypq = (y10 - 64.0f) / 876.0f;                   // BT.2020-limited (wie MKPQ)
-    if (ypq < 0) ypq = 0; if (ypq > 1) ypq = 1;
+    if (mx <= 0) return -1;
+    if (mx > 1) mx = 1;
     const float m1=0.1593017578125f, m2=78.84375f, c1=0.8359375f, c2=18.8515625f, c3=18.6875f;
-    float ep = powf(ypq, 1.0f/m2); float num = ep - c1; if (num < 0) num = 0; float den = c2 - c3*ep;
+    float ep = powf(mx, 1.0f/m2); float num = ep - c1; if (num < 0) num = 0; float den = c2 - c3*ep;
     return powf(num/den, 1.0f/m1) * 10000.0f;             // PQ-EOTF -> nits
 }
 
@@ -115,6 +159,10 @@ void *kuckuck_hybrid_create(void *mtl_device)
     if (!p)
         return NULL;
     p->device = mtl_device;
+    p->smoothPeak = -1.0f;
+    pthread_mutex_lock(&g_render_lock);
+    g_kontexte++;
+    pthread_mutex_unlock(&g_render_lock);
     return p;
 }
 
@@ -123,10 +171,22 @@ void *kuckuck_hybrid_create(void *mtl_device)
 // fertig gerendert ist (Quell-/Target-Wraps leben intern bis dahin). Rückgabe 0 =
 // angenommen (done kommt GENAU EINMAL, auch bei leerem CB), negativ = nichts encodet
 // (done kommt NICHT).
+static int hybrid_render_locked(struct hybrid_priv *p, void *cv_pixbuf, void *target_texture,
+                                void (*done)(void *ud), void *ud);
+
 int kuckuck_hybrid_render_async(void *ctx, void *cv_pixbuf, void *target_texture,
                                 void (*done)(void *ud), void *ud)
 {
-    struct hybrid_priv *p = ctx;
+    // Encode synchron unter der Sperre; `done` feuert später auf Metals Thread (ohne Sperre).
+    pthread_mutex_lock(&g_render_lock);
+    int rc = hybrid_render_locked(ctx, cv_pixbuf, target_texture, done, ud);
+    pthread_mutex_unlock(&g_render_lock);
+    return rc;
+}
+
+static int hybrid_render_locked(struct hybrid_priv *p, void *cv_pixbuf, void *target_texture,
+                                void (*done)(void *ud), void *ud)
+{
     if (!p || !cv_pixbuf || !target_texture)
         return -1;
     CVPixelBufferRef pb = (CVPixelBufferRef) cv_pixbuf;
@@ -136,20 +196,24 @@ int kuckuck_hybrid_render_async(void *ctx, void *cv_pixbuf, void *target_texture
     if (pfmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
         pfmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange) {
         static kk_hdr_params hp; static float cached_dst = -1.0f, cached_src = -1.0f;
-        static float smoothPeak = -1.0f; static unsigned hdrFrame = 0;
         const char *nits = getenv("KUCKUCK_HDR_TARGET_NITS");
-        float dst_peak = nits ? (float) atof(nits) : 203.0f; if (dst_peak < 1.0f) dst_peak = 203.0f;
+        float dst_peak = nits ? (float) atof(nits) : 203.0f;
+        // `!(x >= 1 && x <= 10000)` fängt auch NaN/inf ab („nan" kam per atof durch → NaN-LUT).
+        if (!(dst_peak >= 1.0f && dst_peak <= 10000.0f)) dst_peak = 203.0f;
         float mastering = hybrid_src_peak(pb);   // Mastering/MaxCLL = Obergrenze (Master nicht überschreitbar)
         // Dynamischer Peak: jeden 4. Frame den echten Frame-Peak messen, EMA-glätten,
         // durch Mastering deckeln → per-Szene-Tonemapping (dunkle Szenen nutzen EDR besser).
-        if ((hdrFrame++ & 3) == 0) {
+        if ((p->hdrFrame++ & 3) == 0) {
             float fp = hybrid_frame_peak_nits(pb);
             if (fp > 0) {
                 if (fp > mastering) fp = mastering;
-                smoothPeak = (smoothPeak < 0) ? fp : smoothPeak + 0.15f * (fp - smoothPeak);
+                // Asymmetrisch: heller schnell übernehmen (sonst ~1,2 s abgeschnittene
+                // Lichter nach einem Schnitt ins Helle), dunkler langsam (kein Pumpen).
+                float k = (fp > p->smoothPeak) ? 0.5f : 0.1f;
+                p->smoothPeak = (p->smoothPeak < 0) ? fp : p->smoothPeak + k * (fp - p->smoothPeak);
             }
         }
-        float src_peak = (smoothPeak > 0) ? smoothPeak : mastering;
+        float src_peak = (p->smoothPeak > 0) ? p->smoothPeak : mastering;
         if (src_peak < 100.0f) src_peak = 100.0f;                 // Floor (nicht über-abdunkeln)
         src_peak = roundf(src_peak / 25.0f) * 25.0f;              // 25-nit-quantisiert → LUT-Regen nur bei echter Änderung
         if (dst_peak != cached_dst || src_peak != cached_src) {
@@ -184,7 +248,10 @@ void kuckuck_hybrid_prewarm(void *ctx)
 {
     extern void kk_gpu_prewarm(void *metal_device);
     struct hybrid_priv *p = ctx;
-    if (p) kk_gpu_prewarm(p->device);
+    if (!p) return;
+    pthread_mutex_lock(&g_render_lock);   // PSO-Cache (NSMutableDictionary) ist nicht threadsicher
+    kk_gpu_prewarm(p->device);
+    pthread_mutex_unlock(&g_render_lock);
 }
 
 int kuckuck_hybrid_deblock_nv12(void *ctx, void *src_pixbuf, void *dst_pixbuf)
@@ -192,12 +259,19 @@ int kuckuck_hybrid_deblock_nv12(void *ctx, void *src_pixbuf, void *dst_pixbuf)
     extern bool kk_gpu_deblock_nv12(void *metal_device, void *src_pb, void *dst_pb);
     struct hybrid_priv *p = ctx;
     if (!p) return -1;
-    return kk_gpu_deblock_nv12(p->device, src_pixbuf, dst_pixbuf) ? 0 : -2;
+    pthread_mutex_lock(&g_dbl_lock);
+    bool ok = kk_gpu_deblock_nv12(p->device, src_pixbuf, dst_pixbuf);
+    pthread_mutex_unlock(&g_dbl_lock);
+    return ok ? 0 : -2;
 }
 
 void kuckuck_hybrid_destroy(void *ctx)
 {
     extern void kk_gpu_release_all(void);
-    kk_gpu_release_all();   // alle kk_gpu-Render-Caches freigeben (Speicher beim Player-Close)
+    if (!ctx) return;
+    pthread_mutex_lock(&g_render_lock);
+    // Caches erst freigeben, wenn KEIN Kontext mehr lebt (s. g_render_lock oben).
+    if (--g_kontexte <= 0) { g_kontexte = 0; kk_gpu_release_all(); }
+    pthread_mutex_unlock(&g_render_lock);
     free(ctx);
 }
