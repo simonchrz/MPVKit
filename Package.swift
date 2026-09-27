@@ -42,8 +42,10 @@ let package = Package(
             // renderpl.74 = Chroma per Lanczos3 (separabel, CHH-Vorpass; App gibt per Env vor).
             // renderpl.75 = Render-Sperre/Kontextzähler, H.273-Codepunkte, HD-Light 1:1 +
             // sRGB im letzten Pass, HDR-Peak aus MaxRGB (kk_gpu-Sweep 2026-09-25).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.75/Libkkrender.xcframework.zip",
-            checksum: "edaf184edb708326c0c446f4e8fdebbacc24584c67e6bf34792e1e5f6bdde392"
+            // renderpl.76 = GPU-Fehler bis zur App (done(ud, ok) — ABI!), Caches pro Kontext,
+            // setenv unter Sperre, Anti-Ringing, Dither-Ränder, HLG (kk_gpu-Sweep 2026-09-27).
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.76/Libkkrender.xcframework.zip",
+            checksum: "8e9fdfab7157823bff7b9d1cf2cc257fb749bffd34c8b9eaa67f789b8aa7330c"
         ),
     ]
 )
