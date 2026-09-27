@@ -91,6 +91,52 @@ static int pruefe_dither(kk_gpu *g) {
     return fehler;
 }
 
+/// 5. DITHER AN DEN RÄNDERN (renderpl.76): reines Schwarz (Y=16 → Code 0) und reines
+///    Weiß (Y=235 → 255) bleiben mit Dither exakt. Vorher warf `saturate` die Hälfte
+///    des Rauschens weg — 12,5 % der Pixel wurden Code 1 bzw. 254 (stehendes Korn in
+///    Balken/Abspann, hob den Schwarzpunkt-Fix teilweise auf).
+static int pruefe_dither_raender(kk_gpu *g) {
+    const int W = 64, H = 64; unsigned char *px = malloc(4*W*H);
+    float a, o; kk_lin_params(&a, &o);
+    grau(g, 16, a, o, DELIN_D_MSL, px, W, H);
+    int schwarz = 0; for (int i = 0; i < W*H; i++) schwarz += px[4*i+1] != 0;
+    grau(g, 235, a, o, DELIN_D_MSL, px, W, H);
+    int weiss = 0; for (int i = 0; i < W*H; i++) weiss += px[4*i+1] != 255;
+    free(px);
+    int schlecht = schwarz != 0 || weiss != 0;
+    printf("  Dither-Raender: Schwarz %d/%d Pixel != 0, Weiss %d/%d != 255%s\n",
+           schwarz, W*H, weiss, W*H, schlecht ? "   FEHLER" : "   ok");
+    return schlecht;
+}
+
+/// 6. ANTI-RINGING (renderpl.76): Lanczos3 im Linearlicht schwang an einer hellen
+///    Kante auf dunklem Grund unter den Grund durch (nachgerechnet: bis Code 0, ein
+///    schwarzer Saum an Untertiteln/Logos). Beim Hochskalieren darf das Ergebnis den
+///    Bereich der beiden nächsten Quellpixel nicht verlassen.
+static int pruefe_ringing(kk_gpu *g) {
+    const int SW = 32, SH = 2, DW = 48;   // 1,5× wie HD → Panel-Größenordnung
+    const unsigned char dunkel = 13, hell = 255;   // ~0,05 linear vs. 1,0
+    unsigned char *in8 = malloc(4*SW*SH);
+    for (int y = 0; y < SH; y++) for (int x = 0; x < SW; x++) {
+        unsigned char v = x < SW/2 ? dunkel : hell; int i = y*SW + x;
+        in8[4*i] = in8[4*i+1] = in8[4*i+2] = v; in8[4*i+3] = 255;
+    }
+    kk_tex *in  = kk_tex_create(g, SW, SH, KK_FMT_RGBA8, KK_TEX_SAMPLE | KK_TEX_DOWNLOAD, in8);
+    kk_tex *out = kk_tex_create(g, DW, SH, KK_FMT_RGBA8, KK_TEX_STORAGE | KK_TEX_DOWNLOAD, NULL);
+    kk_lanczos_p p = kk_lanczos_params((float)DW / SW, 0);
+    kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &(kk_compute_args){
+        .out = out, .in = { in }, .n_in = 1, .uniforms = &p, .uniforms_size = sizeof p });
+    kk_gpu_finish(g);
+    unsigned char *got = malloc(4*DW*SH); kk_tex_download(g, out, got);
+    int mn = 255, mx = 0;
+    for (int x = 0; x < DW; x++) { int v = got[4*x]; if (v < mn) mn = v; if (v > mx) mx = v; }
+    free(in8); free(got); kk_tex_destroy(g, &in); kk_tex_destroy(g, &out);
+    int schlecht = mn < dunkel || mx > hell;
+    printf("  Anti-Ringing: Kante %d->%d, Ergebnis min %d max %d%s\n",
+           dunkel, hell, mn, mx, schlecht ? "   FEHLER (Unterschwinger)" : "   ok");
+    return schlecht;
+}
+
 static int pruefe_chroma(kk_gpu *g) {
     const int W = 256, H = 8, CW = W/2, CH = H/2;
     double cb[256], cr[256];
@@ -250,6 +296,50 @@ static int pruefe_chroma_l3(kk_gpu *g) {
     return schlecht;
 }
 
+/// 7. HLG (renderpl.76): ein flaches HLG-Signal 0,75 (Referenzweiß) muss nach MKHLG
+///    bei ~203 nit liegen (1000-nit-Display, OOTF γ=1,2), der PQ-Zweig bei 983 nit.
+///    Vorher liefen HLG-Quellen durch die PQ-EOTF (Weiß fast am Ziel-Peak).
+static double pq_enc_d(double L) {   // 10000-normiertes Linearlicht → PQ-Signal
+    const double m1=0.1593017578125,m2=78.84375,c1=0.8359375,c2=18.8515625,c3=18.6875;
+    double p = pow(fmax(L, 0.0), m1); return pow((c1 + c2*p) / (1.0 + c3*p), m2);
+}
+static int pruefe_hlg(kk_gpu *g) {
+    const int W = 16, H = 16, CW = W/2, CH = H/2;
+    uint16_t *l = malloc(2*W*H), *c = malloc(4*CW*CH);
+    int code = (int)lround(64 + 0.75 * 876);                       // HLG-Signal 0,75
+    for (int i = 0; i < W*H; i++) l[i] = (uint16_t)(code << 6);
+    for (int i = 0; i < CW*CH; i++) { c[2*i] = 512 << 6; c[2*i+1] = 512 << 6; }
+    kk_tex *tl = kk_tex_create(g, W, H, KK_FMT_R16, KK_TEX_SAMPLE | KK_TEX_DOWNLOAD, l);
+    kk_tex *tc = kk_tex_create(g, CW, CH, KK_FMT_RG16, KK_TEX_SAMPLE | KK_TEX_DOWNLOAD, c);
+    struct { float co[2]; } K = { { 0.25f, 0.0f } };
+    int got[2];
+    for (int v = 0; v < 2; v++) {
+        kk_tex *o = kk_tex_create(g, W, H, KK_FMT_RGBA16F, KK_TEX_STORAGE | KK_TEX_SAMPLE, NULL);
+        kk_gpu_compute(g, v ? MKHLG_MSL : MKPQ_MSL, "mk", &(kk_compute_args){ .out = o, .in = { tl, tc },
+            .n_in = 2, .linear = { false, true }, .uniforms = &K, .uniforms_size = sizeof K });
+        kk_tex *o8 = kk_tex_create(g, W, H, KK_FMT_RGBA8, KK_TEX_STORAGE | KK_TEX_DOWNLOAD, NULL);
+        kk_gpu_compute(g,
+            "#include <metal_stdlib>\nusing namespace metal;\n"
+            "kernel void enc(texture2d<float> s [[texture(0)]], texture2d<float,access::write> d [[texture(1)]], uint2 id [[thread_position_in_grid]]){\n"
+            "  if(id.x>=d.get_width()||id.y>=d.get_height())return; float3 L=max(s.read(id).rgb,0.0);\n"
+            "  const float m1=0.1593017578125,m2=78.84375,c1=0.8359375,c2=18.8515625,c3=18.6875;\n"
+            "  float3 p=pow(L,float3(m1)); d.write(float4(pow((c1+c2*p)/(1.0+c3*p),float3(m2)),1.0),id);}\n",
+            "enc", &(kk_compute_args){ .out = o8, .in = { o }, .n_in = 1 });
+        kk_gpu_finish(g);
+        unsigned char px[4*16*16]; kk_tex_download(g, o8, px); got[v] = px[4*(8*W+8)+1];
+        kk_tex_destroy(g, &o); kk_tex_destroy(g, &o8);
+    }
+    free(l); free(c); kk_tex_destroy(g, &tl); kk_tex_destroy(g, &tc);
+    double s = (code - 64) / 876.0;                                  // tatsächliches Signal
+    double E = s <= 0.5 ? s*s/3.0 : (exp((s - 0.55991073)/0.17883277) + 0.28466892)/12.0;
+    int sollHLG = (int)lround(255 * pq_enc_d(1000.0 * pow(E, 1.2) / 10000.0));
+    int schlecht = abs(got[1] - sollHLG) > 1 || got[0] <= got[1] + 20;
+    printf("  HLG: Signal 0,75 -> PQ-Code %d (soll %d = %.0f nit), als PQ gelesen %d%s\n",
+           got[1], sollHLG, 1000.0 * pow(E, 1.2), got[0], schlecht ? "   FEHLER" : "   ok");
+    return schlecht;
+}
+
+
 /// HDR: MKPQ_L3 (CHH auf P010-Chroma) gegen MKPQ bilinear. Flache Fläche muss
 /// gleich bleiben (fängt Fehler in der 10-bit-Skalierung ×65535/64 durch CHH), an
 /// einer Farbkante in y muss L3 die exakte CPU-Referenz treffen (≤1 LSB).
@@ -320,6 +410,9 @@ int main(void) { @autoreleasepool {
     if (!g) { printf("kk_gpu_create fehlgeschlagen\n"); return 1; }
     int f = pruefe_schwarzpunkt(g);
     f |= pruefe_dither(g);
+    f |= pruefe_dither_raender(g);
+    f |= pruefe_ringing(g);
+    f |= pruefe_hlg(g);
     f |= pruefe_chroma(g);
     f |= pruefe_chroma_l3(g);
     f |= pruefe_hdr_l3(g);

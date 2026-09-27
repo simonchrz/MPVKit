@@ -40,10 +40,18 @@ typedef enum {
 kk_gpu *kk_gpu_create(void *mtl_device);
 void    kk_gpu_destroy(kk_gpu **pgpu);
 void   *kk_gpu_mtl_device(kk_gpu *gpu);   // id<MTLDevice> für Interop
-void    kk_gpu_finish(kk_gpu *gpu);       // blockt bis GPU fertig (Bench/Download)
-// Commit OHNE Warten: done(ud) feuert auf Metals Completion-Thread, wenn die GPU
-// fertig ist (kein CB offen → done sofort). Ressourcen-Lebensdauer ist Caller-Sache.
-void    kk_gpu_submit(kk_gpu *gpu, void (*done)(void *ud), void *ud);
+// Blockt bis GPU fertig (Bench/Download). false = Command-Buffer mit Fehler beendet
+// ODER ein Pass seit dem letzten Abschluss nicht kodiert (s. kk_gpu_fehler).
+bool    kk_gpu_finish(kk_gpu *gpu);
+// Commit OHNE Warten: done(ud, ok) feuert auf Metals Completion-Thread, wenn die GPU
+// fertig ist (kein CB offen → done sofort). ok=0: GPU-Fehler oder ausgelassener Pass —
+// das Ziel ist dann NICHT (vollständig) beschrieben. Ressourcen-Lebensdauer ist Caller-Sache.
+void    kk_gpu_submit(kk_gpu *gpu, void (*done)(void *ud, int ok), void *ud);
+// Zähler gescheiterter kk_gpu_compute-Aufrufe seit dem letzten finish/submit. Ein
+// bewusster Rückfall (Pass scheitert → anderer Weg schreibt das Ziel) setzt ihn auf den
+// Stand davor zurück, damit der Frame nicht als kaputt gilt.
+int     kk_gpu_fehler(kk_gpu *gpu);
+void    kk_gpu_fehler_setzen(kk_gpu *gpu, int stand);
 void    kk_gpu_blit(kk_gpu *gpu, kk_tex *src, kk_tex *dst); // Texture-Copy (Render-Out -> Target)
 
 // --- Texturen -------------------------------------------------------------
@@ -100,6 +108,8 @@ typedef struct {
     float rgb2lms[9], lms2ipt[9], ipt2lms[9], lms2rgb[9];
     float in_min, in_max, out_min, out_max;   // PQ-skalierte Tonemap-Range
     float tone_lut[256];                       // bt2390-Tonemap-LUT (I-Werte)
+    int   hlg;                                 // 1 = Quelle ist HLG (ARIB STD-B67), sonst PQ.
+                                               // Liegt HINTER dem CM-Uniform-Layout (vom Shader ungelesen).
 } kk_hdr_params;
 
 #endif // KK_GPU_H

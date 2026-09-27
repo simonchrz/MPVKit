@@ -28,11 +28,11 @@
 #include "kk_gpu.h"
 #include "kk_gpu_render.c"
 
-typedef struct { float scale; uint32_t lutn; float radius; float lut[64]; } EWA_uniform;
+typedef struct { float scale; uint32_t lutn; float radius; float lut[64]; float scaleY; } EWA_uniform;
 
 static EWA_uniform ewa_params(float scale) {
     EWA_uniform e;
-    e.scale = scale; e.lutn = 64; e.radius = KK_EWA_RADIUS;
+    e.scale = scale; e.scaleY = scale; e.lutn = 64; e.radius = KK_EWA_RADIUS;
     for (int i = 0; i < 64; i++) e.lut[i] = KK_EWA_LUT[i];
     return e;
 }

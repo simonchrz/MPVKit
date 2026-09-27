@@ -89,16 +89,21 @@ static void cpu_lanczos(const float *src, int sw, int sh, float *dst, int dw, in
             double coord = (axis == 0) ? x : y;
             double s = (coord + 0.5) / scale - 0.5;
             int base = (int)floor(s);
-            double acc = 0.0, wsum = 0.0;
+            double acc = 0.0, wsum = 0.0, lo = 1e9, hi = -1e9;
             for (int t = 1 - R; t <= R; t++) {
                 int tap = base + t;
                 double w = l3_analytisch((s - tap) * sf);
                 int cx = (axis == 0) ? (tap < 0 ? 0 : (tap > sw - 1 ? sw - 1 : tap)) : x;
                 int cy = (axis == 1) ? (tap < 0 ? 0 : (tap > sh - 1 ? sh - 1 : tap)) : y;
-                acc += w * src[cy * sw + cx];
+                double v = src[cy * sw + cx];
+                if (t == 0 || t == 1) { lo = fmin(lo, v); hi = fmax(hi, v); }
+                acc += w * v;
                 wsum += w;
             }
-            dst[y * dw + x] = (float)(acc / wsum);
+            double o = acc / wsum;
+            // Anti-Ringing wie im Kernel (renderpl.76): nur beim Vergrößern.
+            if (scale > 1.0f) o = fmin(fmax(o, lo), hi);
+            dst[y * dw + x] = (float)o;
         }
     }
 }

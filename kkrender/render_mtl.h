@@ -16,11 +16,16 @@ void *kuckuck_hybrid_create(void *mtl_device);
 // 0 = ok, negativ = Fehler.
 int kuckuck_hybrid_render(void *ctx, void *cv_pixbuf, void *target_texture);
 
-// Async-Render: Encode synchron, Commit ohne Warten; done(ud) feuert auf Metals
+// Async-Render: Encode synchron, Commit ohne Warten; done(ud, ok) feuert auf Metals
 // Completion-Thread wenn der Frame fertig ist. 0 = angenommen (done kommt genau
-// einmal), negativ = nichts encodet (done kommt NICHT).
+// einmal), negativ = nichts encodet (done kommt NICHT). ok=0: GPU-Fehler oder
+// ausgelassener Pass — das Ziel ist NICHT (vollständig) beschrieben, nicht anzeigen.
 int kuckuck_hybrid_render_async(void *ctx, void *cv_pixbuf, void *target_texture,
-                                void (*done)(void *ud), void *ud);
+                                void (*done)(void *ud, int ok), void *ud);
+
+// Render-Env (KUCKUCK_*) setzen bzw. löschen (value NULL), unter der Render-Sperre —
+// statt setenv direkt: die Frame-Pfade lesen getenv unter derselben Sperre.
+void kuckuck_hybrid_setenv(const char *name, const char *value);
 
 
 // PSO-Prewarm: alle Render-Kernel einmal kompilieren (gegen Erst-Frame-Hitch).

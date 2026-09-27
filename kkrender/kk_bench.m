@@ -27,7 +27,7 @@ typedef struct { float a, b; float m[9]; float o; } L_uniform;   // o = Schwarzp
 typedef struct { float m[12]; float co[2]; } D_uniform;   // co = Chroma-Ort (0 = mittig, alt)
 typedef struct { float d[12]; float a, b; float m[9]; float o; float co[2]; } DL_uniform;
 typedef struct { float radius, threshold, grain; uint32_t iters, index; } DB_uniform;
-typedef struct { float scale; uint32_t lutn; float radius; float lut[64]; } EWA_uniform;
+typedef struct { float scale; uint32_t lutn; float radius; float lut[64]; float scaleY; } EWA_uniform;
 
 static double jetzt_ms(void) {
     static mach_timebase_info_data_t tb;
@@ -104,7 +104,7 @@ int main(void) { @autoreleasepool {
         .out=tmpx, .in={lin}, .n_in=1, .uniforms=&px, .uniforms_size=sizeof px }, N);
     t_lany = miss(g, LANCZOS_MSL, "lanczos", &(kk_compute_args){
         .out=skal, .in={tmpx}, .n_in=1, .uniforms=&py, .uniforms_size=sizeof py }, N);
-    EWA_uniform ew; ew.scale=(float)OUT_W/SRC_W; ew.lutn=64; ew.radius=KK_EWA_RADIUS;
+    EWA_uniform ew; ew.scale=(float)OUT_W/SRC_W; ew.scaleY=ew.scale; ew.lutn=64; ew.radius=KK_EWA_RADIUS;
     for (int i=0;i<64;i++) ew.lut[i]=KK_EWA_LUT[i];
     t_ewa = miss(g, EWA_MSL, "ewa", &(kk_compute_args){
         .out=skal, .in={lin}, .n_in=1, .uniforms=&ew, .uniforms_size=sizeof ew }, N);

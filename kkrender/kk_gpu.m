@@ -34,7 +34,11 @@ struct kk_gpu {
     double tsLastMs[KK_TIMING_MAX];   // Ergebnis des ZULETZT abgeschlossenen Frames
     char tsLastName[KK_TIMING_MAX][32];
     int tsLastCount;
+    int passFehler;                   // gescheiterte kk_gpu_compute seit letztem Abschluss
 };
+
+int  kk_gpu_fehler(kk_gpu *g) { return g ? g->passFehler : 0; }
+void kk_gpu_fehler_setzen(kk_gpu *g, int stand) { if (g) g->passFehler = stand; }
 
 static MTLPixelFormat mtl_fmt(kk_fmt f) {
     switch (f) {
@@ -204,26 +208,43 @@ int kk_gpu_timings(kk_gpu *g, const char **namen, double *ms, int max) {
     return n;
 }
 
-void kk_gpu_finish(kk_gpu *g) {
+// Status eines abgeschlossenen Command-Buffers. Bis 2026-09-27 nie geprüft: ein GPU-
+// Fehler (Timeout, Seitenfehler, „Ignored … prior GPU errors") lieferte den unbeschrie-
+// benen Ziel-Buffer als fertiges Bild aus — altes Pool-Bild/Müll, ohne Logzeile.
+static bool kk_cb_ok(id<MTLCommandBuffer> cb) {
+    if (cb.status == MTLCommandBufferStatusCompleted) return true;
+    fprintf(stderr, "[kk_gpu] Command-Buffer status=%ld err=%s\n", (long) cb.status,
+            cb.error ? cb.error.localizedDescription.UTF8String : "-");
+    return false;
+}
+
+bool kk_gpu_finish(kk_gpu *g) {
+    bool ok = g->passFehler == 0;
+    g->passFehler = 0;
     @autoreleasepool {
         if (g->enc) { [g->enc endEncoding]; CFRelease((__bridge CFTypeRef) g->enc); g->enc = nil; }
         if (g->cb)  { [g->cb commit]; [g->cb waitUntilCompleted];
+                      ok = kk_cb_ok(g->cb) && ok;
                       CFRelease((__bridge CFTypeRef) g->cb); g->cb = nil;
                       kk_timing_aufloesen(g); }
     }
+    return ok;
 }
 
-void kk_gpu_submit(kk_gpu *g, void (*done)(void *ud), void *ud) {
+void kk_gpu_submit(kk_gpu *g, void (*done)(void *ud, int ok), void *ud) {
+    bool passOk = g->passFehler == 0;
+    g->passFehler = 0;
     @autoreleasepool {
         if (g->enc) { [g->enc endEncoding]; CFRelease((__bridge CFTypeRef) g->enc); g->enc = nil; }
         if (g->cb) {
             struct kk_gpu *gg = g;
             [g->cb addCompletedHandler:^(id<MTLCommandBuffer> _cb){
-                (void)_cb; kk_timing_aufloesen(gg); if (done) done(ud); }];
+                bool ok = kk_cb_ok(_cb) && passOk;
+                kk_timing_aufloesen(gg); if (done) done(ud, ok ? 1 : 0); }];
             [g->cb commit];
             CFRelease((__bridge CFTypeRef) g->cb); g->cb = nil;   // CB lebt bis Completion selbst weiter
         } else if (done) {
-            done(ud);   // nichts encodet → sofort melden
+            done(ud, passOk ? 1 : 0);   // nichts encodet → sofort melden
         }
     }
 }
@@ -440,10 +461,12 @@ bool kk_gpu_compute(kk_gpu *g, const char *msl_source, const char *entry,
                     const kk_compute_args *a) {
     @autoreleasepool {
         id<MTLComputePipelineState> pso = get_pso(g, msl_source, entry);
-        if (!pso || !a->out) return false;
+        // Jeder ausgelassene Pass zählt: der Frame gilt dann als kaputt (s. kk_gpu_fehler),
+        // statt ein unbeschriebenes Ziel anzuzeigen.
+        if (!pso || !a->out) { g->passFehler++; return false; }
         // NULL-Eingang (Alloc unter Speicherdruck gescheitert) → Pass auslassen statt
         // `a->in[i]->tex` auf NULL zu lesen (SIGSEGV in den CNN-Ketten auf A16).
-        for (int i = 0; i < a->n_in; i++) if (!a->in[i]) return false;
+        for (int i = 0; i < a->n_in; i++) if (!a->in[i]) { g->passFehler++; return false; }
         id<MTLComputeCommandEncoder> enc = get_enc(g);
         [enc setComputePipelineState:pso];
         // Eingänge: texture(0..n_in-1) + sampler(0)=nearest, sampler(1)=linear.

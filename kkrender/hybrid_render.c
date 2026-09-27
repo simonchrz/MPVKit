@@ -21,10 +21,10 @@
 // kk_gpu-Render-Entries (in kk_gpu_render.c).
 extern bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
                           const float *yuv2rgb, const float *prim2disp,
-                          void (*done)(void*), void *done_ud);
+                          void (*done)(void*, int), void *done_ud);
 extern bool kk_gpu_render_hdr(void *metal_device, void *cv_pixbuf, void *target_texture,
                               const kk_hdr_params *hp,
-                              void (*done)(void*), void *done_ud);
+                              void (*done)(void*, int), void *done_ud);
 // Native Color-Parameter-Generatoren (kk_gpu_genparams.c).
 extern void kk_sdr_decode_matrix(int sys, int full, float out[12]);
 extern void kk_primaries_to709(int prim, float out[9]);
@@ -49,7 +49,12 @@ struct hybrid_priv {
     float smoothPeak;   // geglätteter HDR-Bildpeak — PRO Kontext (vorher static: neues
     unsigned hdrFrame;  // Video startete mit dem Peak des vorigen)
     void *device;   // app-MTLDevice (id<MTLTexture>-Quelle); an kk_gpu durchgereicht
+    void *cache;    // eigener Satz Zwischentexturen (kk_cache, renderpl.76) — beim
+                    // Folgenwechsel rendern zwei Kontexte abwechselnd
 };
+extern void *kk_gpu_cache_neu(void);
+extern void  kk_gpu_cache_waehlen(void *c);
+extern void  kk_gpu_cache_freigeben(void *c);
 
 // CoreVideo-YCbCr-Matrix-Attachment -> kk_sdr_decode_matrix-Index (0=601,1=709,2=240M,3=2020NC).
 // Über den H.273-CODEPUNKT, nicht per Vergleich mit den benannten Konstanten: SD-
@@ -106,7 +111,11 @@ static float hybrid_src_peak(CVPixelBufferRef pb)
         uint32_t maxcll = ((uint32_t)b[0]<<8)|b[1];   // MaxCLL (nits, big-endian)
         if (maxcll >= 1 && maxcll <= 10000) return (float) maxcll;
     }
-    return 1000.0f;
+    // KEINE Metadaten → kein Deckel (-1). Bis renderpl.75 kam hier 1000 zurück und
+    // deckelte auch die GEMESSENE Spitze: auf 4000 nit gemastertes Material ohne
+    // SmDm/CoLL (VP9 trägt keine SEI) fraß oberhalb 1000 nit hart aus, die MaxRGB-
+    // Messung war wirkungslos. 1000 bleibt nur Startwert, solange nichts gemessen ist.
+    return -1.0f;
 }
 
 // Dynamischer Frame-Peak (nits): per CPU-Raster (96×96) über Luma UND Chroma der P010-
@@ -115,6 +124,23 @@ static float hybrid_src_peak(CVPixelBufferRef pb)
 // (≈ 6 nit) — die Schätzung lag systematisch zu tief, und das Tonemapping schnitt die
 // Lichter bei der geschätzten Spitze hart ab (Sweep kk_gpu). -1 bei Fehler. Läuft auf
 // der Render-Queue (off-main), VOR dem GPU-Render.
+// HLG-Signal (0..1) → Anzeige-nits für ein 1000-nit-Referenzdisplay (Weiß: Ys = E,
+// also Fd = 1000·E^1,2) — dieselbe Kurve wie MKHLG, für die Spitzenwert-Schätzung.
+static float hybrid_hlg_nits(float e)
+{
+    const float a = 0.17883277f, b = 0.28466892f, c = 0.55991073f;
+    float E = e <= 0.5f ? e * e / 3.0f : (expf((e - c) / a) + b) / 12.0f;
+    return 1000.0f * powf(E, 1.2f);
+}
+
+// Transfer-Attachment = HLG (H.273 Code 18)? Sonst wird PQ angenommen.
+int hybrid_ist_hlg(CVPixelBufferRef pb)
+{
+    CFTypeRef t = CVBufferGetAttachment(pb, kCVImageBufferTransferFunctionKey, NULL);
+    if (!t || CFGetTypeID(t) != CFStringGetTypeID()) return 0;
+    return CVTransferFunctionGetIntegerCodePointForString((CFStringRef) t) == 18;
+}
+
 float hybrid_frame_peak_nits(CVPixelBufferRef pb)
 {
     if (CVPixelBufferGetPlaneCount(pb) < 2) return -1;
@@ -146,6 +172,7 @@ float hybrid_frame_peak_nits(CVPixelBufferRef pb)
     CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
     if (mx <= 0) return -1;
     if (mx > 1) mx = 1;
+    if (hybrid_ist_hlg(pb)) return hybrid_hlg_nits(mx);   // HLG: eigene Kurve, nicht PQ
     const float m1=0.1593017578125f, m2=78.84375f, c1=0.8359375f, c2=18.8515625f, c3=18.6875f;
     float ep = powf(mx, 1.0f/m2); float num = ep - c1; if (num < 0) num = 0; float den = c2 - c3*ep;
     return powf(num/den, 1.0f/m1) * 10000.0f;             // PQ-EOTF -> nits
@@ -160,6 +187,7 @@ void *kuckuck_hybrid_create(void *mtl_device)
         return NULL;
     p->device = mtl_device;
     p->smoothPeak = -1.0f;
+    p->cache = kk_gpu_cache_neu();   // NULL (OOM) → Standardsatz, wie vorher
     pthread_mutex_lock(&g_render_lock);
     g_kontexte++;
     pthread_mutex_unlock(&g_render_lock);
@@ -167,15 +195,15 @@ void *kuckuck_hybrid_create(void *mtl_device)
 }
 
 // Async-Variante: Encode läuft synchron (Quell-Pointer-Zugriff bleibt im Caller-Scope),
-// Commit OHNE Warten — done(ud) feuert auf Metals Completion-Thread, wenn der Frame
+// Commit OHNE Warten — done(ud, ok) feuert auf Metals Completion-Thread, wenn der Frame
 // fertig gerendert ist (Quell-/Target-Wraps leben intern bis dahin). Rückgabe 0 =
 // angenommen (done kommt GENAU EINMAL, auch bei leerem CB), negativ = nichts encodet
 // (done kommt NICHT).
 static int hybrid_render_locked(struct hybrid_priv *p, void *cv_pixbuf, void *target_texture,
-                                void (*done)(void *ud), void *ud);
+                                void (*done)(void *ud, int ok), void *ud);
 
 int kuckuck_hybrid_render_async(void *ctx, void *cv_pixbuf, void *target_texture,
-                                void (*done)(void *ud), void *ud)
+                                void (*done)(void *ud, int ok), void *ud)
 {
     // Encode synchron unter der Sperre; `done` feuert später auf Metals Thread (ohne Sperre).
     pthread_mutex_lock(&g_render_lock);
@@ -185,12 +213,13 @@ int kuckuck_hybrid_render_async(void *ctx, void *cv_pixbuf, void *target_texture
 }
 
 static int hybrid_render_locked(struct hybrid_priv *p, void *cv_pixbuf, void *target_texture,
-                                void (*done)(void *ud), void *ud)
+                                void (*done)(void *ud, int ok), void *ud)
 {
     if (!p || !cv_pixbuf || !target_texture)
         return -1;
     CVPixelBufferRef pb = (CVPixelBufferRef) cv_pixbuf;
     OSType pfmt = CVPixelBufferGetPixelFormatType(pb);
+    kk_gpu_cache_waehlen(p->cache);   // unter g_render_lock (Caller)
 
     // HDR (P010): IPT-Tonemap zum EDR-Peak -> PQ/2020. LUT-Gen gecacht (teuer).
     if (pfmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
@@ -200,20 +229,20 @@ static int hybrid_render_locked(struct hybrid_priv *p, void *cv_pixbuf, void *ta
         float dst_peak = nits ? (float) atof(nits) : 203.0f;
         // `!(x >= 1 && x <= 10000)` fängt auch NaN/inf ab („nan" kam per atof durch → NaN-LUT).
         if (!(dst_peak >= 1.0f && dst_peak <= 10000.0f)) dst_peak = 203.0f;
-        float mastering = hybrid_src_peak(pb);   // Mastering/MaxCLL = Obergrenze (Master nicht überschreitbar)
+        float mastering = hybrid_src_peak(pb);   // Mastering/MaxCLL = Obergrenze; -1 = unbekannt (kein Deckel)
         // Dynamischer Peak: jeden 4. Frame den echten Frame-Peak messen, EMA-glätten,
         // durch Mastering deckeln → per-Szene-Tonemapping (dunkle Szenen nutzen EDR besser).
         if ((p->hdrFrame++ & 3) == 0) {
             float fp = hybrid_frame_peak_nits(pb);
             if (fp > 0) {
-                if (fp > mastering) fp = mastering;
+                if (mastering > 0 && fp > mastering) fp = mastering;
                 // Asymmetrisch: heller schnell übernehmen (sonst ~1,2 s abgeschnittene
                 // Lichter nach einem Schnitt ins Helle), dunkler langsam (kein Pumpen).
                 float k = (fp > p->smoothPeak) ? 0.5f : 0.1f;
                 p->smoothPeak = (p->smoothPeak < 0) ? fp : p->smoothPeak + k * (fp - p->smoothPeak);
             }
         }
-        float src_peak = (p->smoothPeak > 0) ? p->smoothPeak : mastering;
+        float src_peak = (p->smoothPeak > 0) ? p->smoothPeak : (mastering > 0 ? mastering : 1000.0f);
         if (src_peak < 100.0f) src_peak = 100.0f;                 // Floor (nicht über-abdunkeln)
         src_peak = roundf(src_peak / 25.0f) * 25.0f;              // 25-nit-quantisiert → LUT-Regen nur bei echter Änderung
         if (dst_peak != cached_dst || src_peak != cached_src) {
@@ -224,6 +253,7 @@ static int hybrid_render_locked(struct hybrid_priv *p, void *cv_pixbuf, void *ta
             kk_hdr_tone(src_peak, dst_peak, 0.005f, &hp.in_min, &hp.in_max, &hp.out_min, &hp.out_max, hp.tone_lut);
             cached_dst = dst_peak; cached_src = src_peak;
         }
+        hp.hlg = hybrid_ist_hlg(pb);   // je Frame (hp ist statisch gecacht, das Etikett nicht)
         return kk_gpu_render_hdr(p->device, cv_pixbuf, target_texture, &hp, done, ud) ? 0 : -2;
     }
 
@@ -252,6 +282,22 @@ void kuckuck_hybrid_prewarm(void *ctx)
     pthread_mutex_lock(&g_render_lock);   // PSO-Cache (NSMutableDictionary) ist nicht threadsicher
     kk_gpu_prewarm(p->device);
     pthread_mutex_unlock(&g_render_lock);
+    extern void kk_gpu_deblock_prewarm(void *metal_device);
+    pthread_mutex_lock(&g_dbl_lock);
+    kk_gpu_deblock_prewarm(p->device);
+    pthread_mutex_unlock(&g_dbl_lock);
+}
+
+// Render-Env setzen/löschen UNTER der Render-Sperre. Die Frame-Pfade lesen getenv
+// (und strcasestr auf dem Zeiger) unter g_render_lock — beim Folgenwechsel setzte der
+// NEUE Player seine Werte auf seiner Queue, während der ALTE unter der Sperre las:
+// setenv kann den gelesenen String freigeben (Sweep 2026-09-27). value NULL → unsetenv.
+void kuckuck_hybrid_setenv(const char *name, const char *value)
+{
+    if (!name) return;
+    pthread_mutex_lock(&g_render_lock);
+    if (value) setenv(name, value, 1); else unsetenv(name);
+    pthread_mutex_unlock(&g_render_lock);
 }
 
 int kuckuck_hybrid_deblock_nv12(void *ctx, void *src_pixbuf, void *dst_pixbuf)
@@ -270,8 +316,16 @@ void kuckuck_hybrid_destroy(void *ctx)
     extern void kk_gpu_release_all(void);
     if (!ctx) return;
     pthread_mutex_lock(&g_render_lock);
-    // Caches erst freigeben, wenn KEIN Kontext mehr lebt (s. g_render_lock oben).
+    struct hybrid_priv *p = ctx;
+    kk_gpu_cache_freigeben(p->cache);   // eigener Satz: sofort, die anderen Kontexte berührt das nicht
+    p->cache = NULL;
+    // Gemeinsame Caches erst freigeben, wenn KEIN Kontext mehr lebt (s. g_render_lock oben).
     if (--g_kontexte <= 0) { g_kontexte = 0; kk_gpu_release_all(); }
+    else { extern void kk_gpu_texcache_flush(void); kk_gpu_texcache_flush(); }   // überlappender Wechsel
     pthread_mutex_unlock(&g_render_lock);
+    extern void kk_gpu_deblock_flush(void);
+    pthread_mutex_lock(&g_dbl_lock);
+    kk_gpu_deblock_flush();
+    pthread_mutex_unlock(&g_dbl_lock);
     free(ctx);
 }
