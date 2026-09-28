@@ -684,7 +684,13 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
     // DEC+LIN-Fusion (HD-Light ohne CNN/Deblock): dort ist LIN der EINZIGE c_dec-
     // Konsument (Deband ist aus, CNN-Pfade laufen nicht) -> der Standalone-DEC
     // entfällt, declin liest luma/chroma direkt (spart den c_dec-Roundtrip).
-    bool fusedDec = hdLight && !cnnPath && !deblock;
+    // Deband im HD-Light nur auf ausdrückliche App-Vorgabe (KUCKUCK_DEBAND_HD=1, starke
+    // Geräte, Live): der Pass braucht die dekodierte Quelle → dann ohne DEC+LIN-Fusion.
+    const char *dbenv = getenv("KUCKUCK_DEBAND");
+    const char *dbhd = getenv("KUCKUCK_DEBAND_HD");
+    bool debandAn = dbenv && (dbenv[0]=='m' || dbenv[0]=='s')
+                    && (!hdLight || cnnPath || (dbhd && dbhd[0]=='1'));
+    bool fusedDec = hdLight && !cnnPath && !deblock && !debandAn;
     bool l3 = kk_chroma_l3_an(hdLight);
     if (!fusedDec) {
         kk_tex *chh = l3 ? kk_chroma_h(g, chroma, &c_chh, W, D.co[0]) : NULL;
@@ -706,9 +712,8 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
     }
 
     // Deband (KUCKUCK_DEBAND off|mild|strong) auf der encodeten Quelle.
-    const char *dbenv = getenv("KUCKUCK_DEBAND");
     kk_tex *src_lin = c_dec;   // ohne Deband: linearize liest c_dec
-    if (dbenv && (dbenv[0]=='m' || dbenv[0]=='s') && (!hdLight || cnnPath)) {
+    if (debandAn) {
         struct { float radius, threshold, grain; uint32_t iters, index; } db;
         db.radius = 16.0f; db.index = (g_frame++);
         if (dbenv[0]=='s') { db.iters=2; db.threshold=4.0f/1000.0f; db.grain=1.0f/1000.0f; }  // strong
@@ -834,8 +839,8 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
             const char *k = chh ? (declinSrgb ? DECLIN_L3_SRGB_MSL : DECLIN_L3_MSL)
                                 : (declinSrgb ? DECLIN_SRGB_MSL : DECLIN_MSL);
             kk_gpu_compute(g, k, "declin", &la0);
-        } else {   // CNN-Gate an, aber CNN-Pfad oben gescheitert -> c_dec existiert
-            kk_compute_args la0 = { .out=c_lin, .in={c_dec}, .n_in=1, .uniforms=&L, .uniforms_size=sizeof L };
+        } else {   // CNN-Pfad gescheitert oder Deband/Deblock aktiv -> c_dec/c_deb existiert
+            kk_compute_args la0 = { .out=c_lin, .in={src_lin}, .n_in=1, .uniforms=&L, .uniforms_size=sizeof L };
             kk_gpu_compute(g, LIN_MSL, "lin", &la0);
             cur = c_lin;
         }
