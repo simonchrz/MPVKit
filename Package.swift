@@ -44,8 +44,9 @@ let package = Package(
             // sRGB im letzten Pass, HDR-Peak aus MaxRGB (kk_gpu-Sweep 2026-09-25).
             // renderpl.76 = GPU-Fehler bis zur App (done(ud, ok) — ABI!), Caches pro Kontext,
             // setenv unter Sperre, Anti-Ringing, Dither-Ränder, HLG (kk_gpu-Sweep 2026-09-27).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.76/Libkkrender.xcframework.zip",
-            checksum: "8e9fdfab7157823bff7b9d1cf2cc257fb749bffd34c8b9eaa67f789b8aa7330c"
+            // renderpl.77 = Deband im HD-Sparpfad auf App-Vorgabe (KUCKUCK_DEBAND_HD, iPhone-Live).
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.77/Libkkrender.xcframework.zip",
+            checksum: "5814e8b5cf8298e9cde490e271f1ee61f83d9b67e138060dab76d4d89ce32df1"
         ),
     ]
 )
