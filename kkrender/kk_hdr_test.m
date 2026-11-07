@@ -94,6 +94,45 @@ static int pruefe_tonekurve(void) {
     return schlecht | s;
 }
 
+/// LANCZOS_CMH (Scaler + Tonemap in einem Pass, 2026-11-07) gegen LANCZOS -> CMHDR.
+static int pruefe_lanczos_cmh(kk_gpu *g) {
+    const int W = 32, H = 8, OW = 48, OH = 8;
+    unsigned char *in = malloc(4 * W * H);
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) {
+            in[4*(y*W+x)] = (unsigned char)(8 + (240 * x) / (W - 1));
+            in[4*(y*W+x)+1] = (unsigned char)(255 - (200 * x) / (W - 1));
+            in[4*(y*W+x)+2] = (unsigned char)(30 + 25 * y);
+            in[4*(y*W+x)+3] = 255;
+        }
+    kk_tex *src = kk_tex_create(g, W, H, KK_FMT_RGBA8, KK_TEX_SAMPLE, in);
+    kk_tex *zw  = kk_tex_create(g, OW, OH, KK_FMT_RGBA16F, KK_TEX_SAMPLE | KK_TEX_STORAGE, NULL);
+    kk_tex *oA  = kk_tex_create(g, OW, OH, KK_FMT_RGBA8, KK_TEX_STORAGE | KK_TEX_DOWNLOAD, NULL);
+    kk_tex *oB  = kk_tex_create(g, OW, OH, KK_FMT_RGBA8, KK_TEX_STORAGE | KK_TEX_DOWNLOAD, NULL);
+    kk_lanczos_cm pc; pc.l = kk_lanczos_params((float)OW / W, 0);
+    memcpy(pc.cm.rgb2lms, KK_IPT_RGB2LMS_2020, 9 * sizeof(float));
+    memcpy(pc.cm.lms2rgb, KK_IPT_LMS2RGB_2020, 9 * sizeof(float));
+    memcpy(pc.cm.lms2ipt, KK_IPT_LMS2IPT, 9 * sizeof(float));
+    memcpy(pc.cm.ipt2lms, KK_IPT_IPT2LMS, 9 * sizeof(float));
+    kk_hdr_tone(1000.0f, 203.0f, 0.005f, &pc.cm.in_min, &pc.cm.in_max, &pc.cm.out_min, &pc.cm.out_max, pc.cm.tone_lut);
+    pc.cm.hlg = 0;
+    kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &(kk_compute_args){ .out = zw, .in = { src }, .n_in = 1, .uniforms = &pc.l, .uniforms_size = sizeof pc.l });
+    kk_gpu_compute(g, CMHDR_MSL, "cmh", &(kk_compute_args){ .out = oA, .in = { zw }, .n_in = 1, .uniforms = &pc.cm, .uniforms_size = sizeof pc.cm });
+    kk_gpu_compute(g, LANCZOS_CMH_MSL, "lanczos", &(kk_compute_args){ .out = oB, .in = { src }, .n_in = 1, .uniforms = &pc, .uniforms_size = sizeof pc });
+    kk_gpu_finish(g);
+    unsigned char *a = malloc(4 * OW * OH), *b = malloc(4 * OW * OH);
+    kk_tex_download(g, oA, a); kk_tex_download(g, oB, b);
+    int maxd = 0; double summe = 0; int n = 0;
+    for (int i = 0; i < OW * OH; i++) for (int k = 0; k < 3; k++) {
+        int d = (int) b[4*i+k] - (int) a[4*i+k]; if (abs(d) > maxd) maxd = abs(d); summe += d; n++;
+    }
+    int schlecht = maxd > 1 || fabs(summe / n) > 0.2;
+    printf("  LANCZOS_CMH vs LANCZOS->CMHDR  maxdiff=%d LSB  Versatz=%+.3f LSB   %s\n", maxd, summe / n, schlecht ? "FEHLER" : "ok");
+    free(in); free(a); free(b);
+    kk_tex_destroy(g, &src); kk_tex_destroy(g, &zw); kk_tex_destroy(g, &oA); kk_tex_destroy(g, &oB);
+    return schlecht;
+}
+
 static int pruefe_kernel(kk_gpu *g) {
     const int W = 32, H = 8;
     // Linearlicht-Eingang: Graurampe (R=G=B). Was neutral reingeht, muss neutral
@@ -153,6 +192,7 @@ int main(void) { @autoreleasepool {
     kk_gpu *g = kk_gpu_create(NULL);
     if (!g) { printf("kk_gpu_create fehlgeschlagen\n"); return 1; }
     fehler |= pruefe_kernel(g);
+    fehler |= pruefe_lanczos_cmh(g);
     kk_gpu_destroy(&g);
 
     printf(fehler ? "kk_hdr_test: FEHLGESCHLAGEN\n"

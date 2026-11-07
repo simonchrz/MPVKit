@@ -248,6 +248,40 @@ static const char *LANCZOS_MSL      = "#define KK_SRGB_OUT 0\n" LANCZOS_SRC;
 static const char *LANCZOS_SRGB_MSL = "#define KK_SRGB_OUT 1\n" LANCZOS_SRC;
 // Host-Seite: Lanczos-Uniforms inkl. gebackener l3-LUT (einmal berechnet, dann memcpy).
 typedef struct { float scale; uint32_t axis; float lut[64]; } kk_lanczos_p;
+// LANCZOS_CMH (2026-11-07, HDR): der letzte Lanczos-Pass schreibt gleich das IPT-Tonemap-
+// Ergebnis (PQ/2020) — dasselbe Muster wie LANCZOS_SRGB im SDR. Spart den h_ewa-Roundtrip
+// (2× OW×OH×8 B) und einen Dispatch; reine Punktoperation hinter dem Filter, nichts wird je
+// Tap gerechnet. Uniform = kk_lanczos_p gefolgt von kk_hdr_params (nur Floats, kein Padding;
+// das abschließende `hlg` liegt hinter dem Shader-Layout, ungelesen).
+#define LANCZOS_CMH_SRC \
+"#include <metal_stdlib>\nusing namespace metal;\n" \
+"struct P{float scale;uint axis;float lut[64];float rgb2lms[9],lms2ipt[9],ipt2lms[9],lms2rgb[9];float in_min,in_max,out_min,out_max;float tlut[256];};\n" \
+"#define M1 0.1593017578125\n#define M2 78.84375\n#define C1 0.8359375\n#define C2 18.8515625\n#define C3 18.6875\n" \
+"static inline float3 mul3(constant float* m, float3 v){return float3(m[0]*v.x+m[1]*v.y+m[2]*v.z, m[3]*v.x+m[4]*v.y+m[5]*v.z, m[6]*v.x+m[7]*v.y+m[8]*v.z);}\n" \
+"static inline float3 pq_oetf3(float3 l){ float3 lm=pow(max(l,0.0),float3(M1)); return pow((C1+C2*lm)/(1.0+C3*lm),float3(M2)); }\n" \
+"static inline float3 pq_eotf3(float3 e){ float3 ep=pow(max(e,0.0),float3(1.0/M2)); float3 num=max(ep-C1,0.0); float3 den=C2-C3*ep; return pow(num/den,float3(1.0/M1)); }\n" \
+"static inline float l3lut(constant P& p, float x){ x=min(abs(x),3.0)*(63.0/3.0);\n" \
+"  int i0=int(x); return mix(p.lut[i0], p.lut[min(i0+1,63)], x-float(i0)); }\n" \
+"kernel void lanczos(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n" \
+"  constant P& p [[buffer(0)]], uint2 id [[thread_position_in_grid]]){ uint W=dst.get_width(),H=dst.get_height(); if(id.x>=W||id.y>=H)return;\n" \
+"  int sw=int(src.get_width()),sh=int(src.get_height()); float coord=(p.axis==0u?float(id.x):float(id.y));\n" \
+"  float sf=min(p.scale,1.0); int R=int(ceil(3.0/sf));\n" \
+"  float s=(coord+0.5)/p.scale-0.5; int base=int(floor(s)); float4 acc=float4(0.0); float wsum=0.0;\n" \
+"  float4 lo=float4(1e9), hi=float4(-1e9);\n" \
+"  for(int t=1-R;t<=R;t++){ int tap=base+t; float w=l3lut(p,(s-float(tap))*sf);\n" \
+"    int cx=(p.axis==0u)?clamp(tap,0,sw-1):int(id.x); int cy=(p.axis==1u)?clamp(tap,0,sh-1):int(id.y);\n" \
+"    float4 v=src.read(uint2(cx,cy)); if(t==0||t==1){ lo=min(lo,v); hi=max(hi,v); }\n" \
+"    acc+=w*v; wsum+=w; } float4 o=acc/wsum;\n" \
+"  if(p.scale>1.0) o=clamp(o,lo,hi);\n" \
+"  float3 linr=o.rgb;\n" \
+"  float3 lms=mul3(p.rgb2lms,linr); float3 lmspq=pq_oetf3(lms); float3 ipt=mul3(p.lms2ipt,lmspq); float i_orig=ipt.x;\n" \
+"  float ipos=clamp((ipt.x-p.in_min)/(p.in_max-p.in_min),0.0,1.0);\n" \
+"  float fidx=ipos*255.0; int i0=int(fidx); float fr=fidx-float(i0); ipt.x=mix(p.tlut[i0],p.tlut[min(i0+1,255)],fr);\n" \
+"  float ix=max(ipt.x,1e-6); float2 hull=float2(i_orig,ix); hull=((hull-6.0)*hull+9.0)*hull; ipt.yz *= min(i_orig/ix, hull.y/hull.x);\n" \
+"  float3 lmspq2=mul3(p.ipt2lms,ipt); float3 lms2=pq_eotf3(lmspq2);\n" \
+"  float3 c=clamp(mul3(p.lms2rgb,lms2),0.0,1.0); dst.write(float4(pq_oetf3(c),1.0),id);}\n"
+static const char *LANCZOS_CMH_MSL = LANCZOS_CMH_SRC;
+typedef struct { kk_lanczos_p l; kk_hdr_params cm; } kk_lanczos_cm;
 static kk_lanczos_p kk_lanczos_params(float scale, uint32_t axis) {
     static float tbl[64]; static bool init = false;
     if (!init) {
@@ -686,12 +720,11 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
     if (W != c_W || H != c_H || OW != c_OW || OH != c_OH) {
         kk_tex_destroy(g,&c_dec); kk_tex_destroy(g,&c_deb); kk_tex_destroy(g,&c_lin);
         kk_tex_destroy(g,&c_tmpx); kk_tex_destroy(g,&c_liny); kk_tex_destroy(g,&c_out);
-        c_dec  = kk_tex_create(g, W,  H,  KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
-        c_deb  = kk_tex_create(g, W,  H,  KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
+        // Nur die Stufen JEDES Pfads eifrig; c_dec/c_deb/c_liny/c_out entstehen lazy am Ort
+        // ihrer Nutzung (KK_NEED). Im HD-Light-Pfad (iPhone 1440p) lagen sonst ~90 MB tote
+        // Texturen je Kontext (Sweep 2026-11-07), beim Folgenwechsel zweimal.
         c_lin  = kk_tex_create(g, W,  H,  KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
         c_tmpx = kk_tex_create(g, OW, H,  KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
-        c_liny = kk_tex_create(g, OW, OH, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
-        c_out  = kk_tex_create(g, OW, OH, KK_FMT_BGRA8,   KK_TEX_STORAGE, NULL);
         // CNN-Zwischenstufen (2×-Größen) nur noch freigeben — angelegt werden sie erst
         // im CNN-Zweig (kk_cnn_zwischen). Vorher entstanden sie bei JEDEM Größenwechsel
         // (ABR, Drehung), auch ohne Anime4K/ArtCNN: ~120–280 MB Spitze auf A16.
@@ -703,12 +736,15 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
         // Maße nur bei vollständigem Erfolg merken: sonst hielt ein einziger Alloc-Fehler
         // (Speicherdruck) den Renderer bis zum nächsten Größenwechsel fest — jedes Bild
         // brach ab, das Bild stand (Selbstsperre). Mit 0 versucht das nächste Bild neu.
-        bool ok = c_dec && c_deb && c_lin && c_tmpx && c_liny && c_out && c_srgb;
+        bool ok = c_lin && c_tmpx && c_srgb;
         if (ok) { c_W=W; c_H=H; c_OW=OW; c_OH=OH; } else { c_W=c_H=c_OW=c_OH=0; }
     }
-    if (!c_dec || !c_deb || !c_lin || !c_tmpx || !c_liny || !c_out) {
+    if (!c_lin || !c_tmpx || !c_srgb) {
         kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt); return false;
     }
+    // Lazy-Zwischentextur; scheitert die Anlage (Speicherdruck), bricht das Bild sauber ab.
+#define KK_NEED(T, TW, TH, FMT) do { if (!(T)) (T) = kk_tex_create(g, (TW), (TH), (FMT), KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL); \
+        if (!(T)) { kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt); return false; } } while (0)
 
     // Speicher: nur der aktive Pfad resident. SDR-Pfad → HDR-Caches frei; nicht-aktiven
     // CNN-Cache frei (idempotent, nil-safe). Hält die RAM-Baseline niedrig (kein Akkumulieren
@@ -745,6 +781,7 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
     bool fusedDec = hdLight && !cnnPath && !deblock && !debandAn;
     bool l3 = kk_chroma_l3_an(hdLight);
     if (!fusedDec) {
+        KK_NEED(c_dec, W, H, KK_FMT_RGBA16F);
         kk_tex *chh = l3 ? kk_chroma_h(g, chroma, &c_chh, W, D.co[0]) : NULL;
         kk_compute_args da = { .out=c_dec, .in={luma, chh ? chh : chroma}, .n_in=2, .linear={false,true}, .uniforms=&D, .uniforms_size=sizeof D };
         kk_gpu_compute(g, chh ? DEC_L3_MSL : DEC_MSL, "dec", &da);
@@ -774,6 +811,7 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
     const char *dblEnv = getenv("KUCKUCK_KK_DBLIN");
     bool dbLinFusion = debandAn && hdLight && !cnnPath && c_tmpx && !(dblEnv && dblEnv[0]=='0');
     if (debandAn && !dbLinFusion) {
+        KK_NEED(c_deb, W, H, KK_FMT_RGBA16F);
         kk_compute_args dba = { .out=c_deb, .in={c_dec}, .n_in=1, .linear={true}, .uniforms=&db, .uniforms_size=sizeof db };
         kk_gpu_compute(g, DEBAND_MSL, "deband", &dba);
         src_lin = c_deb;
@@ -812,9 +850,11 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
             kk_lanczos_p apx = kk_lanczos_params((float)OW/(W*2), 0), apy = kk_lanczos_params((float)OH/(H*2), 1);
             kk_compute_args axa = { .out=c_atmpx, .in={c_alin}, .n_in=1, .uniforms=&apx, .uniforms_size=sizeof apx };
             kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &axa);            // X: 2W -> OW
+            KK_NEED(c_liny, OW, OH, KK_FMT_RGBA16F);
             kk_compute_args aya = { .out=c_liny, .in={c_atmpx}, .n_in=1, .uniforms=&apy, .uniforms_size=sizeof apy };
             kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &aya);            // Y: 2H -> OH
             bool dw = kk_tex_can_write(tgt);   // Target ShaderWrite-fähig -> Blit sparen
+            if (!dw) KK_NEED(c_out, OW, OH, KK_FMT_BGRA8);
             kk_compute_args ala = { .out=dw?tgt:c_out, .in={c_liny}, .n_in=1 };
             kk_gpu_compute(g, dith ? DELIN_D_MSL : DELIN_MSL, "delin", &ala);
             if (!dw) kk_gpu_blit(g, c_out, tgt);
@@ -849,9 +889,11 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
             kk_lanczos_p apx = kk_lanczos_params((float)OW/(W*2), 0), apy = kk_lanczos_params((float)OH/(H*2), 1);
             kk_compute_args axa = { .out=c_atmpx, .in={c_alin}, .n_in=1, .uniforms=&apx, .uniforms_size=sizeof apx };
             kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &axa);
+            KK_NEED(c_liny, OW, OH, KK_FMT_RGBA16F);
             kk_compute_args aya = { .out=c_liny, .in={c_atmpx}, .n_in=1, .uniforms=&apy, .uniforms_size=sizeof apy };
             kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &aya);
             bool dw = kk_tex_can_write(tgt);   // Target ShaderWrite-fähig -> Blit sparen
+            if (!dw) KK_NEED(c_out, OW, OH, KK_FMT_BGRA8);
             kk_compute_args ala = { .out=dw?tgt:c_out, .in={c_liny}, .n_in=1 };
             kk_gpu_compute(g, dith ? DELIN_D_MSL : DELIN_MSL, "delin", &ala);
             if (!dw) kk_gpu_blit(g, c_out, tgt);
@@ -865,6 +907,7 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
     // EWA vs. separabel visuell belegt gleichwertig (IQ-Harness 06/2026); CAS bleibt.
     // Env KUCKUCK_HD_LIGHT: "0"=nie, "1"=immer, unset=auto (H>=1080).
     bool dw = kk_tex_can_write(tgt);     // Target ShaderWrite-fähig -> direkt rein, Blit sparen
+    if (!dw) KK_NEED(c_out, OW, OH, KK_FMT_BGRA8);
     kk_tex *fin = dw ? tgt : c_out;
     bool cas = glsl && strcasestr(glsl, "cas") && c_srgb;
     kk_tex *dout = cas ? c_srgb : fin;
@@ -918,6 +961,7 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
         }
         if (sy) {
             kk_lanczos_p py = kk_lanczos_params((float)OH/H, 1);
+            if (!encFrueh) KK_NEED(c_liny, OW, OH, KK_FMT_RGBA16F);
             kk_tex *ziel = encFrueh ? c_srgb : c_liny;
             kk_compute_args ya = { .out=ziel, .in={cur}, .n_in=1, .uniforms=&py, .uniforms_size=sizeof py };
             kk_gpu_compute(g, encFrueh ? LANCZOS_SRGB_MSL : LANCZOS_MSL, "lanczos", &ya);
@@ -946,6 +990,7 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
         struct { float scale; uint32_t lutn; float radius; float lut[64]; float scaleY; } ew;
         ew.scale = (float)OW/W; ew.scaleY = (float)OH/H; ew.lutn = 64; ew.radius = KK_EWA_RADIUS;
         for (int i=0;i<64;i++) ew.lut[i]=KK_EWA_LUT[i];
+        KK_NEED(c_liny, OW, OH, KK_FMT_RGBA16F);
         kk_compute_args ea = { .out=c_liny, .in={c_lin}, .n_in=1, .uniforms=&ew, .uniforms_size=sizeof ew };
         kk_gpu_compute(g, EWA_MSL, "ewa", &ea);
         kk_compute_args la = { .out=dout, .in={c_liny}, .n_in=1 };
@@ -996,13 +1041,12 @@ bool kk_gpu_render_hdr(void *metal_device, void *cv_pixbuf, void *target_texture
     if (W != h_W || H != h_H || OW != h_OW || OH != h_OH) {
         kk_tex_destroy(g,&h_pq); kk_tex_destroy(g,&h_ewa); kk_tex_destroy(g,&h_out); kk_tex_destroy(g,&h_tmpx);
         h_pq  = kk_tex_create(g, W,  H,  KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
-        h_ewa = kk_tex_create(g, OW, OH, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
-        h_out = kk_tex_create(g, OW, OH, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL); // PQ-Float
         h_tmpx = kk_tex_create(g, OW, H, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL); // HD-Light Lanczos-X
+        // h_ewa/h_out lazy (KK_NEED): im HD-Light-Pfad mit LANCZOS_CMH braucht es h_ewa nicht.
         // Maße nur bei Erfolg merken (s. SDR: sonst Selbstsperre nach einem Alloc-Fehler).
-        if (h_pq && h_ewa && h_out && h_tmpx) { h_W=W; h_H=H; h_OW=OW; h_OH=OH; } else { h_W=h_H=h_OW=h_OH=0; }
+        if (h_pq && h_tmpx) { h_W=W; h_H=H; h_OW=OW; h_OH=OH; } else { h_W=h_H=h_OW=h_OH=0; }
     }
-    if (!h_pq || !h_ewa || !h_out) {
+    if (!h_pq) {
         kk_tex_destroy(g,&luma); kk_tex_destroy(g,&chroma); kk_tex_destroy(g,&tgt); return false;
     }
     // Speicher: HDR-Pfad nutzt nur h_* → SDR- + CNN-Caches freigeben (idempotent).
@@ -1023,31 +1067,37 @@ bool kk_gpu_render_hdr(void *metal_device, void *cv_pixbuf, void *target_texture
     // (2x ~8 Taps) wie im SDR-HD-Pfad; gleiche Env-Gate-Semantik.
     const char *hdl = getenv("KUCKUCK_HD_LIGHT");
     bool hdLight = hdl ? (hdl[0]=='1') : (H >= 1080);
-    if (hdLight && h_tmpx) {
-        kk_lanczos_p px = kk_lanczos_params((float)OW/W, 0), py = kk_lanczos_params((float)OH/H, 1);
-        kk_compute_args xa = { .out=h_tmpx, .in={h_pq}, .n_in=1, .uniforms=&px, .uniforms_size=sizeof px };
-        kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &xa);
-        kk_compute_args ya = { .out=h_ewa, .in={h_tmpx}, .n_in=1, .uniforms=&py, .uniforms_size=sizeof py };
-        kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &ya);
-    } else {
-        struct { float scale; uint32_t lutn; float radius; float lut[64]; float scaleY; } ew;
-        ew.scale=(float)OW/W; ew.scaleY=(float)OH/H; ew.lutn=64; ew.radius=KK_EWA_RADIUS; for(int i=0;i<64;i++) ew.lut[i]=KK_EWA_LUT[i];
-        kk_compute_args ea = { .out=h_ewa, .in={h_pq}, .n_in=1, .uniforms=&ew, .uniforms_size=sizeof ew };
-        kk_gpu_compute(g, EWA_MSL, "ewa", &ea);                       // EWA-Scale in Linear
-    }
     bool dw = kk_tex_can_write(tgt);     // Target ShaderWrite-fähig -> direkt rein, Blit sparen
     // CAS auch im HDR (2026-11-07, KUCKUCK_HDR_CAS=0 schaltet ab): Tonemap nach h_out,
     // Schärfen direkt ins Ziel (ohne ShaderWrite: nach h_ewa, dann Blit). Ohne CAS wie bisher.
     const char *hc = getenv("KUCKUCK_HDR_CAS");
     bool hdrCas = !(hc && hc[0] == '0');
-    kk_compute_args ca = { .out=(dw && !hdrCas)?tgt:h_out, .in={h_ewa}, .n_in=1, .uniforms=hp, .uniforms_size=sizeof(kk_hdr_params) };
-    kk_gpu_compute(g, CMHDR_MSL, "cmh", &ca);                         // IPT-Tonemap -> PQ/2020
+    kk_tex *pq;   // Tonemap-Ergebnis (PQ/2020): direkt im Ziel oder in h_out
+    if (hdrCas || !dw) { KK_NEED(h_out, OW, OH, KK_FMT_RGBA16F); pq = h_out; } else { pq = tgt; }
+    if (hdLight && h_tmpx) {
+        // Letzter Pass = Lanczos-Y mit Tonemap (LANCZOS_CMH): kein h_ewa-Roundtrip mehr.
+        kk_lanczos_cm pc; pc.l = kk_lanczos_params((float)OH/H, 1); memcpy(&pc.cm, hp, sizeof pc.cm);
+        kk_lanczos_p px = kk_lanczos_params((float)OW/W, 0);
+        kk_compute_args xa = { .out=h_tmpx, .in={h_pq}, .n_in=1, .uniforms=&px, .uniforms_size=sizeof px };
+        kk_gpu_compute(g, LANCZOS_MSL, "lanczos", &xa);
+        kk_compute_args ya = { .out=pq, .in={h_tmpx}, .n_in=1, .uniforms=&pc, .uniforms_size=sizeof pc };
+        kk_gpu_compute(g, LANCZOS_CMH_MSL, "lanczos", &ya);
+    } else {
+        KK_NEED(h_ewa, OW, OH, KK_FMT_RGBA16F);
+        struct { float scale; uint32_t lutn; float radius; float lut[64]; float scaleY; } ew;
+        ew.scale=(float)OW/W; ew.scaleY=(float)OH/H; ew.lutn=64; ew.radius=KK_EWA_RADIUS; for(int i=0;i<64;i++) ew.lut[i]=KK_EWA_LUT[i];
+        kk_compute_args ea = { .out=h_ewa, .in={h_pq}, .n_in=1, .uniforms=&ew, .uniforms_size=sizeof ew };
+        kk_gpu_compute(g, EWA_MSL, "ewa", &ea);                       // EWA-Scale in Linear
+        kk_compute_args ca = { .out=pq, .in={h_ewa}, .n_in=1, .uniforms=hp, .uniforms_size=sizeof(kk_hdr_params) };
+        kk_gpu_compute(g, CMHDR_MSL, "cmh", &ca);                     // IPT-Tonemap -> PQ/2020
+    }
     if (hdrCas) {
-        kk_compute_args cs = { .out=dw ? tgt : h_ewa, .in={h_out}, .n_in=1 };
+        if (!dw) KK_NEED(h_ewa, OW, OH, KK_FMT_RGBA16F);
+        kk_compute_args cs = { .out=dw ? tgt : h_ewa, .in={pq}, .n_in=1 };
         kk_gpu_compute(g, CAS_HDR_MSL, "cas", &cs);
         if (!dw) kk_gpu_blit(g, h_ewa, tgt);
     } else if (!dw) {
-        kk_gpu_blit(g, h_out, tgt);
+        kk_gpu_blit(g, pq, tgt);
     }
     return kk_finish_or_submit(g, &luma, &chroma, &tgt, done, done_ud);
 }
@@ -1114,6 +1164,7 @@ void kk_gpu_prewarm(void *metal_device) {
     kk_gpu_compile(g, MKHLG_L3_MSL, "mk");
     kk_gpu_compile(g, CMHDR_MSL,  "cmh");
     kk_gpu_compile(g, CAS_HDR_MSL, "cas");
+    kk_gpu_compile(g, LANCZOS_CMH_MSL, "lanczos");
 }
 
 
