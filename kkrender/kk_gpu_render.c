@@ -731,7 +731,12 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
         kk_tex_destroy(g,&c_alin); kk_tex_destroy(g,&c_atmpx);
         kk_tex_destroy(g,&c_a2rgb); kk_tex_destroy(g,&c_adeb);
         kk_tex_destroy(g,&c_srgb);
-        c_srgb  = kk_tex_create(g, OW, OH, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);   // CAS-Input
+        // CAS-Eingang (sRGB-kodiert 0..1) als RGB10A2 statt RGBA16F (2026-11-07): halbe Bytes
+        // der letzten Zwischenstufe (−20 MB je 2144×1206-Bild), 10 bit vor einem 8-bit-Ziel
+        // mit Dither = ≤0,25 LSB8 Quantisierung (kk_iq_test). KUCKUCK_KK_SRGB10=0 → wie vorher.
+        const char *s10 = getenv("KUCKUCK_KK_SRGB10");
+        c_srgb  = kk_tex_create(g, OW, OH, (s10 && s10[0]=='0') ? KK_FMT_RGBA16F : KK_FMT_RGB10A2,
+                                KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
         kk_tex_destroy(g,&c_dbl);   // lazy im Deblock-Block
         // Maße nur bei vollständigem Erfolg merken: sonst hielt ein einziger Alloc-Fehler
         // (Speicherdruck) den Renderer bis zum nächsten Größenwechsel fest — jedes Bild

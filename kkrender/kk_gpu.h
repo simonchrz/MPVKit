@@ -26,6 +26,7 @@ typedef enum {
     KK_FMT_RGBA8,     // SDR-Output / Zwischentextur
     KK_FMT_BGRA8,     // Display-IOSurface-Output (AVSampleBufferDisplayLayer ist BGRA)
     KK_FMT_RGBA16F,   // HDR/Linearlicht-Zwischentextur
+    KK_FMT_RGB10A2,   // sRGB-kodierte Zwischenstufe vor CAS (4 B/px statt 8, 2026-11-07)
 } kk_fmt;
 
 typedef enum {

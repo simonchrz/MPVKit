@@ -164,6 +164,13 @@ int main(void) { @autoreleasepool {
         double t_decl3 = miss(g, DEC_L3_MSL, "dec", &(kk_compute_args){ .out=rgb, .in={luma,chh}, .n_in=2, .linear={false,true}, .uniforms=&D, .uniforms_size=sizeof D }, N);
         printf("  Chroma-L3: CHH %6.3f + DEC_L3 %6.3f = %6.3f  gegen DEC bilinear %6.3f (%+.0f%%)\n",
                t_chh, t_decl3, t_chh+t_decl3, t_dec, 100.0*((t_chh+t_decl3)/t_dec-1.0));
+        kk_tex *s10 = kk_tex_create(g, OUT_W, OUT_H, KK_FMT_RGB10A2, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
+        double t_ly10 = miss(g, LANCZOS_SRGB_MSL, "lanczos", &(kk_compute_args){ .out=s10, .in={tmpx}, .n_in=1, .uniforms=&py, .uniforms_size=sizeof py }, N);
+        double t_ly16 = miss(g, LANCZOS_SRGB_MSL, "lanczos", &(kk_compute_args){ .out=skal, .in={tmpx}, .n_in=1, .uniforms=&py, .uniforms_size=sizeof py }, N);
+        double t_cas10 = miss(g, CAS_MSL, "cas", &(kk_compute_args){ .out=ziel, .in={s10}, .n_in=1 }, N);
+        printf("  CAS-Eingang RGB10A2: Lanczos-Y-sRGB %6.3f (16F %6.3f) + CAS %6.3f (16F %6.3f) = %+.0f%%\n",
+               t_ly10, t_ly16, t_cas10, t_cas, 100.0*((t_ly10+t_cas10)/(t_ly16+t_cas)-1.0));
+        kk_tex_destroy(g, &s10);
         kk_tex_destroy(g, &deb); kk_tex_destroy(g, &pq); kk_tex_destroy(g, &chh);
     }
 

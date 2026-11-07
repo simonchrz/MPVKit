@@ -63,6 +63,7 @@ static MTLPixelFormat mtl_fmt(kk_fmt f) {
         case KK_FMT_RGBA8:   return MTLPixelFormatRGBA8Unorm;
         case KK_FMT_BGRA8:   return MTLPixelFormatBGRA8Unorm;
         case KK_FMT_RGBA16F: return MTLPixelFormatRGBA16Float;
+        case KK_FMT_RGB10A2: return MTLPixelFormatRGB10A2Unorm;
     }
     return MTLPixelFormatRGBA8Unorm;
 }
@@ -75,6 +76,7 @@ static int fmt_bytes(kk_fmt f) {
         case KK_FMT_RGBA8:   return 4;
         case KK_FMT_BGRA8:   return 4;
         case KK_FMT_RGBA16F: return 8;
+        case KK_FMT_RGB10A2: return 4;
     }
     return 4;
 }

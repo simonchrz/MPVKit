@@ -95,6 +95,36 @@ static int pruefe_dither(kk_gpu *g) {
 ///    Weiß (Y=235 → 255) bleiben mit Dither exakt. Vorher warf `saturate` die Hälfte
 ///    des Rauschens weg — 12,5 % der Pixel wurden Code 1 bzw. 254 (stehendes Korn in
 ///    Balken/Abspann, hob den Schwarzpunkt-Fix teilweise auf).
+/// CAS-Eingang als RGB10A2 (2026-11-07): sRGB-kodierte Rampe über DELIN in RGBA16F bzw.
+/// RGB10A2, dann CAS → 8-bit-Ziel. 10 bit quantisieren ≤0,25 LSB8 → nach CAS ≤1 Code
+/// Unterschied und kein Pegelversatz.
+static int pruefe_srgb10(kk_gpu *g) {
+    const int W = 64, H = 16; unsigned char *in = malloc(4*W*H);
+    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+        unsigned char v = (unsigned char)(2 + (250 * x) / (W - 1)), u = (unsigned char)(8 + 15 * y);
+        in[4*(y*W+x)] = v; in[4*(y*W+x)+1] = (unsigned char)(255 - v); in[4*(y*W+x)+2] = u; in[4*(y*W+x)+3] = 255;
+    }
+    kk_tex *lin = kk_tex_create(g, W, H, KK_FMT_RGBA8, KK_TEX_SAMPLE, in);
+    kk_tex *s16 = kk_tex_create(g, W, H, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
+    kk_tex *s10 = kk_tex_create(g, W, H, KK_FMT_RGB10A2, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
+    kk_tex *o16 = kk_tex_create(g, W, H, KK_FMT_RGBA8, KK_TEX_STORAGE|KK_TEX_DOWNLOAD, NULL);
+    kk_tex *o10 = kk_tex_create(g, W, H, KK_FMT_RGBA8, KK_TEX_STORAGE|KK_TEX_DOWNLOAD, NULL);
+    kk_gpu_compute(g, DELIN_MSL, "delin", &(kk_compute_args){ .out = s16, .in = { lin }, .n_in = 1 });
+    kk_gpu_compute(g, DELIN_MSL, "delin", &(kk_compute_args){ .out = s10, .in = { lin }, .n_in = 1 });
+    kk_gpu_compute(g, CAS_MSL, "cas", &(kk_compute_args){ .out = o16, .in = { s16 }, .n_in = 1 });
+    kk_gpu_compute(g, CAS_MSL, "cas", &(kk_compute_args){ .out = o10, .in = { s10 }, .n_in = 1 });
+    kk_gpu_finish(g);
+    unsigned char *a = malloc(4*W*H), *b = malloc(4*W*H);
+    kk_tex_download(g, o16, a); kk_tex_download(g, o10, b);
+    int maxd = 0; double summe = 0; int n = 0;
+    for (int i = 0; i < W*H; i++) for (int k = 0; k < 3; k++) { int d = (int)b[4*i+k] - (int)a[4*i+k]; if (abs(d) > maxd) maxd = abs(d); summe += d; n++; }
+    int fehler = maxd > 1 || fabs(summe / n) > 0.1;
+    printf("  CAS aus RGB10A2 vs RGBA16F: max %d Code, Versatz %+.3f LSB   %s\n", maxd, summe / n, fehler ? "FEHLER" : "ok");
+    free(in); free(a); free(b);
+    kk_tex_destroy(g, &lin); kk_tex_destroy(g, &s16); kk_tex_destroy(g, &s10); kk_tex_destroy(g, &o16); kk_tex_destroy(g, &o10);
+    return fehler;
+}
+
 static int pruefe_dither_raender(kk_gpu *g) {
     const int W = 64, H = 64; unsigned char *px = malloc(4*W*H);
     float a, o; kk_lin_params(&a, &o);
@@ -411,6 +441,7 @@ int main(void) { @autoreleasepool {
     int f = pruefe_schwarzpunkt(g);
     f |= pruefe_dither(g);
     f |= pruefe_dither_raender(g);
+    f |= pruefe_srgb10(g);
     f |= pruefe_ringing(g);
     f |= pruefe_hlg(g);
     f |= pruefe_chroma(g);
