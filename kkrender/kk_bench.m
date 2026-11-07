@@ -23,7 +23,10 @@
 #include "kk_gpu.h"
 #include "kk_gpu_render.c"
 
-typedef struct { float a, b; float m[9]; float o; } L_uniform;   // o = Schwarzpunkt-Abzug (0 = alt)
+typedef struct { float a, b; float m[9]; float o; } L_uniform;
+extern void kk_hdr_tone(float src_max_nits, float dst_max_nits, float min_nits,
+                        float *in_min, float *in_max, float *out_min, float *out_max, float lut[256]);
+extern const float KK_IPT_RGB2LMS_2020[9], KK_IPT_LMS2RGB_2020[9], KK_IPT_LMS2IPT[9], KK_IPT_IPT2LMS[9];   // o = Schwarzpunkt-Abzug (0 = alt)
 typedef struct { float m[12]; float co[2]; } D_uniform;   // co = Chroma-Ort (0 = mittig, alt)
 typedef struct { float d[12]; float a, b; float m[9]; float o; float co[2]; } DL_uniform;
 typedef struct { float radius, threshold, grain; uint32_t iters, index; } DB_uniform;
@@ -132,6 +135,37 @@ int main(void) { @autoreleasepool {
     printf("  Standard   DEC+LIN+EWA+DELIN+CAS     %6.3f ms\n", standard);
     printf("  => HD-Light ist %.1fx billiger\n", standard/hd_light);
 
+
+    // --- Fusionen 2026-11-07 (DEBANDLIN, LANCZOS_CMH) + Chroma-L3-Kosten ---
+    {
+        printf("\n  --- Fusionen 2026-11-07 ---\n");
+        typedef struct { float radius, threshold, grain; uint32_t iters, index; float a, b; float m[9]; float o; } DBL_uniform;
+        DBL_uniform DBL = { 16.0f, 0.003f, 0.001f, 1, 0, L.a, L.b, {1,0,0, 0,1,0, 0,0,1}, 0 };
+        DB_uniform DBm = { .radius=16.0f, .threshold=0.003f, .grain=0.001f, .iters=1, .index=0 };
+        kk_tex *deb = kk_tex_create(g, SRC_W, SRC_H, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
+        double t_db = miss(g, DEBAND_MSL, "deband", &(kk_compute_args){ .out=deb, .in={rgb}, .n_in=1, .linear={true}, .uniforms=&DBm, .uniforms_size=sizeof DBm }, N);
+        double t_lin2 = miss(g, LIN_MSL, "lin", &(kk_compute_args){ .out=lin, .in={deb}, .n_in=1, .uniforms=&L, .uniforms_size=sizeof L }, N);
+        double t_dbl = miss(g, DEBANDLIN_MSL, "debandlin", &(kk_compute_args){ .out=lin, .in={rgb}, .n_in=1, .linear={true}, .uniforms=&DBL, .uniforms_size=sizeof DBL }, N);
+        printf("  DEBAND (1080p)   %6.3f ms + LIN %6.3f = %6.3f getrennt\n", t_db, t_lin2, t_db+t_lin2);
+        printf("  DEBANDLIN        %6.3f ms = %+.0f%%\n", t_dbl, 100.0*(t_dbl/(t_db+t_lin2)-1.0));
+        kk_lanczos_cm pc; pc.l = py;
+        memcpy(pc.cm.rgb2lms, KK_IPT_RGB2LMS_2020, 36); memcpy(pc.cm.lms2rgb, KK_IPT_LMS2RGB_2020, 36);
+        memcpy(pc.cm.lms2ipt, KK_IPT_LMS2IPT, 36); memcpy(pc.cm.ipt2lms, KK_IPT_IPT2LMS, 36);
+        kk_hdr_tone(1000.0f, 203.0f, 0.005f, &pc.cm.in_min, &pc.cm.in_max, &pc.cm.out_min, &pc.cm.out_max, pc.cm.tone_lut); pc.cm.hlg = 0;
+        kk_tex *pq = kk_tex_create(g, OUT_W, OUT_H, KK_FMT_RGBA16F, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
+        double t_ly = miss(g, LANCZOS_MSL, "lanczos", &(kk_compute_args){ .out=skal, .in={tmpx}, .n_in=1, .uniforms=&py, .uniforms_size=sizeof py }, N);
+        double t_cmh = miss(g, CMHDR_MSL, "cmh", &(kk_compute_args){ .out=pq, .in={skal}, .n_in=1, .uniforms=&pc.cm, .uniforms_size=sizeof pc.cm }, N);
+        double t_lcm = miss(g, LANCZOS_CMH_MSL, "lanczos", &(kk_compute_args){ .out=pq, .in={tmpx}, .n_in=1, .uniforms=&pc, .uniforms_size=sizeof pc }, N);
+        printf("  Lanczos-Y %6.3f + CMHDR %6.3f = %6.3f getrennt\n", t_ly, t_cmh, t_ly+t_cmh);
+        printf("  LANCZOS_CMH      %6.3f ms = %+.0f%%\n", t_lcm, 100.0*(t_lcm/(t_ly+t_cmh)-1.0));
+        kk_tex *chh = kk_tex_create(g, SRC_W, SRC_H/2, KK_FMT_RG16, KK_TEX_SAMPLE|KK_TEX_STORAGE, NULL);
+        struct { float cox; } PC = { 0.25f };
+        double t_chh = miss(g, CHH_MSL, "chh", &(kk_compute_args){ .out=chh, .in={chroma}, .n_in=1, .uniforms=&PC, .uniforms_size=sizeof PC }, N);
+        double t_decl3 = miss(g, DEC_L3_MSL, "dec", &(kk_compute_args){ .out=rgb, .in={luma,chh}, .n_in=2, .linear={false,true}, .uniforms=&D, .uniforms_size=sizeof D }, N);
+        printf("  Chroma-L3: CHH %6.3f + DEC_L3 %6.3f = %6.3f  gegen DEC bilinear %6.3f (%+.0f%%)\n",
+               t_chh, t_decl3, t_chh+t_decl3, t_dec, 100.0*((t_chh+t_decl3)/t_dec-1.0));
+        kk_tex_destroy(g, &deb); kk_tex_destroy(g, &pq); kk_tex_destroy(g, &chh);
+    }
 
     // --- Probe: halbe Praezision ---
     // Alle Produktions-Kernel rechnen in float, obwohl die Zwischentexturen RGBA16F
