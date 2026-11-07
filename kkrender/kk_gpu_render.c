@@ -245,7 +245,7 @@ static const char *DELIN_D_MSL = "#define KK_DITHER 1\n" DELIN_SRC;   // + Dithe
 // CAS (FidelityFX Contrast-Adaptive-Sharpening, cas.glsl-Port, headless gegen libplacebo
 // maxerr≤3) auf der encodeten sRGB-Ausgabe (HD/Tuner-Sharpener, gated via ~cas).
 #define CAS_SRC \
-"#include <metal_stdlib>\nusing namespace metal;\n#define SHARP 0.5\n" \
+"#include <metal_stdlib>\nusing namespace metal;\n#ifndef SHARP\n#define SHARP 0.5\n#endif\n" \
 "static inline float3 kk_dither(float3 v, uint2 p){\n" \
 "#if KK_DITHER\n" \
 "  uint x=p.x*1973u+p.y*9277u; x^=x>>15; x*=0x2c1b3c6du; x^=x>>12; x*=0x297a2d39u; x^=x>>15;\n" \
@@ -267,11 +267,15 @@ static const char *DELIN_D_MSL = "#define KK_DITHER 1\n" DELIN_SRC;   // + Dithe
 "  float3 win=(b+d)+(f+h); float3 o=clamp((win*w+e)*rcpW,0.0,1.0); dst.write(float4(kk_dither(o,id),1.0),id);}\n"
 static const char *CAS_MSL   = "#define KK_DITHER 0\n" CAS_SRC;
 static const char *CAS_D_MSL = "#define KK_DITHER 1\n" CAS_SRC;   // + Dither (8-Bit-Ziel)
+// HDR (2026-11-07): der HDR-Pfad hatte NIE einen Schärfepass, obwohl die quality-Zeile
+// der App „cas.glsl" meldete. Auf PQ-Codes (strikt 0..1) gelten die Kernel-Annahmen
+// exakt; Stärke bewusst unter SDR (Halos an Lichtern auf OLED), rgba16Float-Ziel → kein Dither.
+static const char *CAS_HDR_MSL = "#define KK_DITHER 0\n#define SHARP 0.35\n" CAS_SRC;
 // DELINCAS: Delin+CAS fusioniert (HD-Light) — der c_srgb-Roundtrip in voller Output-
 // Auflösung entfällt; das sRGB-Encode läuft pro Tap inline (9x3 pow, ALU gegen
 // Bandbreite getauscht — der Renderer ist bandbreiten-gebunden). Identische Mathe.
 #define DELINCAS_SRC \
-"#include <metal_stdlib>\nusing namespace metal;\n#define SHARP 0.5\n" \
+"#include <metal_stdlib>\nusing namespace metal;\n#ifndef SHARP\n#define SHARP 0.5\n#endif\n" \
 "static inline float3 kk_dither(float3 v, uint2 p){\n" \
 "#if KK_DITHER\n" \
 "  uint x=p.x*1973u+p.y*9277u; x^=x>>15; x*=0x2c1b3c6du; x^=x>>12; x*=0x297a2d39u; x^=x>>15;\n" \
@@ -422,6 +426,14 @@ static kk_gpu *g_kk = NULL;  // lazy, teilt libplacebos Device
 int kuckuck_hybrid_pass_timings(const char **namen, double *ms, int max) {
     if (!g_kk) return 0;
     return kk_gpu_timings(g_kk, namen, ms, max);
+}
+int kuckuck_hybrid_pass_timings_fenster(const char **namen, double *mittel, double *min, int *n, int max) {
+    if (!g_kk) return 0;
+    return kk_gpu_timings_fenster(g_kk, namen, mittel, min, n, max);
+}
+int kuckuck_hybrid_cb_zeiten(double *busy, double *wait, double *wake, double *busyMin, double *busyMax) {
+    if (!g_kk) return 0;
+    return kk_gpu_cb_zeiten(g_kk, busy, wait, wake, busyMin, busyMax);
 }
 
 // Async-Abschluss: die Frame-Wraps (luma/chroma/tgt inkl. CVMetalTextureRef!) MÜSSEN
@@ -972,9 +984,19 @@ bool kk_gpu_render_hdr(void *metal_device, void *cv_pixbuf, void *target_texture
         kk_gpu_compute(g, EWA_MSL, "ewa", &ea);                       // EWA-Scale in Linear
     }
     bool dw = kk_tex_can_write(tgt);     // Target ShaderWrite-fähig -> direkt rein, Blit sparen
-    kk_compute_args ca = { .out=dw?tgt:h_out, .in={h_ewa}, .n_in=1, .uniforms=hp, .uniforms_size=sizeof(kk_hdr_params) };
+    // CAS auch im HDR (2026-11-07, KUCKUCK_HDR_CAS=0 schaltet ab): Tonemap nach h_out,
+    // Schärfen direkt ins Ziel (ohne ShaderWrite: nach h_ewa, dann Blit). Ohne CAS wie bisher.
+    const char *hc = getenv("KUCKUCK_HDR_CAS");
+    bool hdrCas = !(hc && hc[0] == '0');
+    kk_compute_args ca = { .out=(dw && !hdrCas)?tgt:h_out, .in={h_ewa}, .n_in=1, .uniforms=hp, .uniforms_size=sizeof(kk_hdr_params) };
     kk_gpu_compute(g, CMHDR_MSL, "cmh", &ca);                         // IPT-Tonemap -> PQ/2020
-    if (!dw) kk_gpu_blit(g, h_out, tgt);
+    if (hdrCas) {
+        kk_compute_args cs = { .out=dw ? tgt : h_ewa, .in={h_out}, .n_in=1 };
+        kk_gpu_compute(g, CAS_HDR_MSL, "cas", &cs);
+        if (!dw) kk_gpu_blit(g, h_ewa, tgt);
+    } else if (!dw) {
+        kk_gpu_blit(g, h_out, tgt);
+    }
     return kk_finish_or_submit(g, &luma, &chroma, &tgt, done, done_ud);
 }
 
@@ -1037,6 +1059,7 @@ void kk_gpu_prewarm(void *metal_device) {
     kk_gpu_compile(g, MKHLG_MSL, "mk");
     kk_gpu_compile(g, MKHLG_L3_MSL, "mk");
     kk_gpu_compile(g, CMHDR_MSL,  "cmh");
+    kk_gpu_compile(g, CAS_HDR_MSL, "cas");
 }
 
 

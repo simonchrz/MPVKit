@@ -98,6 +98,13 @@ bool kk_gpu_compute(kk_gpu *gpu, const char *msl_source, const char *entry,
 // Rueckgabe: Anzahl gefuellter Eintraege (0 wenn aus oder nicht unterstuetzt).
 #define KK_TIMING_MAX 24
 int kk_gpu_timings(kk_gpu *gpu, const char **namen, double *ms, int max);
+// Dieselben Pass-Zeiten über alle Bilder seit dem letzten Aufruf gemittelt (plus Minimum
+// und Anzahl), danach zurückgesetzt. Nur so trennt man Arbeit von Taktstreuung.
+int kk_gpu_timings_fenster(kk_gpu *gpu, const char **namen, double *mittel, double *min, int *n, int max);
+// Command-Buffer-Zeiten je Bild, IMMER an (ohne Messmodus): busy = GPU-Laufzeit,
+// wait = encodet-bis-GPU-Start, wake = GPU-Ende-bis-Completion-Handler (ms, Fenster-
+// Mittel seit dem letzten Aufruf; Rückgabe = Anzahl Bilder, 0 = nichts). Danach Reset.
+int kk_gpu_cb_zeiten(kk_gpu *gpu, double *busy, double *wait, double *wake, double *busyMin, double *busyMax);
 
 // PSO vorkompilieren (Prewarm gegen Erst-Frame-Hitch): nur Compile+Cache, kein Dispatch.
 void kk_gpu_compile(kk_gpu *gpu, const char *msl_source, const char *entry);

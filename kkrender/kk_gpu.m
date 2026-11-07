@@ -1,6 +1,8 @@
 // kk_gpu.m — Metal-Impl der kk_gpu-Abstraktion (libplacebo-Ablösung, Etappe 1).
 #import <Metal/Metal.h>
 #import <CoreVideo/CoreVideo.h>
+#import <os/lock.h>
+#include <mach/mach_time.h>
 #include "kk_gpu.h"
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +37,18 @@ struct kk_gpu {
     char tsLastName[KK_TIMING_MAX][32];
     int tsLastCount;
     int passFehler;                   // gescheiterte kk_gpu_compute seit letztem Abschluss
+
+    // --- Command-Buffer-Zeiten (IMMER an, 2026-11-07): busy = GPUEnd-GPUStart, wait =
+    // GPUStart-kernelEnd (fertig encodet, GPU noch nicht dran), wake = Completion-Handler
+    // minus GPUEnd. Zerlegt die Wanduhr `gpu=` der App — die enthielt bisher Warten,
+    // Takt und Arbeit in einer Zahl. Schreiber: Metal-Completion-Thread; Leser: Render-
+    // Queue → Lock. Fenster-Summen, die App liest und setzt zurück.
+    os_unfair_lock cbLock;
+    double cbBusy, cbWait, cbWake, cbBusyMin, cbBusyMax; int cbN;
+    // Pass-Zeiten über das Fenster akkumuliert (Mittel/Min je Pass-Position) statt nur
+    // das zuletzt fertige Bild: ein Bild je 4 s war bei ±30–50 % Taktstreuung wertlos.
+    double tsSum[KK_TIMING_MAX], tsMin[KK_TIMING_MAX]; int tsN[KK_TIMING_MAX]; int tsAccCount;
+    MTLTimestamp skCpu0, skGpu0; bool skalaGeloggt;
 };
 
 int  kk_gpu_fehler(kk_gpu *g) { return g ? g->passFehler : 0; }
@@ -86,6 +100,9 @@ kk_gpu *kk_gpu_create(void *mtl_device) {
         g->sampLinear = [g->dev newSamplerStateWithDescriptor:sd];
         CFRetain((__bridge CFTypeRef) g->sampLinear);
         CVMetalTextureCacheCreate(kCFAllocatorDefault, NULL, g->dev, NULL, &g->texCache);
+        g->cbLock = OS_UNFAIR_LOCK_INIT; g->cbBusyMin = 1e9;
+        for (int i = 0; i < KK_TIMING_MAX; i++) g->tsMin[i] = 1e9;
+        [g->dev sampleTimestamps:&g->skCpu0 gpuTimestamp:&g->skGpu0];
         // Pass-Zeitmessung vorbereiten (nur wenn angefordert UND vom Geraet
         // unterstuetzt — aeltere GPUs kennen den Timestamp-CounterSet nicht).
         const char *tenv = getenv("KUCKUCK_PASS_TIMING");
@@ -181,22 +198,37 @@ static void kk_timing_aufloesen(struct kk_gpu *g) {
         const MTLCounterResultTimestamp *t = d.bytes;
         // GPU-Ticks -> ms: das Verhaeltnis liefert das Geraet ueber die
         // Korrelation von CPU- und GPU-Zeitbasis.
-        MTLTimestamp cpu0 = 0, gpu0 = 0, cpu1 = 0, gpu1 = 0;
-        [g->dev sampleTimestamps:&cpu0 gpuTimestamp:&gpu0];
-        [g->dev sampleTimestamps:&cpu1 gpuTimestamp:&gpu1];
         double skala = 1.0;   // GPU-Ticks sind auf Apple-GPUs Nanosekunden
-        (void) cpu0; (void) gpu0; (void) cpu1; (void) gpu1;
+        // Annahme einmal prüfen: Verhältnis CPU-ns zu GPU-Ticks über ≥1 s seit dem Create.
+        // Zwei Aufrufe direkt hintereinander (bis 2026-11-07) waren nur Rauschen.
+        if (!g->skalaGeloggt) {
+            MTLTimestamp cpu1 = 0, gpu1 = 0;
+            [g->dev sampleTimestamps:&cpu1 gpuTimestamp:&gpu1];
+            if (cpu1 > g->skCpu0 + 1000000000ull && gpu1 > g->skGpu0) {
+                double q = (double)(cpu1 - g->skCpu0) / (double)(gpu1 - g->skGpu0);
+                fprintf(stderr, "[kk_gpu] Zeitmessung: CPU-ns je GPU-Tick = %.4f (angenommen 1,0)\n", q);
+                g->skalaGeloggt = true;
+            }
+        }
         int k = 0;
         for (int i = 0; i < g->tsCount && k < KK_TIMING_MAX; i++) {
             MTLTimestamp a = t[i*2].timestamp, b = t[i*2+1].timestamp;
             if (a == MTLCounterErrorValue || b == MTLCounterErrorValue || b < a) continue;
-            g->tsLastMs[k] = (double)(b - a) * skala / 1e6;
+            double ms = (double)(b - a) * skala / 1e6;
+            g->tsLastMs[k] = ms;
             NSString *nm = g->tsNames[i];
+            // Fenster-Akkumulation je Position; wechselt dort der Pass-Name (anderer
+            // Pfad), beginnt die Position neu statt Äpfel mit Birnen zu mitteln.
+            if (strncmp(g->tsLastName[k], nm.UTF8String ?: "?", sizeof g->tsLastName[k] - 1) != 0) {
+                g->tsSum[k] = 0; g->tsMin[k] = 1e9; g->tsN[k] = 0;
+            }
+            g->tsSum[k] += ms; if (ms < g->tsMin[k]) g->tsMin[k] = ms; g->tsN[k]++;
             strncpy(g->tsLastName[k], nm.UTF8String ?: "?", sizeof g->tsLastName[k] - 1);
             g->tsLastName[k][sizeof g->tsLastName[k] - 1] = 0;
             k++;
         }
         g->tsLastCount = k;
+        if (k > g->tsAccCount) g->tsAccCount = k;
     }
     g->tsCount = 0;
 }
@@ -206,6 +238,48 @@ int kk_gpu_timings(kk_gpu *g, const char **namen, double *ms, int max) {
     int n = g->tsLastCount < max ? g->tsLastCount : max;
     for (int i = 0; i < n; i++) { namen[i] = g->tsLastName[i]; ms[i] = g->tsLastMs[i]; }
     return n;
+}
+
+int kk_gpu_timings_fenster(kk_gpu *g, const char **namen, double *mittel, double *min, int *n, int max) {
+    if (!g || !g->timing) return 0;
+    int k = g->tsAccCount < max ? g->tsAccCount : max, out = 0;
+    for (int i = 0; i < k; i++) {
+        if (g->tsN[i] <= 0) continue;
+        namen[out] = g->tsLastName[i]; mittel[out] = g->tsSum[i] / g->tsN[i];
+        min[out] = g->tsMin[i]; n[out] = g->tsN[i]; out++;
+        g->tsSum[i] = 0; g->tsMin[i] = 1e9; g->tsN[i] = 0;
+    }
+    g->tsAccCount = 0;
+    return out;
+}
+
+int kk_gpu_cb_zeiten(kk_gpu *g, double *busy, double *wait, double *wake, double *busyMin, double *busyMax) {
+    if (!g) return 0;
+    os_unfair_lock_lock(&g->cbLock);
+    int n = g->cbN;
+    if (n > 0) {
+        *busy = g->cbBusy / n; *wait = g->cbWait / n; *wake = g->cbWake / n;
+        *busyMin = g->cbBusyMin; *busyMax = g->cbBusyMax;
+    }
+    g->cbBusy = g->cbWait = g->cbWake = 0; g->cbBusyMin = 1e9; g->cbBusyMax = 0; g->cbN = 0;
+    os_unfair_lock_unlock(&g->cbLock);
+    return n;
+}
+
+// Zeiten eines fertigen Command-Buffers einsammeln (Completion-Thread).
+static void kk_cb_zeiten_merken(struct kk_gpu *g, id<MTLCommandBuffer> cb) {
+    double busy = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+    double wait = (cb.GPUStartTime - cb.kernelEndTime) * 1000.0;
+    // Jetzt in derselben Zeitbasis wie GPUEndTime (CACurrentMediaTime = mach_absolute_time in s).
+    static mach_timebase_info_data_t tb; if (tb.denom == 0) mach_timebase_info(&tb);
+    double jetzt = (double) mach_absolute_time() * tb.numer / tb.denom / 1e9;
+    double wake = (jetzt - cb.GPUEndTime) * 1000.0;
+    if (!(busy >= 0) || busy > 10000) return;   // 0/NaN bei fehlenden Zeitstempeln → auslassen
+    os_unfair_lock_lock(&g->cbLock);
+    g->cbBusy += busy; g->cbWait += wait; g->cbWake += wake; g->cbN++;
+    if (busy < g->cbBusyMin) g->cbBusyMin = busy;
+    if (busy > g->cbBusyMax) g->cbBusyMax = busy;
+    os_unfair_lock_unlock(&g->cbLock);
 }
 
 // Status eines abgeschlossenen Command-Buffers. Bis 2026-09-27 nie geprüft: ein GPU-
@@ -225,6 +299,7 @@ bool kk_gpu_finish(kk_gpu *g) {
         if (g->enc) { [g->enc endEncoding]; CFRelease((__bridge CFTypeRef) g->enc); g->enc = nil; }
         if (g->cb)  { [g->cb commit]; [g->cb waitUntilCompleted];
                       ok = kk_cb_ok(g->cb) && ok;
+                      kk_cb_zeiten_merken(g, g->cb);
                       CFRelease((__bridge CFTypeRef) g->cb); g->cb = nil;
                       kk_timing_aufloesen(g); }
     }
@@ -240,6 +315,7 @@ void kk_gpu_submit(kk_gpu *g, void (*done)(void *ud, int ok), void *ud) {
             struct kk_gpu *gg = g;
             [g->cb addCompletedHandler:^(id<MTLCommandBuffer> _cb){
                 bool ok = kk_cb_ok(_cb) && passOk;
+                kk_cb_zeiten_merken(gg, _cb);
                 kk_timing_aufloesen(gg); if (done) done(ud, ok ? 1 : 0); }];
             [g->cb commit];
             CFRelease((__bridge CFTypeRef) g->cb); g->cb = nil;   // CB lebt bis Completion selbst weiter

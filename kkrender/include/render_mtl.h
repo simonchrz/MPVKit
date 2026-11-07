@@ -57,6 +57,14 @@ int kuckuck_hybrid_pass_timings(const char **namen, double *ms, int max);
 // (eigener GPU-Kontext). 0 = ok, negativ = nichts geschrieben.
 int kuckuck_hybrid_deblock_nv12(void *ctx, void *src_pixbuf, void *dst_pixbuf);
 
+// Pass-Zeiten als Fenster-Mittel (Messmodus), s. kk_gpu.h kk_gpu_timings_fenster.
+int kuckuck_hybrid_pass_timings_fenster(const char **namen, double *mittel, double *min, int *n, int max);
+// Command-Buffer-Zeiten je Bild, IMMER an: busy (GPU-Laufzeit), wait (bis GPU-Start),
+// wake (GPU-Ende bis Completion), ms, Fenster-Mittel; Rückgabe = Bilder im Fenster.
+// Trennt in der Wanduhr `gpu=` der App Warten von Laufen. Takt von Arbeit trennt es
+// NICHT — dafür gleiche Pixel bei 30 und 60 fps vergleichen.
+int kuckuck_hybrid_cb_zeiten(double *busy, double *wait, double *wake, double *busyMin, double *busyMax);
+
 void kuckuck_hybrid_destroy(void *ctx);
 
 #ifdef __cplusplus
