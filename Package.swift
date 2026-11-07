@@ -45,8 +45,9 @@ let package = Package(
             // renderpl.76 = GPU-Fehler bis zur App (done(ud, ok) — ABI!), Caches pro Kontext,
             // setenv unter Sperre, Anti-Ringing, Dither-Ränder, HLG (kk_gpu-Sweep 2026-09-27).
             // renderpl.77 = Deband im HD-Sparpfad auf App-Vorgabe (KUCKUCK_DEBAND_HD, iPhone-Live).
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.77/Libkkrender.xcframework.zip",
-            checksum: "5814e8b5cf8298e9cde490e271f1ee61f83d9b67e138060dab76d4d89ce32df1"
+            // renderpl.78 = Deband+LIN fusioniert, Chroma-L3 aus einem Phasenwert, CAS im HDR, CB-Zeiten.
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.78/Libkkrender.xcframework.zip",
+            checksum: "fc909aaff9a6d90826b586469b23e149d5c69c31d692570a8f46a129d140bb9b"
         ),
     ]
 )
