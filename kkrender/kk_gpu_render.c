@@ -37,14 +37,23 @@ static void kk_gpu_hdr_release(kk_gpu *g);
 // co = Chroma-Ort-Versatz in CHROMA-Texeln (kk_chroma_offset): mittig 0, left-sited
 // +0,25 horizontal. In Texel-Einheiten, damit er auch für den 2×-Luma-Eingang des
 // ArtCNN-Pfads stimmt (dort sind es 1,0 statt 0,5 Luma-Pixel).
+// Sechs Lanczos3-Gewichte aus EINEM Phasenwert f = s-floor(s) ∈ [0,1): sinpi(f-t) = sinpi(f)·(-1)^t
+// und sinpi((f-t)/3) = sinpi(f/3)·cospi(t/3) − cospi(f/3)·sinpi(t/3) mit konstanten
+// cospi/sinpi(t/3) → 3 Transzendentale je Pixel statt 12 (Sweep 2026-11-07: die Chroma-
+// Gewichte waren mit 66 M sinpi/Bild der größte ALU-Posten der SDR-Kette). Mathematisch
+// identisch zu kk_l3(f-t); Prüfstand kk_iq_test (CPU-Referenz ≤1 LSB) hält.
 #define KK_CHROMA_FN \
 "static inline float kk_l3(float x){ x=abs(x); if(x<1e-5) return 1.0; if(x>=3.0) return 0.0;\n" \
 "  return 3.0*sinpi(x)*sinpi(x/3.0)/(M_PI_F*M_PI_F*x*x); }\n" \
+"static inline void kk_l3w6(float f, thread float* w){ float s1=sinpi(f), s3=sinpi(f/3.0), c3=cospi(f/3.0); const float h=0.8660254;\n" \
+"  float sx[6]={s1,-s1,s1,-s1,s1,-s1};\n" \
+"  float s3t[6]={-0.5*s3+h*c3, 0.5*s3+h*c3, s3, 0.5*s3-h*c3, -0.5*s3-h*c3, -s3};\n" \
+"  for(int t=-2;t<=3;t++){ float x=f-float(t), ax=abs(x); w[t+2]= ax<1e-5 ? 1.0 : (ax>=3.0 ? 0.0 : 3.0*sx[t+2]*s3t[t+2]/(M_PI_F*M_PI_F*x*x)); } }\n" \
 "static inline float2 kk_chroma(texture2d<float> chroma, sampler lin, uint2 id, uint w, uint h, float cox, float coy){\n" \
 "#if KK_CHROMA_L3\n" \
 "  int ch=int(chroma.get_height()); float s=(float(id.y)+0.5)*float(ch)/float(h)-0.5+coy; int b=int(floor(s));\n" \
-"  float2 acc=float2(0.0); float ws=0.0;\n" \
-"  for(int t=-2;t<=3;t++){ int tap=b+t; float wt=kk_l3(s-float(tap));\n" \
+"  float2 acc=float2(0.0); float ws=0.0; float w6[6]; kk_l3w6(s-float(b),w6);\n" \
+"  for(int t=-2;t<=3;t++){ int tap=b+t; float wt=w6[t+2];\n" \
 "    acc+=wt*chroma.read(uint2(id.x,uint(clamp(tap,0,ch-1)))).rg; ws+=wt; }\n" \
 "  return acc/ws;\n" \
 "#else\n" \
@@ -61,8 +70,8 @@ KK_CHROMA_FN
 "kernel void chh(texture2d<float> c [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n"
 "  constant P& p [[buffer(0)]], uint2 id [[thread_position_in_grid]]){ uint W=dst.get_width(),H=dst.get_height(); if(id.x>=W||id.y>=H)return;\n"
 "  int cw=int(c.get_width()); float s=(float(id.x)+0.5)*float(cw)/float(W)-0.5+p.cox; int b=int(floor(s));\n"
-"  float2 acc=float2(0.0); float ws=0.0;\n"
-"  for(int t=-2;t<=3;t++){ int tap=b+t; float wt=kk_l3(s-float(tap)); acc+=wt*c.read(uint2(uint(clamp(tap,0,cw-1)),id.y)).rg; ws+=wt; }\n"
+"  float2 acc=float2(0.0); float ws=0.0; float w6[6]; kk_l3w6(s-float(b),w6);\n"
+"  for(int t=-2;t<=3;t++){ int tap=b+t; float wt=w6[t+2]; acc+=wt*c.read(uint2(uint(clamp(tap,0,cw-1)),id.y)).rg; ws+=wt; }\n"
 "  dst.write(float4(acc/ws,0.0,1.0),id);}\n";
 
 // DEC: YUV -> encodete RGB (exakte Matrix via pl_color_repr_decode, 9+3). KEIN linearize
@@ -162,6 +171,37 @@ static const char *DEBAND_MSL =
 "    float3 diff=abs(res-avg); float bound=p.threshold/float(i); res=select(avg,res,diff>float3(bound)); }\n"
 "  if(p.grain>0.0){ float3 r2=rnd(s); float3 st=min(abs(res),float3(p.grain)); res+=st*(r2-0.5); }\n"
 "  dst.write(float4(res,1.0),id);}\n";
+// DEBANDLIN (2026-11-07): Deband + Linearisieren in EINEM Pass — seit Deband-HD (09-28) lief
+// der teuerste iPhone-Pfad (1080p50 live) wieder mit getrenntem DEC→DEBAND→LIN, die DECLIN-
+// Fusion war dort verloren. Spart den c_deb-Roundtrip (2× W×H×8 B) und einen Dispatch;
+// mit KK_SRGB_OUT (1:1-Fall, VT-SR + Ziel-Deckel) zusätzlich LIN→DELIN samt c_lin. Reine
+// Punktoperation hinter dem Deband-Ergebnis, nichts wird mehrfach gerechnet (anders als
+// DELINCAS). Uniform = DB gefolgt von L (layoutgleich zu den Einzel-Structs).
+#define DEBANDLIN_SRC \
+"#include <metal_stdlib>\nusing namespace metal;\nstruct DBL{float radius,threshold,grain;uint iters,index;float a,b;float m[9];float o;};\n" \
+"static inline float3 rnd(thread uint3& s){ s=1664525u*s+uint3(1013904223u);\n" \
+"  s.x+=s.y*s.z; s.y+=s.z*s.x; s.z+=s.x*s.y; s^=s>>16u;\n" \
+"  s.x+=s.y*s.z; s.y+=s.z*s.x; s.z+=s.x*s.y; return float3(s)*(1.0/float(0xFFFFFFFFu)); }\n" \
+"static inline float srgb(float c){ return c<=0.0031308 ? 12.92*c : 1.055*pow(c,1.0/2.4)-0.055; }\n" \
+"kernel void debandlin(texture2d<float> src [[texture(0)]], texture2d<float,access::write> dst [[texture(1)]],\n" \
+"  sampler near [[sampler(0)]], sampler lin [[sampler(1)]], constant DBL& p [[buffer(0)]],\n" \
+"  uint2 id [[thread_position_in_grid]]){ uint W=dst.get_width(),H=dst.get_height(); if(id.x>=W||id.y>=H)return;\n" \
+"  float2 sz=float2(W,H); float2 pos=(float2(id)+0.5)/sz; float2 pt=1.0/sz;\n" \
+"#define GET(X,Y) (src.sample(lin, pos+pt*float2(X,Y)).rgb)\n" \
+"  uint3 s=uint3(id.x,id.y,p.index); float3 res=src.sample(lin,pos).rgb;\n" \
+"  for(uint i=1;i<=p.iters;i++){ float3 r=rnd(s); float2 d=r.xy*float2(float(i)*p.radius,6.283185307);\n" \
+"    d=d.x*float2(cos(d.y),sin(d.y));\n" \
+"    float3 avg=(GET(+d.x,+d.y)+GET(-d.x,+d.y)+GET(-d.x,-d.y)+GET(+d.x,-d.y))*0.25;\n" \
+"    float3 diff=abs(res-avg); float bound=p.threshold/float(i); res=select(avg,res,diff>float3(bound)); }\n" \
+"  if(p.grain>0.0){ float3 r2=rnd(s); float3 st=min(abs(res),float3(p.grain)); res+=st*(r2-0.5); }\n" \
+"  float3 c=max(res,0.0); float3 v=p.a*pow(c+p.b,float3(2.4))-p.o;\n" \
+"  float3 o=float3(p.m[0]*v.x+p.m[1]*v.y+p.m[2]*v.z, p.m[3]*v.x+p.m[4]*v.y+p.m[5]*v.z, p.m[6]*v.x+p.m[7]*v.y+p.m[8]*v.z);\n" \
+"#if KK_SRGB_OUT\n" \
+"  o=clamp(o,0.0,1.0); o=float3(srgb(o.r),srgb(o.g),srgb(o.b));\n" \
+"#endif\n" \
+"  dst.write(float4(o,1.0),id);}\n"
+static const char *DEBANDLIN_MSL      = "#define KK_SRGB_OUT 0\n" DEBANDLIN_SRC;
+static const char *DEBANDLIN_SRGB_MSL = "#define KK_SRGB_OUT 1\n" DEBANDLIN_SRC;
 // LIN: BT.1886 a*pow(c+b,2.4) (encoded -> linear) + Primaries-Gamut (601/2020 -> 709,
 // RGB-RGB-Matrix in Linear-Light; identity bei 709-Quelle = no-op).
 // `- o`: Schwarzpunkt-Ausgleich (kk_lin_params). Mit o=0 und dem rohen a exakt wie vorher.
@@ -725,11 +765,15 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
 
     // Deband (KUCKUCK_DEBAND off|mild|strong) auf der encodeten Quelle.
     kk_tex *src_lin = c_dec;   // ohne Deband: linearize liest c_dec
+    struct { float radius, threshold, grain; uint32_t iters, index; } db = { 16.0f, 3.0f/1000.0f, 1.0f/1000.0f, 1, 0 };
     if (debandAn) {
-        struct { float radius, threshold, grain; uint32_t iters, index; } db;
-        db.radius = 16.0f; db.index = (g_frame++);
-        if (dbenv[0]=='s') { db.iters=2; db.threshold=4.0f/1000.0f; db.grain=1.0f/1000.0f; }  // strong
-        else               { db.iters=1; db.threshold=3.0f/1000.0f; db.grain=1.0f/1000.0f; }  // mild
+        db.index = (g_frame++);
+        if (dbenv[0]=='s') { db.iters=2; db.threshold=4.0f/1000.0f; }  // strong (sonst mild)
+    }
+    // Deband+LIN fusioniert im HD-Light (s. DEBANDLIN); A/B: KUCKUCK_KK_DBLIN=0 → getrennt.
+    const char *dblEnv = getenv("KUCKUCK_KK_DBLIN");
+    bool dbLinFusion = debandAn && hdLight && !cnnPath && c_tmpx && !(dblEnv && dblEnv[0]=='0');
+    if (debandAn && !dbLinFusion) {
         kk_compute_args dba = { .out=c_deb, .in={c_dec}, .n_in=1, .linear={true}, .uniforms=&db, .uniforms_size=sizeof db };
         kk_gpu_compute(g, DEBAND_MSL, "deband", &dba);
         src_lin = c_deb;
@@ -851,7 +895,15 @@ bool kk_gpu_render(void *metal_device, void *cv_pixbuf, void *target_texture,
             const char *k = chh ? (declinSrgb ? DECLIN_L3_SRGB_MSL : DECLIN_L3_MSL)
                                 : (declinSrgb ? DECLIN_SRGB_MSL : DECLIN_MSL);
             kk_gpu_compute(g, k, "declin", &la0);
-        } else {   // CNN-Pfad gescheitert oder Deband/Deblock aktiv -> c_dec/c_deb existiert
+        } else if (dbLinFusion) {   // Deband+LIN in einem Pass, bei 1:1 gleich sRGB-kodiert
+            struct { float radius, threshold, grain; uint32_t iters, index; float a, b; float m[9]; float o; } DBL;
+            DBL.radius = db.radius; DBL.threshold = db.threshold; DBL.grain = db.grain; DBL.iters = db.iters; DBL.index = db.index;
+            DBL.a = L.a; DBL.b = L.b; memcpy(DBL.m, L.m, sizeof DBL.m); DBL.o = L.o;
+            bool srgbDirekt = encFrueh && !sx && !sy;
+            cur = srgbDirekt ? c_srgb : c_lin;
+            kk_compute_args la0 = { .out=cur, .in={c_dec}, .n_in=1, .linear={true}, .uniforms=&DBL, .uniforms_size=sizeof DBL };
+            kk_gpu_compute(g, srgbDirekt ? DEBANDLIN_SRGB_MSL : DEBANDLIN_MSL, "debandlin", &la0);
+        } else {   // CNN-Pfad gescheitert oder Deblock aktiv -> c_dec/c_deb existiert
             kk_compute_args la0 = { .out=c_lin, .in={src_lin}, .n_in=1, .uniforms=&L, .uniforms_size=sizeof L };
             kk_gpu_compute(g, LIN_MSL, "lin", &la0);
             cur = c_lin;
@@ -1043,6 +1095,8 @@ void kk_gpu_prewarm(void *metal_device) {
     kk_gpu_compile(g, DELINCAS_MSL, "delincas");
     kk_gpu_compile(g, DELINCAS_D_MSL, "delincas");
     kk_gpu_compile(g, DEBAND_MSL, "deband");
+    kk_gpu_compile(g, DEBANDLIN_MSL, "debandlin");
+    kk_gpu_compile(g, DEBANDLIN_SRGB_MSL, "debandlin");
     kk_gpu_compile(g, DEBLOCK_MSL, "deblock");
     kk_gpu_compile(g, LIN_MSL,    "lin");
     kk_gpu_compile(g, LINSIG_MSL, "linsig");

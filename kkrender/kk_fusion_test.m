@@ -251,6 +251,48 @@ static int pruefe_srgb_varianten(kk_gpu *g) {
     return fehler;
 }
 
+/// DEBANDLIN (Deband+LIN fusioniert, 2026-11-07) gegen DEBAND -> LIN, und die sRGB-
+/// Variante gegen DEBANDLIN -> DELIN. Gleicher PRNG-Index → gleiche Zufallsabtastung.
+typedef struct { float radius, threshold, grain; uint32_t iters, index; } DB_uniform;
+typedef struct { float radius, threshold, grain; uint32_t iters, index; float a, b; float m[9]; float o; } DBL_uniform;
+static int pruefe_debandlin(kk_gpu *g) {
+    const int W = 64, H = 32, CW = W / 2, CH = H / 2;
+    unsigned char *luma = malloc(W * H), *chroma = malloc(2 * CW * CH);
+    testbild(luma, W, H, chroma, CW, CH);
+    kk_tex *tl = kk_tex_create(g, W, H, KK_FMT_R8, KK_TEX_SAMPLE, luma);
+    kk_tex *tc = kk_tex_create(g, CW, CH, KK_FMT_RG8, KK_TEX_SAMPLE, chroma);
+    D_uniform D = {{ 1.1643f, 0.0f, 1.7927f, 1.1643f, -0.2132f, -0.5329f, 1.1643f, 2.1124f, 0.0f, -0.9729f, 0.3015f, -1.1334f }};
+    L_uniform L = { 0.8704f, 0.0595f, { 1,0,0, 0,1,0, 0,0,1 }, 0.0021f };
+    DB_uniform db = { 16.0f, 3.0f/1000.0f, 1.0f/1000.0f, 1, 7 };
+    DBL_uniform DBL = { db.radius, db.threshold, db.grain, db.iters, db.index, L.a, L.b, {1,0,0, 0,1,0, 0,0,1}, L.o };
+    kk_tex *dec = kk_tex_create(g, W, H, KK_FMT_RGBA16F, KK_TEX_SAMPLE | KK_TEX_STORAGE, NULL);
+    kk_tex *deb = kk_tex_create(g, W, H, KK_FMT_RGBA16F, KK_TEX_SAMPLE | KK_TEX_STORAGE, NULL);
+    kk_tex *lin = kk_tex_create(g, W, H, KK_FMT_RGBA16F, KK_TEX_SAMPLE | KK_TEX_STORAGE, NULL);
+    kk_tex *oA = kk_tex_create(g, W, H, KK_FMT_RGBA8, KK_TEX_STORAGE | KK_TEX_DOWNLOAD, NULL);
+    kk_tex *oB = kk_tex_create(g, W, H, KK_FMT_RGBA8, KK_TEX_STORAGE | KK_TEX_DOWNLOAD, NULL);
+    kk_tex *sA = kk_tex_create(g, W, H, KK_FMT_RGBA8, KK_TEX_STORAGE | KK_TEX_DOWNLOAD, NULL);
+    kk_tex *sB = kk_tex_create(g, W, H, KK_FMT_RGBA8, KK_TEX_STORAGE | KK_TEX_DOWNLOAD, NULL);
+    kk_gpu_compute(g, DEC_MSL, "dec", &(kk_compute_args){ .out = dec, .in = { tl, tc }, .n_in = 2, .uniforms = &D, .uniforms_size = sizeof D });
+    // Weg A: DEBAND -> LIN (getrennt)
+    kk_gpu_compute(g, DEBAND_MSL, "deband", &(kk_compute_args){ .out = deb, .in = { dec }, .n_in = 1, .linear = { true }, .uniforms = &db, .uniforms_size = sizeof db });
+    kk_gpu_compute(g, LIN_MSL, "lin", &(kk_compute_args){ .out = oA, .in = { deb }, .n_in = 1, .uniforms = &L, .uniforms_size = sizeof L });
+    // Weg B: DEBANDLIN
+    kk_gpu_compute(g, DEBANDLIN_MSL, "debandlin", &(kk_compute_args){ .out = oB, .in = { dec }, .n_in = 1, .linear = { true }, .uniforms = &DBL, .uniforms_size = sizeof DBL });
+    // sRGB: DEBANDLIN -> DELIN gegen DEBANDLIN_SRGB
+    kk_gpu_compute(g, DEBANDLIN_MSL, "debandlin", &(kk_compute_args){ .out = lin, .in = { dec }, .n_in = 1, .linear = { true }, .uniforms = &DBL, .uniforms_size = sizeof DBL });
+    kk_gpu_compute(g, DELIN_MSL, "delin", &(kk_compute_args){ .out = sA, .in = { lin }, .n_in = 1 });
+    kk_gpu_compute(g, DEBANDLIN_SRGB_MSL, "debandlin", &(kk_compute_args){ .out = sB, .in = { dec }, .n_in = 1, .linear = { true }, .uniforms = &DBL, .uniforms_size = sizeof DBL });
+    kk_gpu_finish(g);
+    unsigned char *a = malloc(4 * W * H), *b = malloc(4 * W * H), *c = malloc(4 * W * H), *d = malloc(4 * W * H);
+    kk_tex_download(g, oA, a); kk_tex_download(g, oB, b); kk_tex_download(g, sA, c); kk_tex_download(g, sB, d);
+    int fehler = vergleiche("DEBANDLIN vs DEBAND->LIN", a, b, W * H, 1.5, 0.2);
+    fehler |= vergleiche("DEBANDLIN_SRGB vs DL->DELIN", c, d, W * H, 1.5, 0.2);
+    free(luma); free(chroma); free(a); free(b); free(c); free(d);
+    kk_tex_destroy(g, &tl); kk_tex_destroy(g, &tc); kk_tex_destroy(g, &dec); kk_tex_destroy(g, &deb); kk_tex_destroy(g, &lin);
+    kk_tex_destroy(g, &oA); kk_tex_destroy(g, &oB); kk_tex_destroy(g, &sA); kk_tex_destroy(g, &sB);
+    return fehler;
+}
+
 int main(void) { @autoreleasepool {
     setvbuf(stdout, NULL, _IONBF, 0);
     kk_gpu *g = kk_gpu_create(NULL);
@@ -259,6 +301,7 @@ int main(void) { @autoreleasepool {
     int fehler = pruefe_declin(g);
     fehler |= pruefe_delincas(g);
     fehler |= pruefe_srgb_varianten(g);
+    fehler |= pruefe_debandlin(g);
 
     kk_gpu_destroy(&g);
     printf(fehler ? "kk_fusion_test: FEHLGESCHLAGEN\n"
