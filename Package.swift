@@ -47,8 +47,9 @@ let package = Package(
             // renderpl.77 = Deband im HD-Sparpfad auf App-Vorgabe (KUCKUCK_DEBAND_HD, iPhone-Live).
             // renderpl.78 = Deband+LIN fusioniert, Chroma-L3 aus einem Phasenwert, CAS im HDR, CB-Zeiten.
             // renderpl.79 = LANCZOS_CMH (HDR-Tonemap im letzten Scaler), Zwischentexturen lazy je Pfad.
-            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.79/Libkkrender.xcframework.zip",
-            checksum: "b2c5f1759ab9721f53610d0170894de890a27216744b054a236ed86d2bdaa2c2"
+            // renderpl.80 = CAS-Eingang als RGB10A2.
+            url: "https://github.com/simonchrz/MPVKit/releases/download/0.41.0-renderpl.80/Libkkrender.xcframework.zip",
+            checksum: "0daa33561bcc12f8ebdf36cd64ebb59b6605a7e1dc0209d108d9eda0be3641c8"
         ),
     ]
 )
